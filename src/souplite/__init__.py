@@ -10,5 +10,5 @@ from souplite.utils.low_ram import setup_low_ram_environment
 
 setup_low_ram_environment()
 
-__version__ = "0.75.0-lite"
+__version__ = "0.75.0"
 __author__ = "Muhtar Jaksilikov"
