@@ -2,7 +2,8 @@
 SoupLite Low-RAM Optimization Utilities.
 Designed to run LLM workflows on low-memory machines (<= 2 GB RAM).
 
-Original base project created by Muhtar Jaksilikov (https://github.com/MuhtarJaksilikov/Soup).
+Original base project created by Makazhan Alpamys (https://github.com/MakazhanAlpamys/Soup).
+Re-architected by Muhtar Jaksilikov.
 """
 
 import os
@@ -16,7 +17,8 @@ logger = logging.getLogger("souplite.low_ram")
 
 # System RAM Threshold in GB for low-RAM mode
 LOW_RAM_THRESHOLD_GB = 2.5
-DEFAULT_2GB_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_2GB_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+FALLBACK_05B_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 FALLBACK_135M_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 
 def setup_low_ram_environment() -> None:
@@ -112,10 +114,10 @@ def get_low_ram_model_preset(model_override: str | None = None) -> str:
         return model_override
     
     total_ram = get_total_system_ram_gb()
-    if total_ram <= 1.5:
+    if total_ram <= 1.2:
         return FALLBACK_135M_MODEL
-    elif total_ram <= 2.5:
-        return DEFAULT_2GB_MODEL
+    elif total_ram <= 1.8:
+        return FALLBACK_05B_MODEL
     return DEFAULT_2GB_MODEL
 
 

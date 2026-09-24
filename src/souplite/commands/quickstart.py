@@ -1,4 +1,4 @@
-"""soup quickstart — one command for a complete demo (create data + config + train)."""
+"""souplite quickstart — one command for a complete demo (create data + config + train)."""
 
 from __future__ import annotations
 
@@ -56,26 +56,31 @@ DEMO_DATA = [
      "output": "Inference is using a trained model to make predictions on new data."},
 ]
 
-_DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+_DEFAULT_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+_FALLBACK_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 _LOW_VRAM_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
-_LOW_VRAM_THRESHOLD_GB = 4.0
 
 
 def _pick_quickstart_model() -> tuple[str, str | None]:
-    """Pick the demo model based on detected RAM/VRAM for <=2GB RAM setups."""
+    """Pick the demo model based on detected RAM for <=2GB RAM setups."""
     from souplite.utils.low_ram import get_total_system_ram_gb
     
     ram_gb = get_total_system_ram_gb()
-    if ram_gb <= 1.5:
+    if ram_gb <= 1.2:
         return (
             _LOW_VRAM_MODEL,
-            f"Detected {ram_gb:.1f} GB RAM — using {_LOW_VRAM_MODEL} for 2GB low-memory mode.",
+            f"Detected {ram_gb:.1f} GB RAM — using {_LOW_VRAM_MODEL} for ultra-low memory mode.",
+        )
+    elif ram_gb <= 1.8:
+        return (
+            _FALLBACK_MODEL,
+            f"Detected {ram_gb:.1f} GB RAM — using {_FALLBACK_MODEL} for 1.5GB low-memory mode.",
         )
     return _DEFAULT_MODEL, None
 
 
 DEMO_CONFIG = """# SoupLite Quickstart Config — low-RAM optimized demo
-base: Qwen/Qwen2.5-0.5B-Instruct
+base: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
 task: sft
 
@@ -175,14 +180,13 @@ def quickstart(
         console.print(f"[yellow]Config file already exists:[/] {config_path}")
     else:
         rendered = DEMO_CONFIG.replace(_DEFAULT_MODEL, model_id)
-        # When --output is set, retarget data + run dirs into that dir.
         if output is not None:
             rendered = rendered.replace(
                 "./quickstart_data.jsonl", str(data_path)
             ).replace("./quickstart_output", str(out_dir / "quickstart_output"))
         config_path.write_text(rendered, encoding="utf-8")
         console.print(f"[green]Created:[/] {config_path}")
-    # Also write a `soup.yaml` symlink-style alias for tools that look for it.
+
     soup_yaml = out_dir / "soup.yaml"
     if not soup_yaml.exists() and output is not None:
         try:
@@ -194,10 +198,10 @@ def quickstart(
 
     if dry_run:
         console.print("\n[yellow]Dry run - files created, skipping training.[/]")
-        console.print(f"To train: [bold]soup train --config {config_path}[/]")
+        console.print(f"To train: [bold]souplite train --config {config_path}[/]")
         raise typer.Exit()
 
-    # 3. Train — invoke via subprocess so Typer resolves defaults properly
+    # 3. Train
     console.print("\n[bold]Starting training...[/]\n")
     import subprocess
     import sys
