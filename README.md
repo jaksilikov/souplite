@@ -17,11 +17,11 @@
 </p>
 
 <p align="center">
-  <a href="#-быстрый-старт">Быстрый Старт</a> &bull;
   <a href="#-авторство-и-концепция">Авторство</a> &bull;
   <a href="#-сравнение-soup-vs-souplite">Сравнение</a> &bull;
   <a href="#-архитектура-оптимизации-памяти">Архитектура</a> &bull;
-  <a href="#-инструкция-по-публикации-на-github">Публикация на GitHub</a>
+  <a href="#-быстрый-старт">Быстрый Старт</a> &bull;
+  <a href="#-запуск-в-docker-2-гб-озу-лимит">Docker</a>
 </p>
 
 ---
@@ -127,25 +127,6 @@ services:
           memory: 2048M
         reservations:
           memory: 512M
-```
-
----
-
-## 📤 Инструкция по публикации на GitHub
-
-Репозиторий локально настроен и содержит один чистый начальный коммит. Чтобы выложить его под своим аккаунтом на GitHub:
-
-1. **Создайте пустой репозиторий** на GitHub под именем `souplite` (без создания README/gitignore на сайте).
-2. **Выполните команды в консоли**:
-
-```bash
-cd /home/user/souplite
-
-# Прикрепите ваш удаленный GitHub URL
-git remote set-url origin https://github.com/jaksilikov/souplite.git
-
-# Отправьте код на GitHub
-git push -u origin main
 ```
 
 ---
