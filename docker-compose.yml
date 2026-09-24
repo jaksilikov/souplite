@@ -1,0 +1,25 @@
+services:
+  souplite:
+    image: souplite:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/workspace
+    environment:
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+      - MALLOC_TRIM_THRESHOLD_=100000
+      - PYTHONMALLOC=malloc
+      - OMP_NUM_THREADS=1
+      - TOKENIZERS_PARALLELISM=false
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+        reservations:
+          memory: 512M
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host

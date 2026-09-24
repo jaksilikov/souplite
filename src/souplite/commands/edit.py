@@ -1,0 +1,399 @@
+"""v0.61.0 Parts C/D/E — `soup edit` command group.
+
+* ``soup edit set`` — surgical ROME / MEMIT / AlphaEdit (Part C).
+* ``soup edit diff`` — knowledge-injection diff visualizer (Part E).
+* Sequential edit governor (Part D) is consulted by both subcommands.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
+
+console = Console()
+
+app = typer.Typer(
+    name="edit",
+    help=(
+        "Knowledge editing (ROME / MEMIT / AlphaEdit) - patch facts "
+        "without re-training (v0.61.0)."
+    ),
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+# v0.71.16 #250 — covariance-corpus loader caps.
+_MAX_COV_CORPUS_BYTES = 64 * 1024 * 1024  # 64 MiB
+_MAX_COV_CORPUS_LINES = 100_000
+
+
+def _load_cov_corpus(path: str) -> list[str]:
+    """Load a covariance corpus (JSONL or plain text) for ``--cov-corpus`` (#250).
+
+    Each JSONL object contributes its ``text`` / ``prompt`` / ``content`` field;
+    every other line (non-dict JSON or non-JSON) contributes its raw stripped
+    text. cwd-contained, symlink-rejected (TOCTOU on the raw path), size + line
+    capped. Raises ``FileNotFoundError`` for a missing file and ``ValueError``
+    for a containment / symlink / oversize / empty-corpus failure.
+    """
+    import errno
+    import json as _json
+    import os
+    import stat
+
+    from souplite.utils.paths import is_under_cwd
+
+    if not isinstance(path, str) or not path:
+        raise ValueError("--cov-corpus path must be a non-empty string")
+    if "\x00" in path:
+        raise ValueError("--cov-corpus path must not contain null bytes")
+    if not is_under_cwd(path):
+        raise ValueError(
+            f"--cov-corpus path must stay under cwd: {os.path.basename(path)!r}"
+        )
+    # Raw-path symlink guard (the Windows guard, where O_NOFOLLOW is a no-op).
+    try:
+        if os.path.lexists(path) and stat.S_ISLNK(os.lstat(path).st_mode):
+            raise ValueError("--cov-corpus path must not be a symlink")
+    except OSError:
+        pass  # lexists/lstat race — os.open below surfaces the real error
+    # O_NOFOLLOW closes the TOCTOU window between the check and the read: os.open
+    # fails with ELOOP if the final component is a symlink (parity with the
+    # diagnose.live / tunability readers).
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"--cov-corpus file not found: {os.path.basename(path)!r}"
+        ) from exc
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise ValueError("--cov-corpus path must not be a symlink") from exc
+        raise ValueError(
+            f"--cov-corpus path is not readable ({type(exc).__name__})"
+        ) from exc
+    # fstat the RAW fd before wrapping it: on POSIX ``os.open`` succeeds on a
+    # directory, and ``os.fdopen`` then raises ``IsADirectoryError`` before our
+    # ``S_ISREG`` check could run — so reject non-regular files (and oversize)
+    # here, closing the fd to avoid a leak. (On Windows ``os.open`` already
+    # rejects a directory, surfacing via the OSError branch above.)
+    try:
+        st = os.fstat(fd)
+    except OSError as exc:
+        os.close(fd)
+        raise ValueError(
+            f"--cov-corpus path is not readable ({type(exc).__name__})"
+        ) from exc
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        raise ValueError("--cov-corpus path must be a regular file")
+    if st.st_size > _MAX_COV_CORPUS_BYTES:
+        os.close(fd)
+        raise ValueError(
+            f"--cov-corpus file too large (> {_MAX_COV_CORPUS_BYTES} bytes)"
+        )
+    rows: list[str] = []
+    with os.fdopen(fd, encoding="utf-8") as fh:
+        for i, line in enumerate(fh):
+            if i >= _MAX_COV_CORPUS_LINES:
+                break
+            stripped = line.strip()
+            if not stripped:
+                continue
+            parsed = None
+            is_json = True
+            try:
+                parsed = _json.loads(stripped)
+            except _json.JSONDecodeError:
+                is_json = False
+            if is_json and isinstance(parsed, dict):
+                for fld in ("text", "prompt", "content"):
+                    val = parsed.get(fld)
+                    if isinstance(val, str) and val.strip():
+                        rows.append(val)
+                        break
+            else:
+                rows.append(stripped)
+    if not rows:
+        raise ValueError("--cov-corpus has no usable text rows")
+    return rows
+
+
+@app.command(name="set")
+def set_edit(
+    base: str = typer.Option(
+        ..., "--base", "-b",
+        help="Base model HF id or local path.",
+    ),
+    method: str = typer.Option(
+        "rome", "--method", "-m",
+        help="Edit method: rome / memit / alphaedit.",
+    ),
+    subject: str = typer.Option(
+        ..., "--subject", "-s",
+        help='Prefix sentence (e.g. "Paris is the capital of France").',
+    ),
+    target: str = typer.Option(
+        ..., "--target", "-t",
+        help='New completion target (e.g. "Lyon").',
+    ),
+    layer: Optional[int] = typer.Option(
+        None, "--layer", "-l",
+        help="MLP layer index to edit (defaults to method-specific recommended layer).",
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o",
+        help="Directory to save the edited model / GRACE codebook (cwd-contained).",
+    ),
+    device: Optional[str] = typer.Option(
+        None, "--device",
+        help="torch device (cpu / cuda). Defaults to CUDA when available.",
+    ),
+    use_governor: bool = typer.Option(
+        True, "--governor/--no-governor",
+        help="Consult the sequential-edit governor (refuse on norm blowup).",
+    ),
+    cov_corpus: Optional[str] = typer.Option(
+        None, "--cov-corpus",
+        help=(
+            "ROME only: JSONL/text corpus to estimate the key covariance C "
+            "for a C^{-1}-preconditioned update (reduces collateral damage)."
+        ),
+    ),
+    plan_only: bool = typer.Option(
+        False, "--plan-only",
+        help="Print the resolved EditPlan and exit without applying.",
+    ),
+    registry_id: Optional[str] = typer.Option(
+        None, "--registry-id",
+        help="Optional Registry entry id to attach the edited model as a child.",
+    ),
+) -> None:
+    """Apply a single surgical knowledge edit."""
+    from souplite.utils.knowledge_edit import apply_edit, build_edit_plan
+
+    # Validate the optional --registry-id BEFORE building the plan so a
+    # crafted id can't crash the v0.61.1 registry attach (review HIGH H4).
+    if registry_id is not None:
+        if not isinstance(registry_id, str) or not registry_id:
+            console.print("[red]Invalid --registry-id:[/] must be non-empty")
+            raise typer.Exit(2)
+        if "\x00" in registry_id:
+            console.print("[red]Invalid --registry-id:[/] null bytes not allowed")
+            raise typer.Exit(2)
+        if len(registry_id) > 256:
+            console.print("[red]Invalid --registry-id:[/] >256 chars")
+            raise typer.Exit(2)
+
+    try:
+        plan = build_edit_plan(
+            base=base,
+            method=method,
+            subject=subject,
+            target=target,
+            layer=layer,
+        )
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]Invalid edit request:[/] {escape(str(exc))}")
+        raise typer.Exit(2) from exc
+
+    # Render the resolved plan.
+    body = (
+        f"[bold]Method:[/] {escape(plan.method)}\n"
+        f"[bold]Base:[/]   {escape(plan.base)}\n"
+        f"[bold]Layer:[/]  {plan.layer}\n"
+        f"[bold]Subject:[/] {escape(plan.subject)}\n"
+        f"[bold]Target:[/]  {escape(plan.target)}\n\n"
+        f"[dim]{escape(plan.spec.description)}[/]"
+    )
+    console.print(Panel(body, title="EditPlan", border_style="cyan"))
+
+    if plan_only:
+        console.print("[green]Plan-only mode — exiting without applying.[/]")
+        return
+
+    # v0.71.16 #250 — load the optional covariance corpus (path security lives
+    # here at the CLI boundary; apply_edit rejects it for non-ROME methods).
+    cov_corpus_rows = None
+    if cov_corpus is not None:
+        try:
+            cov_corpus_rows = _load_cov_corpus(cov_corpus)
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            console.print(f"[red]Cannot load --cov-corpus:[/] {escape(str(exc))}")
+            raise typer.Exit(2) from exc
+
+    # Load a persisted governor so sequential edits across separate `soup edit
+    # set` runs accumulate (#196 / #197). Best-effort — a missing / unreadable
+    # governor DB never blocks an edit.
+    governor = None
+    store = None
+    if use_governor:
+        try:
+            from souplite.utils.edit_governor import (
+                EditGovernorStore,
+                default_governor_db_path,
+                load_governor,
+                save_governor,
+            )
+
+            store = EditGovernorStore(default_governor_db_path())
+            governor = load_governor(store, plan.base)
+        except (ValueError, OSError) as exc:
+            console.print(f"[dim]Governor disabled ({escape(str(exc))}).[/]")
+            governor = None
+            store = None
+
+    from souplite.utils.edit_governor import GovernedEditError
+
+    try:
+        result = apply_edit(
+            plan,
+            output_dir=output,
+            governor=governor,
+            device=device,
+            cov_corpus=cov_corpus_rows,
+        )
+    except GovernedEditError as exc:
+        console.print(
+            Panel(
+                f"[red]Edit refused by governor:[/] {escape(str(exc))}",
+                title="Sequential-edit governor",
+                border_style="red",
+            )
+        )
+        if store is not None:
+            store.close()
+        raise typer.Exit(2) from exc
+    except (ValueError, RuntimeError, OSError) as exc:
+        console.print(f"[red]Edit failed:[/] {escape(str(exc))}")
+        if store is not None:
+            store.close()
+        raise typer.Exit(2) from exc
+
+    # Persist the updated governor state so the next edit sees the new count.
+    if governor is not None and store is not None:
+        try:
+            save_governor(store, governor)
+        except (ValueError, OSError):
+            pass
+        finally:
+            store.close()
+
+    console.print(
+        Panel(
+            f"[bold]Method:[/] {escape(result.method)}\n"
+            f"[bold]Layers edited:[/] {list(result.layers_edited)}\n"
+            f"[bold]Norm delta:[/] {result.norm_delta:.4f}\n"
+            f"[bold]Target prob:[/] {result.target_prob_before:.4f} -> "
+            f"{result.target_prob_after:.4f}\n"
+            + (
+                f"[bold]Saved:[/] {escape(result.output_dir)}\n"
+                if result.output_dir
+                else ""
+            )
+            + (
+                f"[bold]Governor:[/] count="
+                f"{governor.edit_count} verdict={escape(governor.last_verdict)}"
+                if governor is not None
+                else "[dim]Governor disabled.[/]"
+            ),
+            title="Edit applied",
+            border_style="green",
+        )
+    )
+
+    if registry_id is not None and result.output_dir is not None:
+        from souplite.registry.attach import attach_artifact
+
+        kind = "grace_codebook" if result.method == "grace" else "edited_model"
+        try:
+            attach_artifact(registry_id, path=result.output_dir, kind=kind)
+            console.print(
+                f"[green]Attached {kind} to Registry entry "
+                f"{escape(registry_id)}.[/]"
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            console.print(
+                f"[yellow]Could not attach to Registry:[/] {escape(str(exc))}"
+            )
+
+
+@app.command(name="diff")
+def diff_edit(
+    before: str = typer.Argument(
+        ..., help="Label or run id of the model BEFORE the edit (metadata).",
+    ),
+    after: str = typer.Argument(
+        ..., help="Label or run id of the model AFTER the edit (metadata).",
+    ),
+    probe_file: Optional[str] = typer.Option(
+        None, "--probes",
+        help=(
+            "JSONL file with probe prompts; required when both "
+            "--before-model and --after-model are given. Each row should "
+            "have a 'prompt' field. Capped at 1000 rows."
+        ),
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o",
+        help="Where to write the rendered diff JSON.",
+    ),
+    top_k: int = typer.Option(
+        10, "--top-k", "-k",
+        help="Number of changed facts to surface (1-100).",
+    ),
+    before_model: Optional[str] = typer.Option(
+        None, "--before-model",
+        help=(
+            "Model path / HF id of the BEFORE model "
+            "(live generation with --after-model and --probes)."
+        ),
+    ),
+    after_model: Optional[str] = typer.Option(
+        None, "--after-model",
+        help=(
+            "Model path / HF id of the AFTER model "
+            "(live generation with --before-model and --probes)."
+        ),
+    ),
+    device: Optional[str] = typer.Option(
+        None, "--device",
+        help="torch device (cpu / cuda). Defaults to CUDA when available.",
+    ),
+) -> None:
+    """Knowledge-injection diff: facts changed between before / after.
+
+    Pass both ``--before-model`` and ``--after-model`` alongside ``--probes``
+    to evaluate probe completions live and surface changed facts.
+    """
+    from souplite.utils.edit_diff import build_diff_report, render_diff_table
+
+    try:
+        report = build_diff_report(
+            before_run_id=before,
+            after_run_id=after,
+            probe_file=probe_file,
+            top_k=top_k,
+            before_model=before_model,
+            after_model=after_model,
+            device=device,
+        )
+    except (TypeError, ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]Cannot build diff:[/] {escape(str(exc))}")
+        raise typer.Exit(2) from exc
+
+    render_diff_table(report, console)
+
+    if output is not None:
+        from souplite.utils.edit_diff import write_diff_report
+
+        try:
+            write_diff_report(report, output)
+        except (TypeError, ValueError, OSError) as exc:
+            console.print(f"[red]Cannot write diff:[/] {escape(str(exc))}")
+            raise typer.Exit(2) from exc
+        console.print(f"Wrote diff -> {escape(output)}")

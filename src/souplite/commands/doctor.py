@@ -1,0 +1,1015 @@
+"""soup doctor — check dependency compatibility and system health."""
+
+from __future__ import annotations
+
+import platform
+import re
+import sys
+
+import typer
+from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
+from rich.table import Table
+
+from souplite.utils.constants import GITHUB_URL
+from souplite.utils.torchao_compat import TORCHAO_MIN_VERSION
+
+console = Console()
+
+
+# Dependencies to check: (import_name, package_name, min_version, required)
+#
+# A core-only install (`pip install souplite`) is intentionally light: the CLI,
+# config system, and data tools — no PyTorch. Only the core rows below are
+# required; the heavy training stack lives in EXTRA_GROUPS as one optional
+# extra, so a healthy core-only install reports no failures (#828).
+DEPS = [
+    ("pydantic", "pydantic", "2.0.0", True),
+    ("typer", "typer", "0.9.0", True),
+    ("rich", "rich", "13.0.0", True),
+    ("yaml", "pyyaml", "6.0", True),
+    ("plotext", "plotext", "5.2.0", True),
+    # Optional
+    ("fastapi", "fastapi", "0.104.0", False),
+    ("uvicorn", "uvicorn", "0.24.0", False),
+    ("datasketch", "datasketch", "1.6.0", False),
+    ("lm_eval", "lm-eval", "0.4.0", False),
+    ("wandb", "wandb", "0.15.0", False),
+    ("deepspeed", "deepspeed", "0.12.0", False),
+    ("httpx", "httpx", "0.24.0", False),
+    ("unsloth", "unsloth", "2024.8", False),
+    ("PIL", "Pillow", "9.0.0", False),
+    ("torchao", "torchao", TORCHAO_MIN_VERSION, False),
+    ("sglang", "sglang", "0.2.0", False),
+    ("librosa", "librosa", "0.10.0", False),
+]
+
+# Extra groups: (extra_name, [(import_name, package_name, min_version), ...])
+EXTRA_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
+    (
+        "train",
+        [
+            # The torch floor is declared once, in pyproject.toml's [train] extra.
+            # This literal is a copy, pinned to the declaration by
+            # tests/test_issue636_torch_floor.py — reading installed metadata instead
+            # would report the install's history, not the declaration (#636).
+            ("torch", "torch", "2.6.0"),
+            ("transformers", "transformers", "5.16.1"),
+            ("peft", "peft", "0.20.0"),
+            ("trl", "trl", "0.29.0"),
+            ("datasets", "datasets", "2.14.0"),
+            ("bitsandbytes", "bitsandbytes", "0.41.0"),
+            ("accelerate", "accelerate", "0.27.0"),
+        ],
+    ),
+]
+
+# Packages whose declared breaking-major ceiling must be reported as
+# incompatible instead of silently green-lighted by ``soup doctor``.
+_MAX_EXCLUSIVE: dict[str, str] = {
+    "transformers": "6.0.0",
+    "peft": "1.0.0",
+    "trl": "1.0.0",
+}
+
+
+def doctor(
+    nccl: bool = typer.Option(
+        False, "--nccl", help="Measure NCCL bandwidth and check against reference table."
+    ),
+    disk: bool = typer.Option(
+        False,
+        "--disk",
+        help=(
+            "Detect the disk media type (NVMe / SSD / HDD). Layer streaming's "
+            "disk overflow tier needs NVMe. Off by default: the probe costs ~9 s "
+            "on Windows, and on Linux it WRITES a ~64 MiB scratch file "
+            "(.soup-diskprobe-*, git-ignored) into the current directory to "
+            "measure sequential read throughput."
+        ),
+    ),
+    config: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help=(
+            "Also check a soup.yaml: report which of the settings it actually "
+            "sets are not read on its task and backend (#755)."
+        ),
+    ),
+):
+    """Check system dependencies, GPU, and compatibility."""
+    console.print("[bold]Soup Doctor[/] - checking your environment...\n")
+
+    # System info
+    dual_python_advisory = _detect_dual_python_interpreters()
+    panel_body = (
+        f"Python:   [bold]{sys.version.split()[0]}[/]\n"
+        f"Platform: [bold]{platform.system()} {platform.release()}[/]\n"
+        f"Arch:     [bold]{platform.machine()}[/]"
+    )
+    if dual_python_advisory:
+        panel_body += f"\n[yellow]{dual_python_advisory}[/]"
+    console.print(Panel(panel_body, title="System"))
+
+    # GPU check
+    _check_gpu()
+
+    # MLX (Apple Silicon) check
+    _check_mlx()
+
+    # Resources check
+    _check_resources(probe_disk=disk)
+
+    # Dependencies table
+    table = Table(title="Dependencies")
+    table.add_column("Package", style="bold")
+    table.add_column("Required", justify="center")
+    table.add_column("Installed", justify="center")
+    table.add_column("Min Version")
+    table.add_column("Status")
+
+    issues: list[str] = []
+    # Actionable install specs for the trailing "Fix all" line. Only entries
+    # that are actually missing or out of range land here — never the full
+    # required set, and never a bare per-package floor for an extra group.
+    fix_parts: list[str] = []
+    fix_pre: list[str] = []
+    # A missing or incompatible core dependency turns doctor into a gate:
+    # exit non-zero at the end. An installed package beyond its declared
+    # ceiling is blocking wherever it is found, extra groups included (#874).
+    # Advisory issues (optional packages, a missing or outdated [train]
+    # member, torchvision skew) never touch the exit code.
+    core_broken = False
+
+    for import_name, pkg_name, min_ver, required in DEPS:
+        try:
+            mod = __import__(import_name)
+            version = getattr(mod, "__version__", getattr(mod, "VERSION", None))
+            if version is None:
+                # v0.40.1 Part D / M1 — some installs (notably ``rich``)
+                # don't export ``__version__`` on the package surface;
+                # importlib.metadata is canonical and works everywhere.
+                try:
+                    from importlib.metadata import (
+                        PackageNotFoundError,
+                    )
+                    from importlib.metadata import (
+                        version as _pkgver,
+                    )
+
+                    version = _pkgver(pkg_name)
+                except (PackageNotFoundError, ImportError):
+                    version = "?"
+            version_str = str(version)
+
+            # Flag versions beyond Soup's validated compatibility band.
+            max_excl = _MAX_EXCLUSIVE.get(pkg_name)
+            if max_excl and _version_ge(version_str, max_excl):
+                status = f"[red]INCOMPATIBLE (need <{max_excl})[/]"
+                issues.append(
+                    f'Downgrade {pkg_name}: pip install "{pkg_name}>={min_ver},<{max_excl}"'
+                )
+                fix_parts.append(f'"{pkg_name}>={min_ver},<{max_excl}"')
+                # Asymmetry, on purpose (#874): here only a *required* DEPS row
+                # past its ceiling blocks, whereas the extra-group check below
+                # blocks unconditionally. An optional DEPS row past a ceiling
+                # would exit 0 while the same package in an extra group exits 1.
+                # Unreachable today (_MAX_EXCLUSIVE and the optional DEPS rows
+                # do not intersect), but written down so it is not rediscovered.
+                if required:
+                    core_broken = True
+            elif _version_ok(version_str, min_ver):
+                status = "[green]OK[/]"
+            else:
+                status = f"[yellow]outdated (need >={min_ver})[/]"
+                issues.append(f'Upgrade {pkg_name}: pip install "{pkg_name}>={min_ver}"')
+                fix_parts.append(f'"{pkg_name}>={min_ver}"')
+
+            table.add_row(
+                pkg_name,
+                "yes" if required else "optional",
+                version_str,
+                f">={min_ver}",
+                status,
+            )
+        except ImportError:
+            if required:
+                status = "[red]MISSING[/]"
+                issues.append(f'Install {pkg_name}: pip install "{pkg_name}>={min_ver}"')
+                fix_parts.append(f'"{pkg_name}>={min_ver}"')
+                core_broken = True
+            else:
+                status = "[dim]not installed[/]"
+
+            table.add_row(
+                pkg_name,
+                "yes" if required else "optional",
+                "-",
+                f">={min_ver}",
+                status,
+            )
+
+    # Extra groups render in the same table as optional rows. A missing group
+    # member is advisory (status only, no per-package issue); a group with at
+    # least one missing member contributes exactly one issue pointing at the
+    # extra, so the suggestion keeps the declared ceilings and the platform
+    # torch index instead of bare per-package floors.
+    for extra_name, members in EXTRA_GROUPS:
+        missing_pkgs: list[str] = []
+        for import_name, pkg_name, min_ver in members:
+            version_str = _installed_version_str(import_name, pkg_name)
+            if version_str is None:
+                table.add_row(
+                    pkg_name,
+                    escape(f"[{extra_name}]"),
+                    "-",
+                    f">={min_ver}",
+                    "[dim]not installed[/]",
+                )
+                missing_pkgs.append(pkg_name)
+                continue
+            max_excl = _MAX_EXCLUSIVE.get(pkg_name)
+            if max_excl and _version_ge(version_str, max_excl):
+                status = f"[red]INCOMPATIBLE (need <{max_excl})[/]"
+                issues.append(
+                    f'Downgrade {pkg_name}: pip install "{pkg_name}>={min_ver},<{max_excl}"'
+                )
+                fix_parts.append(f'"{pkg_name}>={min_ver},<{max_excl}"')
+                core_broken = True
+            elif _version_ok(version_str, min_ver):
+                status = "[green]OK[/]"
+            else:
+                status = f"[yellow]outdated (need >={min_ver})[/]"
+                issues.append(f'Upgrade {pkg_name}: pip install "{pkg_name}>={min_ver}"')
+                fix_parts.append(f'"{pkg_name}>={min_ver}"')
+            table.add_row(pkg_name, escape(f"[{extra_name}]"), version_str, f">={min_ver}", status)
+        if missing_pkgs:
+            all_missing = len(missing_pkgs) == len(members)
+            missing_list = ", ".join(missing_pkgs)
+            if extra_name == "train":
+                driver = _nvidia_smi_cuda_version()
+                torch_missing = "torch" in missing_pkgs
+                # Single call site, gated on torch itself being missing.
+                tag = (
+                    _torch_cuda_wheel_tag(driver)
+                    if driver is not None and torch_missing
+                    else None
+                )
+                url = f"https://download.pytorch.org/whl/{tag}" if tag else None
+                if all_missing:
+                    if url is not None:
+                        # ``--index-url`` replaces PyPI, so torch must come from the
+                        # CUDA wheel index in its own step; the ``[train]`` extra is
+                        # then resolved against PyPI with torch already satisfied.
+                        issues.append(
+                            "Training stack not installed:\n"
+                            f"  pip install torch --index-url {url}\n"
+                            '  pip install "souplite[train]"'
+                        )
+                        fix_pre.append(f"pip install torch --index-url {url}")
+                    else:
+                        issues.append(
+                            'Training stack not installed: pip install "souplite[train]"'
+                        )
+                elif url is not None:
+                    issues.append(
+                        f"Training stack incomplete, missing: {missing_list}\n"
+                        f"  pip install torch --index-url {url}\n"
+                        '  pip install "souplite[train]"'
+                    )
+                    fix_pre.append(f"pip install torch --index-url {url}")
+                else:
+                    issues.append(
+                        f"Training stack incomplete, missing: {missing_list}\n"
+                        '  pip install "souplite[train]"'
+                    )
+                fix_parts.append('"souplite[train]"')
+            elif all_missing:
+                issues.append(
+                    f"{extra_name} stack not installed: "
+                    f'pip install "souplite[{extra_name}]"'
+                )
+                fix_parts.append(f'"souplite[{extra_name}]"')
+            else:
+                issues.append(
+                    f"{extra_name} stack incomplete, missing: {missing_list}\n"
+                    f'  pip install "souplite[{extra_name}]"'
+                )
+                fix_parts.append(f'"souplite[{extra_name}]"')
+
+    console.print(table)
+
+    # Check torchvision + torch compatibility
+    _check_torchvision_compat(issues)
+
+    if nccl:
+        _run_nccl_check()
+
+    # Summary
+    if issues:
+        # Issue/fix text may contain "[train]"-style brackets, which Rich
+        # would otherwise swallow as markup tags — escape so the suggestion
+        # renders literally (cmd.exe-safe double quotes included). highlight
+        # is off so Rich does not colour-wrap the quoted specs mid-command.
+        console.print(f"\n[yellow]Found {len(issues)} issue(s):[/]")
+        for issue in issues:
+            console.print(f"  [red]>[/] {escape(issue)}", highlight=False)
+        if fix_pre or fix_parts:
+            console.print("\n[dim]Fix all:[/]")
+            for step in fix_pre:
+                console.print(f"[dim]  {escape(step)}[/]", highlight=False)
+            if fix_parts:
+                console.print(
+                    f"[dim]  pip install {escape(' '.join(fix_parts))}[/]", highlight=False
+                )
+    else:
+        console.print("\n[bold green]All checks passed![/] Your environment is ready.")
+
+    # After the environment summary on purpose: "All checks passed" reports on
+    # the environment, and printing config findings above it read as though the
+    # green line covered them too.
+    if config:
+        _check_config_support(config)
+
+    console.print(f"\n[dim]GitHub: [link={GITHUB_URL}]{GITHUB_URL}[/link][/]")
+
+    if core_broken:
+        raise typer.Exit(code=1)
+
+
+def _installed_version_str(import_name: str, pkg_name: str) -> str | None:
+    """Return the installed version string, or None when not importable."""
+    try:
+        mod = __import__(import_name)
+    except ImportError:
+        return None
+    version = getattr(mod, "__version__", getattr(mod, "VERSION", None))
+    if version is None:
+        try:
+            from importlib.metadata import PackageNotFoundError
+            from importlib.metadata import version as _pkgver
+
+            version = _pkgver(pkg_name)
+        except (PackageNotFoundError, ImportError):
+            version = "?"
+    return str(version)
+
+
+def _check_config_support(config_path: str) -> None:
+    """#755 — report the settings this config sets that its backend never reads.
+
+    Only fields the user actually wrote are listed. A wall of 275 rows is not a
+    pre-flight check, and the fields sitting at their schema default are not
+    what anyone came here to ask about.
+    """
+    from souplite.config.backend_support import (
+        DEFAULT_BACKEND,
+        check_config,
+        unsupported_for,
+    )
+
+    try:
+        from souplite.config.loader import load_config
+
+        cfg = load_config(config_path)
+    except FileNotFoundError as exc:
+        console.print(f"\n[red]Config not found:[/] {config_path}")
+        # Non-zero deliberately: this leg is meant to be gate-able in CI, and a
+        # config that cannot be read is not a clean bill of health. `doctor`
+        # without --config keeps its old exit status.
+        raise typer.Exit(2) from exc
+    except SystemExit as exc:
+        # load_config prints its own diagnosis and raises SystemExit(1) for a
+        # schema-invalid config. SystemExit is a BaseException, so it walks
+        # past `except Exception` and the exit code contradicted the 2
+        # documented in docs/commands.md. Re-raised as 2 so all three unreadable
+        # shapes -- missing, unparseable, schema-invalid -- agree.
+        console.print("\n[red]Config could not be loaded (see above).[/]")
+        raise typer.Exit(2) from exc
+    except Exception as exc:  # invalid YAML, unreadable file
+        console.print(f"\n[red]Config could not be loaded:[/] {exc}")
+        raise typer.Exit(2) from exc
+
+    backend = getattr(cfg, "backend", DEFAULT_BACKEND)
+    gaps = check_config(cfg)
+
+    console.print(
+        f"\n[bold]Config check[/] - task=[bold]{cfg.task}[/] "
+        f"backend=[bold]{backend}[/]"
+    )
+    if not gaps:
+        known = unsupported_for(cfg.task, backend)
+        console.print(
+            f"  [green]None of the {len(known)} setting(s) known to be unread "
+            f"on task={cfg.task} backend={backend} is set in this config.[/]"
+        )
+        return
+
+    table = Table(title=None, show_header=True)
+    # overflow="fold" on both text columns: a dotted field name is one
+    # unbreakable word, so Rich ellipsises it on a narrow terminal and the row
+    # says a setting is ignored without saying which one. Folding keeps the
+    # name and the reason legible at any width.
+    table.add_column("setting", style="bold", overflow="fold")
+    table.add_column("status", justify="center")
+    table.add_column("why", overflow="fold")
+    for entry in gaps:
+        table.add_row(entry.field, f"[yellow]{entry.status}[/]", entry.describe())
+    console.print(table)
+    console.print(
+        f"  [yellow]{len(gaps)} setting(s) written here are not read on "
+        f"backend={backend}.[/]"
+    )
+
+
+def _get_mlx_info() -> dict:
+    """Surface MLX info in the doctor report (never crashes on non-Apple)."""
+    try:
+        from souplite.utils.mlx import get_mlx_info
+    except ImportError:
+        return {"available": False}
+    try:
+        return get_mlx_info()
+    except Exception:  # noqa: BLE001
+        return {"available": False}
+
+
+def _check_mlx():
+    """Report the MLX (Apple Silicon) backend in ``soup doctor``.
+
+    MLX is an Apple Silicon-only stack, so the panel is informational rather
+    than a pass/fail dependency: it shows the installed version and hardware
+    when present, and says so plainly when MLX is missing. It must never crash
+    the report (the info helper degrades to ``available=False`` on any error).
+    """
+    info = _get_mlx_info()
+    if info.get("available"):
+        mem_bytes = info.get("unified_memory_bytes")
+        mem_str = f"{mem_bytes / (1024**3):.0f} GB" if mem_bytes else "unknown"
+        chip = (info.get("chip") or {}).get("chip")
+        console.print(
+            Panel(
+                f"Version:  [bold green]{info.get('version') or 'unknown'}[/]\n"
+                f"Chip:     [bold]{chip or 'Apple Silicon'}[/]\n"
+                f"Memory:   [bold]{mem_str}[/] unified",
+                title="MLX",
+            )
+        )
+    elif info.get("apple_silicon"):
+        console.print(
+            Panel(
+                "Status:   [yellow]not installed[/]\n"
+                "Install:  [dim]pip install \"souplite\\[mlx]\"[/]",
+                title="MLX",
+            )
+        )
+
+
+def _check_gpu():
+    """Check GPU availability and display info."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            gpus = []
+            for idx in range(gpu_count):
+                name = torch.cuda.get_device_name(idx)
+                mem = torch.cuda.get_device_properties(idx)
+                total_gb = getattr(mem, "total_memory", getattr(mem, "total_mem", 0))
+                total_gb = total_gb / (1024**3)
+                gpus.append(f"  GPU {idx}: [bold]{name}[/] ({total_gb:.1f} GB)")
+            gpu_info = "\n".join(gpus)
+            cuda_ver = torch.version.cuda or "N/A"
+            console.print(
+                Panel(
+                    f"CUDA:     [bold green]available[/] (v{cuda_ver})\n"
+                    f"GPUs:     [bold]{gpu_count}[/]\n{gpu_info}",
+                    title="GPU",
+                )
+            )
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            console.print(
+                Panel(
+                    "Backend:  [bold green]MPS (Apple Silicon)[/]\n"
+                    "Status:   [bold green]available[/]",
+                    title="GPU",
+                )
+            )
+        else:
+            # v0.40.1 Part C / N3 — distinguish "no GPU hardware" from
+            # "GPU hardware present, wrong torch wheel". When nvidia-smi
+            # reports a GPU but torch lacks CUDA, the user installed the
+            # CPU-only wheel — point them at the right reinstall command.
+            advisory = _detect_gpu_hw_without_torch_cuda()
+            console.print(
+                Panel(
+                    "Backend:  [bold yellow]CPU only[/]\n"
+                    "Warning:  Training will be slow without GPU."
+                    + (f"\n[dim]{advisory}[/]" if advisory else ""),
+                    title="GPU",
+                )
+            )
+    except ImportError:
+        console.print(
+            Panel(
+                "Backend:  [red]unknown (torch not installed)[/]",
+                title="GPU",
+            )
+        )
+
+
+# Newest-first PyTorch CUDA wheel tags. A driver that advertises CUDA N.M can
+# load any wheel whose CUDA is <= N.M (driver backward compatibility).
+_TORCH_CUDA_WHEELS: tuple[tuple[int, int, str], ...] = (
+    (13, 2, "cu132"),
+    (13, 0, "cu130"),
+    (12, 8, "cu128"),
+    (12, 6, "cu126"),
+    (12, 4, "cu124"),
+    (12, 1, "cu121"),
+    (11, 8, "cu118"),
+)
+
+# PyTorch CUDA indexes that carry a torch release satisfying Soup's
+# ``[train]`` floor (torch>=2.6.0). Keep this table explicit: not every
+# CUDA version reported by a driver has a corresponding PyTorch index.
+_SUPPORTED_TORCH_CUDA_WHEELS = frozenset(
+    {"cu132", "cu130", "cu128", "cu126", "cu124", "cu118"}
+)
+
+
+def _parse_cuda_version(text: str) -> tuple[int, int] | None:
+    """Extract ``(major, minor)`` from an nvidia-smi CUDA version header."""
+    match = re.search(r"CUDA(?:\s+UMD)?\s+Version:\s*(\d+)\.(\d+)", text or "")
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _torch_cuda_wheel_tag(driver: tuple[int, int] | None) -> str | None:
+    """Pick the newest supported PyTorch CUDA wheel for a driver version.
+
+    A missing driver version is not safe to guess from, so it returns ``None``.
+    """
+    if driver is None:
+        return None
+
+    for major, minor, tag in _TORCH_CUDA_WHEELS:
+        if driver >= (major, minor) and tag in _SUPPORTED_TORCH_CUDA_WHEELS:
+            return tag
+
+    return None
+
+
+def _nvidia_smi_executable() -> str | None:
+    """Absolute path to nvidia-smi, or None.
+
+    Bare ``nvidia-smi`` is never handed to ``subprocess`` (CWE-427):
+    Windows ``CreateProcess`` searches the current directory before PATH.
+    """
+    import shutil
+
+    return shutil.which("nvidia-smi")
+
+
+def _nvidia_smi_cuda_version() -> tuple[int, int] | None:
+    """Read the driver's max CUDA version from ``nvidia-smi`` header output."""
+    import subprocess
+
+    nvidia_smi = _nvidia_smi_executable()
+    if nvidia_smi is None:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603 — argv list, no shell
+            [nvidia_smi],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return _parse_cuda_version((completed.stdout or "") + (completed.stderr or ""))
+
+
+def _detect_gpu_hw_without_torch_cuda() -> str:
+    """v0.40.1 Part C / N3 — return advisory string if nvidia-smi succeeds
+    but torch lacks CUDA (i.e. user installed the CPU-only wheel).
+    """
+    import subprocess
+
+    nvidia_smi = _nvidia_smi_executable()
+    if nvidia_smi is None:
+        return ""
+    try:
+        completed = subprocess.run(  # noqa: S603 — argv list, no shell
+            [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    gpu_name = (completed.stdout or "").strip().splitlines()[:1]
+    raw_label = gpu_name[0] if gpu_name else "GPU"
+    # v0.40.1 review fix — security: nvidia-smi output is embedded in a
+    # Rich-markup string at the call site; escape `[`/`]` so a GPU name like
+    # "NVIDIA Quadro [T4]" cannot break or inject markup.
+    from rich.markup import escape as _markup_escape
+
+    gpu_label = _markup_escape(raw_label)
+    try:
+        from importlib.metadata import version as _pkgver
+
+        torch_version = _pkgver("torch")
+    except Exception:  # noqa: BLE001
+        torch_version = "?"
+
+    try:
+        import torch
+
+        torch_cuda_version = getattr(torch.version, "cuda", None)
+    except Exception:  # noqa: BLE001
+        torch_cuda_version = None
+
+    wheel = _torch_cuda_wheel_tag(_nvidia_smi_cuda_version())
+    windows_note = ""
+    if platform.system() == "Windows":
+        windows_note = " On Windows, PyPI's torch wheel is CPU-only."
+
+    if wheel is None:
+        return (
+            f"GPU hardware present ({gpu_label}) but torch CUDA could not "
+            f"be confirmed. The installed torch is {torch_version}. "
+            "Run `nvidia-smi` and install a PyTorch CUDA wheel compatible "
+            "with the reported driver."
+            f"{windows_note}"
+        )
+
+    index_url = f"https://download.pytorch.org/whl/{wheel}"
+
+    if torch_cuda_version:
+        build_status = (
+            f"torch CUDA build ({torch_cuda_version}) could not initialise"
+        )
+    else:
+        build_status = "torch is the CPU build"
+
+    return (
+        f"GPU hardware present ({gpu_label}) but {build_status} "
+        f"(torch {torch_version}). To enable your GPU: "
+        f"`pip install --force-reinstall \"torch>=2.6.0\" "
+        f"--index-url {index_url}`"
+        f"{windows_note}"
+    )
+
+
+def _detect_dual_python_interpreters() -> str:
+    """v0.40.1 Part C / N4 — flag when ``soup`` runs under one Python and
+    ``python`` on the user's PATH is a different interpreter.
+    """
+    import os
+    import shutil
+
+    soup_python = sys.executable
+    path_python = shutil.which("python") or shutil.which("python3")
+    if not path_python:
+        return ""
+    # v0.40.1 review fix — use os.path.realpath, not Path.resolve(), so
+    # Windows 8.3 short names don't produce a false-positive advisory.
+    try:
+        if os.path.realpath(path_python) == os.path.realpath(soup_python):
+            return ""
+    except OSError:
+        return ""
+    return (
+        f"`soup` runs under {soup_python}; `python` on your PATH is "
+        f"{path_python}. site-packages may differ — for any `python -c` "
+        f"check use the soup interpreter explicitly."
+    )
+
+
+_GB = 1024**3
+
+
+def _get_ram_gb() -> str:
+    """Get total system RAM in GB, with cross-platform fallbacks."""
+    # Prefer psutil if installed
+    try:
+        import psutil
+
+        return f"{psutil.virtual_memory().total / _GB:.0f} GB"
+    except ImportError:
+        pass
+
+    system = platform.system()
+    if system == "Linux":
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        return f"{kb * 1024 / _GB:.0f} GB"
+        except (OSError, ValueError):
+            pass
+    elif system == "Darwin":
+        try:
+            import subprocess
+
+            res = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if res.returncode == 0:
+                return f"{int(res.stdout.strip()) / _GB:.0f} GB"
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    elif system == "Windows":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return f"{stat.ullTotalPhys / _GB:.0f} GB"
+        except (OSError, AttributeError):
+            pass
+
+    return "Unknown"
+
+
+def _check_resources(probe_disk: bool = False):
+    """Check RAM and Disk space and display info."""
+    import shutil
+
+    table = Table(title="System Resources")
+    table.add_column("Resource", style="bold")
+    table.add_column("Value")
+
+    table.add_row("RAM", _get_ram_gb())
+
+    try:
+        usage = shutil.disk_usage(".")
+        disk_str = f"{usage.free / _GB:.0f} GB free"
+    except OSError:
+        disk_str = "Unknown"
+
+    table.add_row("Disk", disk_str)
+
+    # v0.72.3 — layer streaming's disk overflow tier needs NVMe: on a spinning
+    # disk each step costs 2 seeks per layer (plan P11), which does not merely
+    # run slower, it thrashes. Reported here so the refusal is not the first
+    # time an operator hears about it.
+    #
+    # Opt-in behind --disk, matching this command's own --nccl convention for
+    # expensive probes. Measured on the dev box: the Windows PowerShell query
+    # costs ~9 s cold and ~2.4 s warm (17.6 s -> 20.0 s on `soup doctor`), paid
+    # by every user including the majority who never touch layer streaming. A
+    # streaming run does its own lazy probe when the tier decision actually
+    # depends on the answer, so nothing is lost by defaulting this off.
+    if probe_disk:
+        try:
+            from souplite.utils.layer_stream import detect_disk_kind
+
+            kind = detect_disk_kind(".")
+        except Exception:  # noqa: BLE001 — a diagnostic must never crash the report
+            kind = "unknown"
+        verdict = {
+            "nvme": "[green]NVMe[/] — layer streaming can use the disk overflow tier",
+            "ssd": "[yellow]SATA SSD[/] — layer streaming refuses the disk tier (RAM only)",
+            "hdd": "[red]HDD[/] — layer streaming refuses the disk tier (RAM only)",
+        }.get(kind, "[yellow]Unknown[/] — layer streaming will refuse the disk tier")
+        table.add_row("Disk type", verdict)
+
+    console.print(table)
+    console.print()
+
+
+def _check_torchvision_compat(issues: list):
+    """Check that torchvision version is compatible with torch."""
+    try:
+        import torch
+        import torchvision
+
+        torch_ver = torch.__version__.split("+")[0]
+        tv_ver = torchvision.__version__.split("+")[0]
+        torch_minor = ".".join(torch_ver.split(".")[:2])
+        tv_minor = ".".join(tv_ver.split(".")[:2])
+
+        # Known compatible pairs (torch minor -> torchvision minor)
+        compat = {
+            "2.6": "0.21",
+            "2.5": "0.20",
+            "2.4": "0.19",
+            "2.3": "0.18",
+            "2.2": "0.17",
+            "2.1": "0.16",
+            "2.0": "0.15",
+        }
+        expected_tv = compat.get(torch_minor)
+        if expected_tv and not tv_minor.startswith(expected_tv):
+            msg = (
+                f"torchvision {tv_ver} may be incompatible with torch {torch_ver}. "
+                f"Expected torchvision {expected_tv}.x"
+            )
+            console.print(f"  [yellow]Warning:[/] {msg}")
+            issues.append(msg)
+    except (ImportError, AttributeError):
+        # AttributeError: torchvision circular import on some platforms
+        pass
+
+
+def _version_ok(installed: str, minimum: str) -> bool:
+    """Check if installed version meets minimum requirement."""
+    try:
+        inst_parts = [int(x) for x in installed.split(".")[:3]]
+        min_parts = [int(x) for x in minimum.split(".")[:3]]
+        # Pad to same length
+        while len(inst_parts) < 3:
+            inst_parts.append(0)
+        while len(min_parts) < 3:
+            min_parts.append(0)
+        return inst_parts >= min_parts
+    except (ValueError, AttributeError):
+        return True  # Can't parse, assume OK
+
+
+def _version_ge(installed: str, threshold: str) -> bool:
+    """v0.40.1 Part C / C5 — return True iff installed >= threshold.
+
+    Used to flag major-version upgrades we haven't migrated to. Robust to
+    suffixes like ``5.0.0.dev0`` (split on ``.``, parse leading ints only).
+    """
+    try:
+        inst_parts: list[int] = []
+        for chunk in installed.split(".")[:3]:
+            digits = "".join(c for c in chunk if c.isdigit())
+            inst_parts.append(int(digits) if digits else 0)
+        thr_parts = [int(x) for x in threshold.split(".")[:3]]
+        while len(inst_parts) < 3:
+            inst_parts.append(0)
+        while len(thr_parts) < 3:
+            thr_parts.append(0)
+        return inst_parts >= thr_parts
+    except (ValueError, AttributeError):
+        return False
+
+
+def _run_nccl_check():
+    """Run NCCL bandwidth test if requested."""
+    try:
+        import torch
+        import torch.distributed as dist
+        import torch.multiprocessing as mp
+
+        from souplite.utils.profiling_v0_43 import nccl_bandwidth_check
+        from souplite.utils.topology import detect_topology
+    except ImportError:
+        console.print("\n[yellow]NCCL bandwidth check requires torch and torch.distributed.[/]")
+        return
+
+    if not torch.cuda.is_available() or not dist.is_available():
+        console.print("\n[yellow]NCCL bandwidth check requires CUDA and torch.distributed.[/]")
+        return
+
+    topo = detect_topology()
+    gpu_count = topo["gpu_count"]
+    if gpu_count < 2:
+        console.print("\n[yellow]NCCL bandwidth requires >=2 GPUs[/]")
+        return
+
+    name = torch.cuda.get_device_name(0).lower()
+    if "h100" in name:
+        gpu = "h100"
+    elif "a100" in name:
+        gpu = "a100"
+    elif "v100" in name:
+        gpu = "v100"
+    elif "4090" in name:
+        gpu = "rtx4090"
+    elif "3090" in name:
+        gpu = "rtx3090"
+    else:
+        gpu = "unknown"
+
+    link = topo["interconnect"]
+
+    manager = mp.Manager()
+    return_dict = manager.dict()
+
+    console.print(
+        "\n[bold]Measuring NCCL bandwidth[/] "
+        "(100 MB all_reduce, 3 warmup + 10 timed iters, median GB/s)..."
+    )
+    try:
+        mp.spawn(_nccl_worker, args=(return_dict,), nprocs=2, join=True)
+    except Exception as e:
+        console.print(f"[red]Failed to measure NCCL bandwidth:[/] {e}")
+        return
+
+    if "gb_per_sec" in return_dict:
+        measured = return_dict["gb_per_sec"]
+        res = nccl_bandwidth_check(gpu=gpu, link=link, measured_gb_per_sec=measured)
+        status = res["status"]
+        if status == "OK":
+            color = "green"
+        elif status == "MINOR":
+            color = "yellow"
+        else:
+            color = "red"
+
+        expected = res.get("expected_gb_per_sec")
+        expected_str = f" vs expected {expected:.1f}" if expected else ""
+
+        console.print(
+            f"  Result ({gpu.upper()} over {link.upper()}): "
+            f"[{color}]{status}[/] ({measured:.1f} GB/s{expected_str})"
+        )
+    else:
+        console.print("[red]Failed to capture NCCL bandwidth measurement.[/]")
+
+
+# NCCL benchmark constants. 100 MB matches typical gradient-bucket size for
+# medium models (7B fp16 ≈ 100-200 MB per bucket) so the measurement
+# reflects real all-reduce traffic, not artificially small messages.
+_NCCL_BENCHMARK_TENSOR_BYTES = 100 * 1024 * 1024  # 100 MB
+_NCCL_BENCHMARK_WARMUP_ITERS = 3  # 3 warmups to amortise CUDA kernel JIT
+_NCCL_BENCHMARK_TIMED_ITERS = 10  # 10 timed runs; report the median (robust to outliers)
+
+
+def _nccl_worker(rank: int, return_dict):
+    import os
+    import statistics
+    import time
+
+    import torch
+    import torch.distributed as dist
+
+    # Snapshot prior env so we can restore after the spawn finishes —
+    # avoids leaking MASTER_ADDR/MASTER_PORT into the parent doctor process
+    # (matters when tests run multiple doctor invocations in one session).
+    prior_addr = os.environ.get("MASTER_ADDR")
+    prior_port = os.environ.get("MASTER_PORT")
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
+
+    try:
+        dist.init_process_group("nccl", rank=rank, world_size=2)
+
+        # 100 MB tensor of float32 (4 bytes per element).
+        num_elements = _NCCL_BENCHMARK_TENSOR_BYTES // 4
+        tensor = torch.ones(num_elements, dtype=torch.float32, device=f"cuda:{rank}")
+
+        # Warmup — runs CUDA kernel JIT + first-NCCL-collective handshake
+        # out of the timing window. 3 iters is enough to stabilise.
+        for _ in range(_NCCL_BENCHMARK_WARMUP_ITERS):
+            dist.all_reduce(tensor)
+        torch.cuda.synchronize(device=f"cuda:{rank}")
+
+        # Per-iteration timing (10 samples). Median is more robust to
+        # one-off jitter (kernel preemption, swap, etc.) than mean.
+        per_iter_sec: list[float] = []
+        for _ in range(_NCCL_BENCHMARK_TIMED_ITERS):
+            start = time.perf_counter()
+            dist.all_reduce(tensor)
+            torch.cuda.synchronize(device=f"cuda:{rank}")
+            per_iter_sec.append(time.perf_counter() - start)
+
+        if rank == 0:
+            median_elapsed = statistics.median(per_iter_sec)
+            size_gb = (tensor.element_size() * tensor.numel()) / 1e9
+            return_dict["gb_per_sec"] = size_gb / median_elapsed
+
+        dist.destroy_process_group()
+    finally:
+        # Restore prior env exactly as we found it (or remove if missing).
+        if prior_addr is None:
+            os.environ.pop("MASTER_ADDR", None)
+        else:
+            os.environ["MASTER_ADDR"] = prior_addr
+        if prior_port is None:
+            os.environ.pop("MASTER_PORT", None)
+        else:
+            os.environ["MASTER_PORT"] = prior_port

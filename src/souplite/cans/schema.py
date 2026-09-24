@@ -1,0 +1,218 @@
+"""Pydantic schemas for the ``.can`` artifact format (v0.26.0 Part E)."""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+from souplite.utils.yaml_limits import check_expanded_nodes
+
+CAN_FORMAT_VERSION = 3  # v0.71.3 #182: attestations field (additive over v2)
+SUPPORTED_CAN_FORMAT_VERSIONS = (1, 2, 3)
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{0,127}$")
+_HF_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-./]{0,127}$")
+_HF_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{0,95}/[A-Za-z0-9][A-Za-z0-9_\-.]{0,95}$")
+
+# v0.71.3 #182 — caps on embedded in-toto attestations.
+_MAX_ATTESTATIONS = 64
+_MAX_ATTESTATION_BYTES = 1024 * 1024  # 1 MiB per statement
+
+
+def validate_attestation_statement(stmt: object) -> dict:
+    """Validate one embedded in-toto Statement dict (v0.71.3 #182).
+
+    Shape-only: must be a dict carrying ``_type`` (str) and ``predicateType``
+    (str), and serialise to <= 1 MiB. Returns the statement unchanged.
+    """
+    if not isinstance(stmt, dict):
+        raise ValueError("attestation must be a dict (in-toto Statement)")
+    # Before json.dumps: a statement loaded from YAML may share references
+    # (anchors / aliases) whose serialised form is exponentially larger. Every
+    # node costs at least one byte of JSON, so a statement within the byte cap
+    # below has fewer nodes than _MAX_ATTESTATION_BYTES and always passes.
+    check_expanded_nodes(stmt, "attestation", limit=_MAX_ATTESTATION_BYTES)
+    type_field = stmt.get("_type")
+    predicate_type = stmt.get("predicateType")
+    if not isinstance(type_field, str) or not type_field:
+        raise ValueError("attestation missing a non-empty '_type' string")
+    if not isinstance(predicate_type, str) or not predicate_type:
+        raise ValueError("attestation missing a non-empty 'predicateType' string")
+    try:
+        size = len(json.dumps(stmt).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"attestation is not JSON-serialisable: {exc}") from exc
+    if size > _MAX_ATTESTATION_BYTES:
+        raise ValueError(
+            f"attestation too large ({size} > {_MAX_ATTESTATION_BYTES} bytes)"
+        )
+    return stmt
+
+
+class DeployTarget(BaseModel):
+    """One declarative deploy target embedded in a can manifest (v2+).
+
+    ``kind`` selects the deploy backend:
+      - ``ollama``: model name to deploy via ``soup deploy ollama``
+      - ``gguf``: relative path inside the can to a GGUF artifact
+      - ``vllm``: model id to serve via ``soup serve --backend vllm``
+    """
+
+    kind: Literal["ollama", "gguf", "vllm"] = Field(description="Deploy backend")
+    name: Optional[str] = Field(
+        default=None, max_length=128,
+        description="Model / artifact name (kind-specific)",
+    )
+    path: Optional[str] = Field(
+        default=None, max_length=512,
+        description="Relative path within the can for kind=gguf",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError("deploy name must not contain null bytes or newlines")
+        return value
+
+    @field_validator("path")
+    @classmethod
+    def _safe_relpath(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if "\x00" in value:
+            raise ValueError("deploy path contains null byte")
+        if value.startswith("/") or value.startswith("\\"):
+            raise ValueError(f"deploy path '{value}' must be relative")
+        # Windows drive-absolute (``C:\...`` / ``C:/...``) is absolute too but
+        # starts with a letter, so it slipped past the ``/`` / ``\`` check.
+        if len(value) >= 2 and value[1] == ":" and value[0].isalpha():
+            raise ValueError(f"deploy path '{value}' must be relative")
+        # Normalise separators first, then split — a mixed-separator path
+        # like ``foo/..\\bar`` would otherwise slip past a single-separator
+        # split because ``"..\\bar"`` != ``".."``.
+        normalised = value.replace("\\", "/")
+        if any(part == ".." for part in normalised.split("/")):
+            raise ValueError(f"deploy path '{value}' may not contain '..'")
+        return value
+
+
+class DataRef(BaseModel):
+    """How to fetch the training data after unpacking a can.
+
+    ``kind`` is one of:
+      - ``url``: HTTPS URL pointing at a JSONL file
+      - ``hf``: HuggingFace dataset id (``org/dataset``)
+      - ``local``: relative path — user must supply it locally
+    """
+
+    kind: Literal["url", "hf", "local"] = Field(
+        description="Data source type",
+    )
+    url: Optional[str] = Field(default=None, description="HTTPS URL")
+    hf_dataset: Optional[str] = Field(default=None, description="HF dataset id")
+    local_path: Optional[str] = Field(default=None, description="Relative local path")
+
+    @field_validator("url")
+    @classmethod
+    def _https_only(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if not value.startswith("https://"):
+            raise ValueError(
+                f"data_ref.url must be https:// (got: {value}) - "
+                "plain http is forbidden for remote fetches"
+            )
+        return value
+
+    @field_validator("hf_dataset")
+    @classmethod
+    def _valid_hf_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if not _HF_NAME_RE.match(value):
+            raise ValueError(
+                f"hf_dataset '{value}' is invalid - "
+                "use 'org/name' with alphanumeric + _-./"
+            )
+        return value
+
+
+class Manifest(BaseModel):
+    """Top-level metadata for a ``.can`` file."""
+
+    can_format_version: int = Field(description="Format version integer")
+    name: str = Field(description="Recipe name")
+    author: str = Field(description="Author handle", max_length=128)
+    created_at: str = Field(description="ISO-8601 timestamp or YYYY-MM-DD")
+    base_hash: str = Field(description="SHA-256 of the config (from registry)")
+    description: Optional[str] = Field(default=None, max_length=4096)
+    tags: list[str] = Field(default_factory=list)
+    deploy_targets: list[DeployTarget] = Field(
+        default_factory=list,
+        description="Optional declarative deploy targets (v2+)",
+    )
+    attestations: list[dict] = Field(
+        default_factory=list,
+        description="Optional embedded in-toto Statements (v3+)",
+    )
+
+    @field_validator("attestations", mode="before")
+    @classmethod
+    def _valid_attestations(cls, value: object) -> list[dict]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("attestations must be a list of in-toto Statements")
+        if len(value) > _MAX_ATTESTATIONS:
+            raise ValueError(
+                f"too many attestations ({len(value)} > {_MAX_ATTESTATIONS})"
+            )
+        return [validate_attestation_statement(s) for s in value]
+
+    @field_validator("can_format_version")
+    @classmethod
+    def _known_version(cls, value: int) -> int:
+        if value not in SUPPORTED_CAN_FORMAT_VERSIONS:
+            raise ValueError(
+                f"unknown can_format_version {value}; this build of Soup "
+                f"supports versions {SUPPORTED_CAN_FORMAT_VERSIONS}. "
+                "Upgrade Soup or re-pack the can with a supported format."
+            )
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, value: str) -> str:
+        if not _NAME_RE.match(value):
+            raise ValueError(
+                f"can name '{value}' is invalid - "
+                "alphanumeric + _-. only, must start with alphanumeric"
+            )
+        return value
+
+    @field_validator("author")
+    @classmethod
+    def _clean_author(cls, value: str) -> str:
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError("author must not contain null bytes or newlines")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def _parseable_created_at(cls, value: str) -> str:
+        # Accept YYYY-MM-DD or any ISO-8601 datetime parseable by fromisoformat
+        from datetime import datetime as _dt
+
+        try:
+            _dt.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"created_at '{value}' is not valid ISO-8601"
+            ) from exc
+        return value

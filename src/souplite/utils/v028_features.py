@@ -1,0 +1,228 @@
+"""v0.28.0 speed/memory feature application — extracted for multi-trainer reuse.
+
+The original v0.28.0 release wired Cut Cross-Entropy, FP8, and kernel auto-compose
+into ``SFTTrainerWrapper`` only and gated other trainers via a
+``model_validator`` to fail-fast at config-load. v0.33.0 (#43) drops that
+gate and extracts the apply logic here so any trainer wrapper can call it
+in two lines.
+
+Kernel auto-compose is now rejected at config load because it never applied
+the candidate it reported. Activation-offloading is NOT included here — its
+scope is the entire ``trainer.train()`` call (it wraps in a context manager),
+so each trainer wires it inline. CCE / FP8 are pre-train one-shots and fit this
+single helper.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Iterator, Optional
+
+if TYPE_CHECKING:
+    from rich.console import Console
+
+    from souplite.config.schema import TrainingConfig
+
+
+def apply_v028_speed_memory(
+    *,
+    model: Any,
+    tcfg: "TrainingConfig",
+    base_model: str,
+    console: Optional["Console"] = None,
+    device: str = "cpu",
+    backend: str = "transformers",
+    skip_cut_ce: bool = False,
+) -> dict[str, bool]:
+    """Apply Cut-CE / FP8 features to ``model``.
+
+    Returns a dict ``{feature_name: applied}`` so the caller can log the
+    decisions for the run record. Each feature degrades silently to a
+    yellow advisory if the underlying lib isn't available — never crashes
+    the training kick-off.
+    """
+    applied: dict[str, bool] = {
+        "cut_ce": False,
+        "fp8": False,
+        "kernel_auto_compose": False,
+    }
+
+    def _say(text: str, style: str = "green") -> None:
+        if console is None:
+            return
+        console.print(f"[{style}]{text}[/]")
+
+    # --- Cut Cross-Entropy ---------------------------------------------------
+    if getattr(tcfg, "use_cut_ce", False):
+        if skip_cut_ce:
+            applied["cut_ce"] = False
+        else:
+            from souplite.utils.cut_ce import NO_MATCHING_ARCHITECTURE_MESSAGE
+
+            try:
+                from souplite.utils.cut_ce import apply_cut_ce
+                ok = bool(apply_cut_ce(base_model))
+            except Exception:  # noqa: BLE001 — degrade gracefully
+                ok = False
+            applied["cut_ce"] = ok
+            if ok:
+                _say("Cut Cross-Entropy enabled (chunked CCE kernel)")
+            else:
+                _say(f"Cut Cross-Entropy: {NO_MATCHING_ARCHITECTURE_MESSAGE}", style="yellow")
+
+    # --- FP8 training --------------------------------------------------------
+    if getattr(tcfg, "quantization_aware", None) == "fp8":
+        recipe = getattr(tcfg, "fp8_recipe", "tensorwise")
+        from souplite.utils.fp8 import FP8HardwareUnsupportedError
+        try:
+            from souplite.utils.fp8 import apply_fp8_training
+            ok = bool(apply_fp8_training(model, recipe=recipe))
+        except FP8HardwareUnsupportedError:
+            # #835 ruling: FP8 was asked for explicitly and this card cannot run
+            # it. Warning and training on without it is the silent-setting
+            # defect; the run stops here, before anything trains.
+            raise
+        except Exception:  # noqa: BLE001
+            ok = False
+        applied["fp8"] = ok
+        if ok:
+            _say(f"FP8 training enabled (Float8Linear, recipe={recipe})")
+        else:
+            _say(
+                "FP8 training requested but unavailable (torchao.float8 missing)",
+                style="yellow",
+            )
+
+    # --- FP8 attention (v0.71.21 #141) ---------------------------------------
+    # Key added only when the flag is set — keeps the legacy 3-key dict
+    # contract on the no-features path (test_part_c exact-equality).
+    if getattr(tcfg, "fp8_attention", False):
+        recipe = getattr(tcfg, "fp8_recipe", "tensorwise")
+        from souplite.utils.fp8 import FP8HardwareUnsupportedError
+        try:
+            from souplite.utils.advanced_precision import apply_fp8_attention
+            converted = apply_fp8_attention(model, recipe=recipe)
+            applied["fp8_attention"] = True
+            _say(f"FP8 attention enabled ({converted} projections)")
+        except FP8HardwareUnsupportedError:
+            raise
+        except (RuntimeError, ValueError, TypeError) as exc:
+            applied["fp8_attention"] = False
+            _say(f"FP8 attention: {exc}", style="yellow")
+
+    # --- NVFP4 (v0.71.21 #141 — Blackwell-only) ------------------------------
+    if getattr(tcfg, "nvfp4", False):
+        try:
+            from souplite.utils.advanced_precision import apply_nvfp4
+            targeted = apply_nvfp4(model)
+            applied["nvfp4"] = True
+            _say(f"NVFP4 quantisation applied ({targeted} linears)")
+        except (RuntimeError, ValueError, TypeError) as exc:
+            applied["nvfp4"] = False
+            _say(f"NVFP4: {exc}", style="yellow")
+
+    # --- Kernel auto-compose -------------------------------------------------
+    # Config validation rejects this flag. Keep a defensive guard for callers
+    # that bypass Pydantic so the old helper can no longer report a selection
+    # that it never applied (#801).
+    if getattr(tcfg, "kernel_auto_compose", False):
+        _say(
+            "Kernel auto-compose is unsupported; enable use_liger and/or "
+            "use_flash_attn explicitly",
+            style="yellow",
+        )
+
+    return applied
+
+
+@contextlib.contextmanager
+def activation_offloading_context(
+    tcfg: "TrainingConfig", output_dir: str,
+) -> Iterator[None]:
+    """Wrap a trainer's ``trainer.train()`` call with activation offloading.
+
+    Centralises the cwd-containment guard for ``activation_offloading="disk"``
+    (defence-in-depth — caller's ``cfg.output`` is also validated upstream)
+    and the ``offload_context`` setup. ``None`` and ``"cpu"`` modes pass
+    through to ``offload_context`` directly.
+
+    Raises ``ValueError`` when ``activation_offloading="disk"`` and
+    ``output_dir`` is outside the current working directory.
+    """
+    from souplite.utils.activation_offload import offload_context
+    from souplite.utils.paths import is_under_cwd
+
+    save_dir: Optional[str] = None
+    mode = getattr(tcfg, "activation_offloading", None)
+    if mode == "disk":
+        if not is_under_cwd(output_dir):
+            # Reduce to basename so $HOME / absolute paths don't leak (matches
+            # the v0.34.0 crash.py policy).
+            import os as _os
+
+            raise ValueError(
+                "activation_offloading='disk' requires the training output "
+                "dir to be under the current working directory; got "
+                f"basename={_os.path.basename(output_dir)!r}"
+            )
+        save_dir = str(Path(output_dir) / "_activation_offload")
+    with offload_context(mode, save_dir=save_dir):
+        yield
+
+
+def supports_v028_features(task: str) -> bool:
+    """Tasks where v0.28.0 speed/memory wiring has been ported.
+
+    Every task that calls :func:`apply_v028_speed_memory` should be listed
+    here so config validation can advise users on tasks that would silently
+    no-op. v0.35.0 (#60) extends coverage from {sft, dpo, pretrain} to
+    every transformer-backend trainer.
+    """
+    return task in {
+        "sft",
+        "dpo",
+        "pretrain",
+        "grpo",
+        "kto",
+        "orpo",
+        "simpo",
+        "ipo",
+        "bco",
+        "preference",
+        "ppo",
+        "reward_model",
+        "embedding",
+    }
+
+
+def warn_unsupported_features(
+    tcfg: "TrainingConfig", task: str,
+) -> Optional[str]:
+    """Return a human warning if non-v0.28.0-wired tasks set v0.28.0 flags.
+
+    Returns None when nothing to warn about. v0.35.0 #60 expanded coverage
+    to every transformer-backend trainer; this helper now only fires for
+    truly-unsupported tasks (e.g. a hypothetical future task or an MLX
+    backend route).
+    """
+    if supports_v028_features(task):
+        return None
+    issues: list[str] = []
+    if getattr(tcfg, "use_cut_ce", False):
+        issues.append("use_cut_ce")
+    if getattr(tcfg, "quantization_aware", None) == "fp8":
+        issues.append('quantization_aware="fp8"')
+    if getattr(tcfg, "activation_offloading", None) is not None:
+        issues.append("activation_offloading")
+    if getattr(tcfg, "fp8_attention", False):
+        issues.append("fp8_attention")
+    if getattr(tcfg, "nvfp4", False):
+        issues.append("nvfp4")
+    if not issues:
+        return None
+    return (
+        f"v0.28.0 speed/memory features {issues} are not wired for "
+        f"task={task!r}. Flags will be silently ignored. See "
+        "supports_v028_features() for the current supported task list."
+    )

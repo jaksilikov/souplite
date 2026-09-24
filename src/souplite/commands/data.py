@@ -1,0 +1,4242 @@
+"""soup data — dataset inspection and tools."""
+
+from __future__ import annotations
+
+import json
+import ntpath
+import os
+import random
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from souplite.data.loader import load_raw_data
+from souplite.data.validator import validate_and_stats
+from souplite.utils.embed import DEFAULT_EMBED_MODEL, embed_texts
+from souplite.utils.exit_codes import EXIT_GATE_FAILED, EXIT_USAGE_ERROR, GateCommand
+from souplite.utils.paths import is_under_cwd
+from souplite.utils.semdedup import DedupReport, greedy_semdedup
+from souplite.utils.terminal import for_terminal
+
+console = Console()
+
+app = typer.Typer(no_args_is_help=True)
+
+
+@app.command()
+def inspect(
+    path: str = typer.Argument(..., help="Path to dataset file (jsonl, csv, parquet)"),
+    rows: int = typer.Option(5, "--rows", "-r", help="Number of sample rows to show"),
+):
+    """Inspect a dataset: show stats and sample rows."""
+    file_path = Path(path)
+    if not file_path.exists():
+        console.print(f"[red]File not found: {file_path}[/]")
+        raise typer.Exit(1)
+
+    console.print(f"[dim]Inspecting {file_path}...[/]\n")
+    data = load_raw_data(file_path)
+    result = validate_and_stats(data)
+
+    # Print stats
+    stats_table = Table(title="Dataset Stats")
+    stats_table.add_column("Metric", style="bold")
+    stats_table.add_column("Value")
+    stats_table.add_row("Total samples", str(result["total"]))
+    stats_table.add_row("Columns", ", ".join(result["columns"]))
+    stats_table.add_row("Avg length (chars)", str(result["avg_length"]))
+    stats_table.add_row("Min length", str(result["min_length"]))
+    stats_table.add_row("Max length", str(result["max_length"]))
+    stats_table.add_row("Empty fields", str(result["empty_fields"]))
+    stats_table.add_row("Duplicates", str(result["duplicates"]))
+    console.print(stats_table)
+
+    # Vision stats (if dataset contains images)
+    _show_vision_stats(data)
+
+    # Print sample rows
+    if rows > 0 and len(data) > 0:
+        # Escape dataset-derived cell content + column names: a stray '[/]' in
+        # ordinary data crashes Rich with MarkupError; a crafted '[link=...]'
+        # renders a phishing hyperlink. Mirrors `soup data review`.
+        from rich.markup import escape as _escape
+
+        console.print(f"\n[bold]Sample rows ({min(rows, len(data))}):[/]")
+        sample_table = Table(show_lines=True)
+        for col in result["columns"][:5]:  # max 5 columns
+            sample_table.add_column(_escape(str(col)), max_width=60)
+        for row in data[: min(rows, len(data))]:
+            values = [
+                _escape(str(row.get(col, ""))[:60])
+                for col in result["columns"][:5]
+            ]
+            sample_table.add_row(*values)
+        console.print(sample_table)
+
+
+@app.command(cls=GateCommand)
+def validate(
+    path: str = typer.Argument(..., help="Path to dataset file"),
+    fmt: str = typer.Option(
+        "auto", "--format", "-f",
+        help="Expected format: auto, alpaca, sharegpt, chatml, dpo, kto, plaintext",
+    ),
+    min_valid_fraction: float = typer.Option(
+        0.0,
+        "--min-valid-fraction",
+        min=0.0,
+        max=1.0,
+        help="Exit 2 when the fraction of valid rows is below this value",
+    ),
+):
+    """Validate a dataset, returning exit 3 for input errors and 2 for unusable data."""
+    file_path = Path(path)
+    if not file_path.exists():
+        console.print(f"[red]File not found: {file_path}[/]")
+        raise typer.Exit(EXIT_USAGE_ERROR)
+
+    if fmt != "auto":
+        from souplite.data.formats import VALID_FORMATS
+
+        if fmt not in VALID_FORMATS:
+            console.print(
+                f"[red]Unknown --format: {fmt!r}[/]\n"
+                f"Accepted: auto, {', '.join(VALID_FORMATS)}"
+            )
+            raise typer.Exit(EXIT_USAGE_ERROR)
+
+    data = load_raw_data(file_path)
+
+    # Auto-detect format if not specified
+    if fmt == "auto":
+        from souplite.data.formats import detect_format
+
+        try:
+            fmt = detect_format(data)
+            console.print(f"[dim]Auto-detected format: {fmt}[/]")
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(EXIT_USAGE_ERROR)
+
+    result = validate_and_stats(data, expected_format=fmt)
+
+    if result["issues"]:
+        console.print("[yellow]Issues found:[/]")
+        for issue in result["issues"]:
+            console.print(f"  [yellow]![/] {issue}")
+    else:
+        console.print("[bold green]Dataset is valid![/]")
+
+    valid = result["valid_rows"]
+    total = result["total"]
+    console.print(f"\n[green]{valid}/{total} rows valid for {fmt} format[/]")
+
+    if total > 0 and valid == 0:
+        console.print("[red]Validation failed: no usable rows remain.[/]")
+        raise typer.Exit(EXIT_GATE_FAILED)
+
+    if total > 0 and valid / total < min_valid_fraction:
+        console.print(
+            f"[red]Validation failed: valid fraction {valid / total:.3f} is below "
+            f"--min-valid-fraction {min_valid_fraction:.3f}.[/]"
+        )
+        raise typer.Exit(EXIT_GATE_FAILED)
+
+
+@app.command()
+def convert(
+    path: str = typer.Argument(..., help="Input dataset file"),
+    to: str = typer.Option(
+        ..., "--to", "-t",
+        help="Target format: alpaca, sharegpt, chatml",
+    ),
+    output: str = typer.Option(
+        None, "--output", "-o",
+        help="Output file path (default: <input>_<format>.jsonl)",
+    ),
+):
+    """Convert a dataset between formats (alpaca, sharegpt, chatml)."""
+    from souplite.data.formats import (
+        CONVERTIBLE_FORMATS,
+        detect_format,
+        format_to_messages,
+        messages_to_format,
+    )
+
+    file_path = Path(path)
+    if not file_path.exists():
+        console.print(f"[red]File not found: {file_path}[/]")
+        raise typer.Exit(1)
+
+    if to not in CONVERTIBLE_FORMATS:
+        console.print(
+            f"[red]Invalid target format: {to}[/]\n"
+            f"Supported: {', '.join(CONVERTIBLE_FORMATS)}"
+        )
+        raise typer.Exit(1)
+
+    data = load_raw_data(file_path)
+    if not data:
+        console.print("[red]Dataset is empty.[/]")
+        raise typer.Exit(1)
+
+    src_fmt = detect_format(data)
+    console.print(f"[dim]Detected source format: {src_fmt}[/]")
+
+    if src_fmt == to:
+        console.print(f"[yellow]Source and target format are both '{to}'. Nothing to convert.[/]")
+        raise typer.Exit()
+
+    if src_fmt == "dpo":
+        console.print("[red]Cannot convert DPO format (preference pairs are not conversations).[/]")
+        raise typer.Exit(1)
+
+    # Convert: source -> messages -> target
+    converted = []
+    failed = 0
+    for row in data:
+        messages = format_to_messages(row, src_fmt)
+        if messages is None:
+            failed += 1
+            continue
+        result = messages_to_format(messages, to)
+        if result is None:
+            failed += 1
+            continue
+        converted.append(result)
+
+    if not converted:
+        console.print("[red]All rows failed to convert.[/]")
+        raise typer.Exit(1)
+
+    # Determine output path
+    if output is None:
+        output = str(file_path.stem) + f"_{to}.jsonl"
+    out_path = Path(output)
+
+    _write_jsonl(out_path, converted)
+
+    console.print(
+        f"[green]Converted {len(converted)} rows:[/] {src_fmt} -> {to}\n"
+        f"Output: [bold]{out_path}[/]"
+    )
+    if failed > 0:
+        console.print(f"[yellow]{failed} rows failed to convert.[/]")
+
+
+@app.command()
+def merge(
+    files: list[str] = typer.Argument(..., help="Paths to dataset files to merge"),
+    output: str = typer.Option(
+        "merged.jsonl", "--output", "-o",
+        help="Output file path",
+    ),
+    shuffle: bool = typer.Option(False, "--shuffle", help="Shuffle after merging"),
+):
+    """Merge multiple datasets into a single file."""
+    all_data: list[dict] = []
+
+    for file_str in files:
+        file_path = Path(file_str)
+        if not file_path.exists():
+            console.print(f"[red]File not found: {file_path}[/]")
+            raise typer.Exit(1)
+        data = load_raw_data(file_path)
+        console.print(f"[dim]Loaded {len(data)} rows from {file_path}[/]")
+        all_data.extend(data)
+
+    if not all_data:
+        console.print("[red]No data loaded from any file.[/]")
+        raise typer.Exit(1)
+
+    if shuffle:
+        random.shuffle(all_data)
+
+    out_path = Path(output)
+    _write_jsonl(out_path, all_data)
+
+    console.print(
+        f"[green]Merged {len(all_data)} rows from {len(files)} files.[/]\n"
+        f"Output: [bold]{out_path}[/]"
+    )
+
+
+def _row_embed_text(row: dict, field: Optional[str]) -> str:
+    """What gets embedded for a row: one field, or all text values joined.
+
+    Mirrors the MinHash branch's text selection so ``--field`` means the
+    same thing for both backends. NOTE: ``soup data topics`` deliberately
+    picks row text differently — it prefers ``_eval_text.row_text``'s
+    assistant-turn extraction, because a topic map should cluster on what
+    the model is taught to SAY, whereas dedup must consider the whole row.
+    """
+    if field:
+        return str(row.get(field, ""))
+    return " ".join(str(value) for value in row.values() if value)
+
+
+def _semantic_dedup(
+    data: list[dict],
+    *,
+    threshold: float,
+    field: Optional[str],
+    embed_model: str,
+    device: str,
+    out_path: Path,
+) -> DedupReport:
+    """SemDeDup branch of ``soup data dedup --semantic``."""
+    texts = [_row_embed_text(row, field) for row in data]
+    try:
+        vectors = embed_texts(texts, model_id=embed_model, device=device)
+    except ImportError:
+        console.print(
+            "[red]Semantic dedup needs PyTorch + transformers.[/]\n"
+            # \[train] is escaped: Rich would otherwise eat the bracket as a
+            # markup tag and print `pip install "souplite"` -- a command that
+            # installs the package WITHOUT the extra the user is missing.
+            # Double quotes, not single: cmd.exe cannot strip `'` and pip then
+            # rejects the requirement outright.
+            "Install with: [bold]pip install \"souplite\\[train]\"[/]"
+        )
+        raise typer.Exit(1)
+    except (ValueError, TypeError) as exc:
+        from rich.markup import escape as _esc
+
+        console.print(f"[red]{_esc(str(exc))}[/]")
+        raise typer.Exit(1)
+
+    report = greedy_semdedup(vectors, threshold=threshold)
+    unique = [data[idx] for idx in report.kept]
+    _write_jsonl(out_path, unique)
+    console.print(
+        f"[green]Semantic dedup complete:[/] {len(data)} -> {len(unique)} rows "
+        f"([red]-{len(report.dropped)}[/] near-duplicates)\n"
+        f"Output: [bold]{out_path}[/]"
+    )
+    return report
+
+
+@app.command()
+def dedup(
+    path: str = typer.Argument(..., help="Path to dataset file"),
+    output: str = typer.Option(
+        None, "--output", "-o",
+        help="Output file path (default: <input>_deduped.jsonl)",
+    ),
+    threshold: float = typer.Option(
+        0.8, "--threshold",
+        help="Similarity threshold (0.0-1.0): MinHash Jaccard by default, "
+             "embedding cosine under --semantic.",
+    ),
+    field: str = typer.Option(
+        None, "--field", "-f",
+        help="Field to hash/embed (default: all text fields concatenated)",
+    ),
+    semantic: bool = typer.Option(
+        False, "--semantic",
+        help="Use embedding cosine (SemDeDup) instead of MinHash. Catches "
+             "paraphrases MinHash misses. Requires souplite\\[train].",
+    ),
+    embed_model: str = typer.Option(
+        DEFAULT_EMBED_MODEL, "--embed-model",
+        help="Embedding model used by --semantic.",
+    ),
+    device: str = typer.Option(
+        "auto", "--device", help="Device for --semantic (auto/cpu/cuda)."
+    ),
+):
+    """Remove near-duplicate rows: MinHash (default) or embeddings (--semantic).
+
+    ``--threshold`` is backend-dependent: MinHash Jaccard similarity by
+    default, embedding cosine under ``--semantic``.
+    """
+    file_path = Path(path)
+    if not file_path.exists():
+        console.print(f"[red]File not found: {file_path}[/]")
+        raise typer.Exit(1)
+
+    data = load_raw_data(file_path)
+    if not data:
+        console.print("[red]Dataset is empty.[/]")
+        raise typer.Exit(1)
+
+    # Output resolution + containment is shared by BOTH backends.
+    if output is None:
+        output = str(file_path.stem) + "_deduped.jsonl"
+    out_path = Path(output)
+    if not is_under_cwd(out_path):
+        console.print(
+            f"[red]Output path is outside the working directory: {out_path}[/]"
+        )
+        raise typer.Exit(1)
+
+    if semantic:
+        console.print(
+            f"[dim]Semantic dedup of {len(data)} rows "
+            f"(threshold={threshold}, model={embed_model})...[/]"
+        )
+        _semantic_dedup(
+            data, threshold=threshold, field=field,
+            embed_model=embed_model, device=device, out_path=out_path,
+        )
+        return
+
+    # MinHash branch. The import lives HERE, not at the top of the function:
+    # the semantic path must not require the [data] extra it never uses.
+    try:
+        from datasketch import MinHash, MinHashLSH
+    except ImportError:
+        console.print(
+            "[red]datasketch not installed.[/]\n"
+            "Install with: [bold]pip install \"souplite\\[data]\"[/]"
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[dim]Deduplicating {len(data)} rows (threshold={threshold})...[/]")
+
+    # Build MinHash for each row
+    num_perm = 128
+    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    minhashes = []
+
+    for idx, row in enumerate(data):
+        if field:
+            text = str(row.get(field, ""))
+        else:
+            text = " ".join(str(v) for v in row.values() if v)
+
+        words = text.lower().split()
+        shingles = set()
+        for i in range(max(1, len(words) - 2)):
+            shingles.add(" ".join(words[i: i + 3]))
+
+        mhash = MinHash(num_perm=num_perm)
+        for shingle in shingles:
+            mhash.update(shingle.encode("utf-8"))
+
+        minhashes.append(mhash)
+
+        try:
+            lsh.insert(str(idx), mhash)
+        except ValueError:
+            pass  # duplicate key, already inserted by LSH
+
+    # Collect unique indices
+    seen: set[int] = set()
+    unique_indices = []
+    for idx in range(len(data)):
+        if idx in seen:
+            continue
+        unique_indices.append(idx)
+        results = lsh.query(minhashes[idx])
+        for dup_idx_str in results:
+            seen.add(int(dup_idx_str))
+
+    unique_data = [data[idx] for idx in unique_indices]
+    removed = len(data) - len(unique_data)
+
+    _write_jsonl(out_path, unique_data)
+
+    console.print(
+        f"[green]Dedup complete:[/] {len(data)} -> {len(unique_data)} rows "
+        f"([red]-{removed}[/] duplicates)\n"
+        f"Output: [bold]{out_path}[/]"
+    )
+
+
+@app.command(name="filter")
+def filter_data(
+    path: str = typer.Argument(..., help="Path to dataset file"),
+    output: str = typer.Option(
+        None, "--output", "-o",
+        help="Output file path (default: <input>_filtered.jsonl)",
+    ),
+    perplexity: float = typer.Option(
+        None, "--perplexity", "--ppl",
+        help="Max perplexity threshold (rows above this are removed)",
+    ),
+    coherence: float = typer.Option(
+        None, "--coherence", "--min-coherence",
+        help="Min coherence threshold 0.0-1.0 (rows below this are removed)",
+    ),
+    perplexity_model: str = typer.Option(
+        "gpt2", "--ppl-model",
+        help="Model for perplexity scoring (default: gpt2)",
+    ),
+    field: str = typer.Option(
+        None, "--field", "-f",
+        help="Field to score (default: all text fields concatenated)",
+    ),
+    score_only: bool = typer.Option(
+        False, "--score-only",
+        help="Add scores to data without filtering (writes _scored.jsonl)",
+    ),
+):
+    """Filter dataset by quality: perplexity and/or coherence scoring."""
+    file_path = Path(path)
+    if not file_path.exists():
+        console.print(f"[red]File not found: {file_path}[/]")
+        raise typer.Exit(1)
+
+    if perplexity is None and coherence is None and not score_only:
+        console.print(
+            "[red]Specify at least one filter: --perplexity, --coherence, or --score-only[/]"
+        )
+        raise typer.Exit(1)
+
+    data = load_raw_data(file_path)
+    if not data:
+        console.print("[red]Dataset is empty.[/]")
+        raise typer.Exit(1)
+
+    console.print(f"[dim]Scoring {len(data)} rows...[/]")
+
+    # Extract texts for scoring
+    texts = []
+    for row in data:
+        if field and field in row:
+            texts.append(str(row[field]))
+        else:
+            texts.append(" ".join(str(v) for v in row.values() if v))
+
+    # Compute coherence scores (lightweight, always computed)
+    from souplite.utils.quality import compute_coherence_score
+
+    coherence_scores = compute_coherence_score(texts)
+
+    # Compute perplexity scores (requires model, only if requested)
+    perplexity_scores = None
+    if perplexity is not None or score_only:
+        try:
+            from souplite.utils.quality import compute_perplexity_scores
+
+            console.print(f"[dim]Computing perplexity with {perplexity_model}...[/]")
+            perplexity_scores = compute_perplexity_scores(
+                texts, model_name=perplexity_model,
+            )
+        except ImportError:
+            console.print(
+                "[yellow]torch/transformers not available for perplexity scoring. "
+                "Skipping perplexity.[/]"
+            )
+
+    if score_only:
+        # Add scores to each row and write output
+        scored_data = []
+        for idx, row in enumerate(data):
+            scored_row = dict(row)
+            scored_row["_coherence_score"] = coherence_scores[idx]
+            if perplexity_scores is not None:
+                scored_row["_perplexity_score"] = round(perplexity_scores[idx], 2)
+            scored_data.append(scored_row)
+
+        if output is None:
+            output = str(file_path.stem) + "_scored.jsonl"
+        out_path = Path(output)
+        _write_jsonl(out_path, scored_data)
+        console.print(
+            f"[green]Scored {len(scored_data)} rows.[/]\n"
+            f"Output: [bold]{out_path}[/]"
+        )
+        return
+
+    # Filter
+    kept = []
+    removed = []
+    for idx, row in enumerate(data):
+        remove = False
+        if perplexity is not None and perplexity_scores is not None:
+            if perplexity_scores[idx] > perplexity:
+                remove = True
+        if coherence is not None and coherence_scores[idx] < coherence:
+            remove = True
+
+        if remove:
+            removed.append(row)
+        else:
+            kept.append(row)
+
+    if output is None:
+        output = str(file_path.stem) + "_filtered.jsonl"
+    out_path = Path(output)
+    _write_jsonl(out_path, kept)
+
+    console.print(
+        f"[green]Filter complete:[/] {len(data)} -> {len(kept)} rows "
+        f"([red]-{len(removed)}[/] removed)\n"
+        f"Output: [bold]{out_path}[/]"
+    )
+    if perplexity is not None and perplexity_scores is not None:
+        avg_ppl = sum(perplexity_scores) / len(perplexity_scores)
+        console.print(f"Avg perplexity: [bold]{avg_ppl:.1f}[/] (threshold: {perplexity})")
+    if coherence is not None:
+        avg_coh = sum(coherence_scores) / len(coherence_scores)
+        console.print(f"Avg coherence:  [bold]{avg_coh:.3f}[/] (threshold: {coherence})")
+
+
+@app.command()
+def stats(
+    path: str = typer.Argument(..., help="Path to dataset file"),
+):
+    """Extended dataset statistics: length distribution, token counts, languages."""
+    from souplite.data.validator import extended_stats
+
+    file_path = Path(path)
+    if not file_path.exists():
+        console.print(f"[red]File not found: {file_path}[/]")
+        raise typer.Exit(1)
+
+    data = load_raw_data(file_path)
+    if not data:
+        console.print("[red]Dataset is empty.[/]")
+        raise typer.Exit(1)
+
+    ext_stats = extended_stats(data)
+
+    # Basic info table
+    info_table = Table(title=f"Extended Stats: {file_path.name}")
+    info_table.add_column("Metric", style="bold")
+    info_table.add_column("Value", justify="right")
+    info_table.add_row("Total samples", str(ext_stats["total"]))
+    info_table.add_row("", "")
+    info_table.add_row("[bold]Length (chars)[/]", "")
+    info_table.add_row("  p10", str(ext_stats["length_p10"]))
+    info_table.add_row("  p25", str(ext_stats["length_p25"]))
+    info_table.add_row("  p50 (median)", str(ext_stats["length_p50"]))
+    info_table.add_row("  p75", str(ext_stats["length_p75"]))
+    info_table.add_row("  p90", str(ext_stats["length_p90"]))
+    info_table.add_row("", "")
+    info_table.add_row("[bold]Tokens (approx)[/]", "")
+    info_table.add_row("  Average", str(ext_stats["avg_tokens"]))
+    info_table.add_row("  Min", str(ext_stats["min_tokens"]))
+    info_table.add_row("  Max", str(ext_stats["max_tokens"]))
+
+    if ext_stats["languages"]:
+        info_table.add_row("", "")
+        info_table.add_row("[bold]Languages (sample)[/]", "")
+        for lang, count in sorted(
+            ext_stats["languages"].items(), key=lambda x: -x[1]
+        ):
+            info_table.add_row(f"  {lang}", str(count))
+
+    console.print(info_table)
+
+    # Terminal histogram of lengths
+    try:
+        import io
+        import sys
+
+        import plotext as plt
+
+        lengths = ext_stats["lengths"]
+        if lengths:
+            # Force UTF-8 stdout on Windows to avoid UnicodeEncodeError
+            # plotext uses box-drawing chars (U+2500 etc.) that cp1251/cp1252 can't encode
+            original_stdout = sys.stdout
+            needs_redirect = (
+                sys.platform == "win32"
+                and hasattr(sys.stdout, "encoding")
+                and (sys.stdout.encoding or "").lower().replace("-", "") != "utf8"
+            )
+            if needs_redirect:
+                try:
+                    sys.stdout = io.TextIOWrapper(
+                        sys.stdout.buffer, encoding="utf-8", errors="replace",
+                    )
+                except AttributeError:
+                    pass  # no .buffer (e.g. in tests), keep original
+
+            try:
+                from souplite.utils.plotext_compat import render_histogram
+
+                render_histogram(
+                    plt,
+                    lengths,
+                    console=console,
+                    bins=30,
+                    title="Text Length Distribution (chars)",
+                    xlabel="Length",
+                    ylabel="Count",
+                )
+            finally:
+                sys.stdout = original_stdout
+    except UnicodeEncodeError:
+        console.print(
+            "\n[dim]Histogram skipped (encoding issue).[/] "
+            "Set PYTHONIOENCODING=utf-8 to enable."
+        )
+    except ImportError:
+        console.print(
+            "\n[dim]Install plotext for histograms:[/] [bold]pip install plotext[/]"
+        )
+
+
+def _show_vision_stats(data: list[dict]) -> None:
+    """Show image statistics if dataset contains image fields."""
+    if not data:
+        return
+
+    # Check if this is a vision dataset
+    sample = data[0]
+    if "image" not in sample:
+        return
+
+    total = len(data)
+    has_image = sum(1 for row in data if row.get("image"))
+    missing_image = total - has_image
+
+    # Collect image file info
+    extensions: dict[str, int] = {}
+    existing = 0
+    for row in data:
+        img_path = row.get("image", "")
+        if not img_path:
+            continue
+        ext = Path(img_path).suffix.lower()
+        extensions[ext] = extensions.get(ext, 0) + 1
+        if Path(img_path).exists():
+            existing += 1
+
+    vision_table = Table(title="Vision Stats")
+    vision_table.add_column("Metric", style="bold")
+    vision_table.add_column("Value")
+    vision_table.add_row("Images referenced", str(has_image))
+    vision_table.add_row("Missing image field", str(missing_image))
+    vision_table.add_row("Images found on disk", str(existing))
+    if extensions:
+        ext_str = ", ".join(f"{ext} ({count})" for ext, count in sorted(extensions.items()))
+        vision_table.add_row("Image formats", ext_str)
+    console.print(vision_table)
+
+
+def _write_jsonl(path: Path, data: list[dict]) -> None:
+    """Write a list of dicts as JSONL."""
+    with open(path, "w", encoding="utf-8") as f:
+        for row in data:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+# --- Sampling strategies ---
+
+
+def _sample_random(data: list[dict], num: int, seed: int | None = None) -> list[dict]:
+    """Random sampling without replacement."""
+    rng = random.Random(seed)
+    num = min(num, len(data))
+    return rng.sample(data, num)
+
+
+def _sample_diverse(
+    data: list[dict], num: int, seed: int | None = None
+) -> list[dict]:
+    """Cluster-based diverse sampling using TF-IDF + K-means.
+
+    Falls back to random sampling if sklearn is not available.
+    """
+    num = min(num, len(data))
+    if num >= len(data):
+        return list(data)
+
+    # Extract text representations
+    texts = [
+        " ".join(str(val) for val in row.values() if val) for row in data
+    ]
+
+    try:
+        from sklearn.cluster import MiniBatchKMeans
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        vectorizer = TfidfVectorizer(max_features=1000, stop_words="english")
+        tfidf_matrix = vectorizer.fit_transform(texts)
+
+        num_clusters = min(num, len(data))
+        kmeans = MiniBatchKMeans(
+            n_clusters=num_clusters, random_state=seed or 0, n_init=3
+        )
+        labels = kmeans.fit_predict(tfidf_matrix)
+
+        # Sample one item from each cluster (index-based dedup)
+        chosen_indices: list[int] = []
+        rng = random.Random(seed)
+        for cluster_id in range(num_clusters):
+            cluster_indices = [
+                idx for idx, label in enumerate(labels) if label == cluster_id
+            ]
+            if cluster_indices:
+                chosen_indices.append(rng.choice(cluster_indices))
+
+        sampled = [data[idx] for idx in chosen_indices]
+
+        # If we need more, fill randomly from remaining
+        if len(sampled) < num:
+            remaining_indices = list(set(range(len(data))) - set(chosen_indices))
+            extra_indices = rng.sample(
+                remaining_indices, min(num - len(sampled), len(remaining_indices))
+            )
+            sampled.extend(data[idx] for idx in extra_indices)
+
+        return sampled[:num]
+
+    except ImportError:
+        # Fallback: simple length-based diversity (bucket by text length)
+        rng = random.Random(seed)
+        indexed = [(idx, len(texts[idx])) for idx in range(len(data))]
+        indexed.sort(key=lambda pair: pair[1])
+        # Evenly spaced picks across sorted list
+        step = max(1, len(indexed) // num)
+        picked_indices = [
+            indexed[idx * step][0] for idx in range(min(num, len(indexed)))
+        ]
+        picked = [data[idx] for idx in picked_indices]
+        # Fill remainder randomly
+        if len(picked) < num:
+            remaining_indices = list(set(range(len(data))) - set(picked_indices))
+            extra_indices = rng.sample(
+                remaining_indices, min(num - len(picked), len(remaining_indices))
+            )
+            picked.extend(data[idx] for idx in extra_indices)
+        return picked[:num]
+
+
+def _sample_hard(data: list[dict], num: int) -> list[dict]:
+    """Sample hardest examples by text length (proxy for complexity).
+
+    Longer texts tend to be more complex / challenging.
+    """
+    num = min(num, len(data))
+    if num >= len(data):
+        return list(data)
+
+    # Score by total text length (proxy for difficulty)
+    scored = []
+    for row in data:
+        text_len = sum(len(str(val)) for val in row.values() if val)
+        scored.append((text_len, row))
+
+    # Sort by length descending, take top N
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [row for _, row in scored[:num]]
+
+
+@app.command(name="sample")
+def sample_data(
+    path: str = typer.Argument(..., help="Path to dataset file"),
+    output: str = typer.Option(
+        None, "--output", "-o",
+        help="Output file path (default: <input>_sampled.jsonl)",
+    ),
+    num: int = typer.Option(
+        None, "--n", "-n",
+        help="Number of samples to select",
+    ),
+    pct: float = typer.Option(
+        None, "--pct",
+        help="Percentage of dataset to sample (0-100)",
+    ),
+    strategy: str = typer.Option(
+        "random", "--strategy", "-s",
+        help="Sampling strategy: random, diverse (TF-IDF + clusters), hard (by length)",
+    ),
+    seed: int = typer.Option(
+        None, "--seed",
+        help="Random seed for reproducibility",
+    ),
+):
+    """Sample a subset of a dataset using various strategies."""
+    file_path = Path(path)
+    if not file_path.exists():
+        console.print(f"[red]File not found: {file_path}[/]")
+        raise typer.Exit(1)
+
+    if num is None and pct is None:
+        console.print("[red]Specify either --n (count) or --pct (percentage).[/]")
+        raise typer.Exit(1)
+
+    if strategy not in ("random", "diverse", "hard"):
+        console.print(
+            f"[red]Unknown strategy: {strategy}[/]\n"
+            "Supported: [bold]random[/], [bold]diverse[/], [bold]hard[/]"
+        )
+        raise typer.Exit(1)
+
+    data = load_raw_data(file_path)
+    if not data:
+        console.print("[red]Dataset is empty.[/]")
+        raise typer.Exit(1)
+
+    # Compute sample count
+    if pct is not None:
+        sample_count = max(1, int(len(data) * pct / 100))
+    else:
+        sample_count = num
+
+    # Apply strategy
+    if strategy == "random":
+        sampled = _sample_random(data, sample_count, seed=seed)
+    elif strategy == "diverse":
+        sampled = _sample_diverse(data, sample_count, seed=seed)
+    elif strategy == "hard":
+        sampled = _sample_hard(data, sample_count)
+    else:
+        sampled = _sample_random(data, sample_count, seed=seed)
+
+    # Resolve output path (with path traversal protection on explicit --output)
+    # v0.40.1 Part E — include the strategy in the default filename so
+    # successive `random` / `diverse` / `hard` runs don't silently overwrite
+    # each other.
+    if output is None:
+        out_path = file_path.parent / f"{file_path.stem}_sampled_{strategy}.jsonl"
+    else:
+        from souplite.utils.paths import is_under_cwd
+
+        out_path = Path(output).resolve()
+        # realpath + commonpath (is_under_cwd) — Path.resolve()+relative_to()
+        # breaks on Windows 8.3 short names.
+        if not is_under_cwd(output):
+            console.print("[red]Output path must be under the current working directory.[/]")
+            raise typer.Exit(1)
+
+    _write_jsonl(out_path, sampled)
+
+    console.print(
+        f"[green]Sampled {len(sampled)} rows[/] from {len(data)} "
+        f"(strategy: {strategy})\n"
+        f"Output: [bold]{out_path}[/]"
+    )
+
+
+@app.command(name="split")
+def split_data(
+    path: str = typer.Argument(..., help="Path to dataset file"),
+    val: int = typer.Option(
+        None, "--val",
+        help="Validation split: percentage (default) or absolute count (with --absolute)",
+    ),
+    test: int = typer.Option(
+        None, "--test",
+        help="Test split: percentage (default) or absolute count (with --absolute)",
+    ),
+    train: int = typer.Option(
+        None, "--train",
+        help=(
+            "Train split (informational; the train remainder is implied by "
+            "--val + --test). Accepted for command parity."
+        ),
+    ),
+    absolute: bool = typer.Option(
+        False, "--absolute",
+        help="Treat --val/--test as absolute sample counts instead of percentages",
+    ),
+    seed: int = typer.Option(
+        None, "--seed",
+        help="Random seed for reproducible splits",
+    ),
+    stratify: str = typer.Option(
+        None, "--stratify",
+        help="Field name for stratified splitting (preserves category distribution)",
+    ),
+    stratify_semantic: bool = typer.Option(
+        False, "--stratify-semantic",
+        help=(
+            "Use semantic clustering (TF-IDF + K-Means) to perform stratified "
+            "splitting without requiring a category field"
+        ),
+    ),
+    num_clusters: Optional[int] = typer.Option(
+        None, "--num-clusters",
+        help="Number of semantic clusters to use for semantic stratified splitting (default: 5)",
+    ),
+):
+    """Split dataset into train/val/test files."""
+    file_path = Path(path)
+    if not file_path.exists():
+        console.print(f"[red]File not found: {file_path}[/]")
+        raise typer.Exit(1)
+
+    if val is None and test is None:
+        console.print("[red]Specify at least one of --val or --test.[/]")
+        raise typer.Exit(1)
+
+    # Reject negatives: a negative val/test slipped past the `>= total` check
+    # and produced a negative slice (e.g. --val -10 sent 90 rows to val, 10 to
+    # train — a silently inverted split).
+    if (val is not None and val < 0) or (test is not None and test < 0):
+        console.print("[red]--val and --test must be non-negative.[/]")
+        raise typer.Exit(1)
+
+    if stratify and stratify_semantic:
+        console.print("[red]Cannot use --stratify and --stratify-semantic together. Pick one.[/]")
+        raise typer.Exit(1)
+
+    if num_clusters is not None and num_clusters <= 0:
+        console.print("[red]--num-clusters must be a positive integer.[/]")
+        raise typer.Exit(1)
+
+    if not stratify_semantic and num_clusters is not None:
+        console.print(
+            "[yellow]Warning: --num-clusters was passed but --stratify-semantic is not enabled. "
+            "It will have no effect.[/]"
+        )
+
+    data = load_raw_data(file_path)
+    if not data:
+        console.print("[red]Dataset is empty.[/]")
+        raise typer.Exit(1)
+
+    total = len(data)
+
+    # Calculate split sizes
+    if absolute:
+        val_count = val or 0
+        test_count = test or 0
+        if val_count + test_count >= total:
+            console.print(
+                f"[red]val ({val_count}) + test ({test_count}) >= dataset size ({total}).[/]"
+            )
+            raise typer.Exit(1)
+    else:
+        val_count = int(total * val / 100) if val else 0
+        test_count = int(total * test / 100) if test else 0
+        if val_count + test_count >= total:
+            console.print(
+                f"[red]Split sizes ({val_count} + {test_count}) >= dataset size ({total}).[/]"
+            )
+            raise typer.Exit(1)
+
+    # Perform split
+    if stratify:
+        train_data, val_data, test_data = _stratified_split(
+            data, val_count, test_count, stratify, seed=seed,
+        )
+    elif stratify_semantic:
+        resolved_clusters = num_clusters or 5
+        labels = _get_semantic_labels(data, resolved_clusters, seed=seed)
+        train_data, val_data, test_data = _stratified_split(
+            data, val_count, test_count, labels, seed=seed,
+        )
+    else:
+        train_data, val_data, test_data = _random_split(
+            data, val_count, test_count, seed=seed,
+        )
+
+    # Write output files
+    stem = file_path.stem
+    parent = file_path.parent
+
+    train_path = parent / f"{stem}_train.jsonl"
+    _write_jsonl(train_path, train_data)
+
+    output_msg = (
+        f"[green]Split {total} rows:[/]\n"
+        f"  Train: {len(train_data)} -> [bold]{train_path}[/]"
+    )
+
+    if val_data:
+        val_path = parent / f"{stem}_val.jsonl"
+        _write_jsonl(val_path, val_data)
+        output_msg += f"\n  Val:   {len(val_data)} -> [bold]{val_path}[/]"
+
+    if test_data:
+        test_path = parent / f"{stem}_test.jsonl"
+        _write_jsonl(test_path, test_data)
+        output_msg += f"\n  Test:  {len(test_data)} -> [bold]{test_path}[/]"
+
+    console.print(output_msg)
+
+
+def _random_split(
+    data: list, val_count: int, test_count: int, seed: int | None = None,
+) -> tuple:
+    """Random split into train/val/test."""
+    rng = random.Random(seed)
+    indices = list(range(len(data)))
+    rng.shuffle(indices)
+
+    test_indices = set(indices[:test_count])
+    val_indices = set(indices[test_count:test_count + val_count])
+
+    train_data = []
+    val_data = []
+    test_data = []
+
+    for idx in range(len(data)):
+        if idx in test_indices:
+            test_data.append(data[idx])
+        elif idx in val_indices:
+            val_data.append(data[idx])
+        else:
+            train_data.append(data[idx])
+
+    return train_data, val_data, test_data
+
+
+def _get_semantic_labels(
+    data: list[dict], num_clusters: int, seed: int | None = None
+) -> list[str]:
+    """Infers semantic category labels using TF-IDF + K-Means."""
+    # Medium: row count limit to prevent OOM / slowness on pathological datasets
+    if len(data) > 50000:
+        console.print(
+            f"[red]Semantic stratified splitting is capped at 50,000 rows. "
+            f"Got {len(data):,} rows.[/]"
+        )
+        raise typer.Exit(1)
+
+    # Extract text representations
+    texts = [
+        " ".join(str(val) for val in row.values() if val) for row in data
+    ]
+
+    try:
+        from sklearn.cluster import MiniBatchKMeans
+        from sklearn.feature_extraction.text import TfidfVectorizer
+    except ImportError:
+        console.print(
+            "[red]Semantic stratified splitting requires scikit-learn.[/]\n"
+            "Install with: [bold]pip install \"souplite\\[data]\"[/]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        vectorizer = TfidfVectorizer(max_features=1000, stop_words="english")
+        tfidf_matrix = vectorizer.fit_transform(texts)
+    except ValueError as exc:
+        console.print(
+            f"[red]Semantic stratified splitting failed: {exc}[/]\n"
+            "Check that your dataset contains vectorizable words (not just stop words)."
+        )
+        raise typer.Exit(1)
+
+    actual_clusters = min(num_clusters, len(data))
+    if actual_clusters <= 1:
+        return ["cluster_0"] * len(data)
+
+    kmeans = MiniBatchKMeans(
+        n_clusters=actual_clusters, random_state=seed or 0, n_init=3
+    )
+    labels = kmeans.fit_predict(tfidf_matrix)
+    return [f"cluster_{label}" for label in labels]
+
+
+def _stratified_split(
+    data: list, val_count: int, test_count: int,
+    stratify_keys: str | list[str], seed: int | None = None,
+) -> tuple:
+    """Stratified split preserving category distribution."""
+    # Group by stratify keys
+    groups: dict[str, list[int]] = {}
+    for idx, row in enumerate(data):
+        if isinstance(stratify_keys, list):
+            key = str(stratify_keys[idx])
+        else:
+            key = str(row.get(stratify_keys, "unknown"))
+        groups.setdefault(key, []).append(idx)
+
+    rng = random.Random(seed)
+    total = len(data)
+
+    train_indices = []
+    val_indices = []
+    test_indices = []
+
+    for key, indices in groups.items():
+        rng.shuffle(indices)
+        group_size = len(indices)
+        group_frac = group_size / total
+
+        group_val = round(val_count * group_frac) if val_count else 0
+        group_test = round(test_count * group_frac) if test_count else 0
+
+        # Ensure we don't take more than available
+        group_val = min(group_val, group_size)
+        group_test = min(group_test, group_size - group_val)
+
+        test_indices.extend(indices[:group_test])
+        val_indices.extend(indices[group_test:group_test + group_val])
+        train_indices.extend(indices[group_test + group_val:])
+
+    train_data = [data[idx] for idx in train_indices]
+    val_data = [data[idx] for idx in val_indices]
+    test_data = [data[idx] for idx in test_indices]
+
+    return train_data, val_data, test_data
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace Dataset Hub helpers
+# ---------------------------------------------------------------------------
+
+
+def list_datasets(search: str, sort: str = "downloads", limit: int = 20) -> list:
+    """Search HuggingFace Hub for datasets. Returns list of DatasetInfo objects."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    return list(api.list_datasets(search=search, sort=sort, limit=limit))
+
+
+def _hf_dataset_info(dataset_id: str) -> dict:
+    """Fetch metadata about a HuggingFace dataset."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    try:
+        info = api.dataset_info(dataset_id)
+    except Exception as exc:
+        raise ValueError(f"Dataset not found: {dataset_id} — {exc}") from exc
+
+    # Extract split sizes
+    splits: dict[str, int] = {}
+    if hasattr(info, "card_data") and info.card_data:
+        ds_info = getattr(info.card_data, "dataset_info", None)
+        if ds_info and isinstance(ds_info, dict):
+            for config_data in ds_info.values():
+                if isinstance(config_data, dict) and "splits" in config_data:
+                    for split_name, split_data in config_data["splits"].items():
+                        if isinstance(split_data, dict):
+                            splits[split_name] = split_data.get("num_examples", 0)
+
+    # Extract feature names
+    features: list[str] = []
+    if hasattr(info, "card_data") and info.card_data:
+        ds_info = getattr(info.card_data, "dataset_info", None)
+        if ds_info and isinstance(ds_info, dict):
+            for config_data in ds_info.values():
+                if isinstance(config_data, dict) and "features" in config_data:
+                    feat_list = config_data["features"]
+                    if isinstance(feat_list, list):
+                        for feat in feat_list:
+                            if isinstance(feat, dict) and "name" in feat:
+                                features.append(feat["name"])
+                    break
+
+    return {
+        "id": info.id,
+        "description": getattr(info, "description", "") or "",
+        "downloads": getattr(info, "downloads", 0) or 0,
+        "likes": getattr(info, "likes", 0) or 0,
+        "size_bytes": getattr(info, "size", None),
+        "splits": splits,
+        "features": features,
+        "tags": list(info.tags) if info.tags else [],
+    }
+
+
+def _hf_download_dataset(
+    dataset_id: str,
+    split: str = "train",
+    samples: int | None = None,
+) -> list[dict]:
+    """Download a dataset from HuggingFace Hub and return as list of dicts."""
+    from datasets import load_dataset
+
+    try:
+        ds = load_dataset(
+            dataset_id, split=split, streaming=True, trust_remote_code=False,
+        )
+    except Exception as exc:
+        raise ValueError(f"Failed to load dataset {dataset_id}: {exc}") from exc
+
+    rows: list[dict] = []
+    for idx, row in enumerate(ds):
+        if samples is not None and idx >= samples:
+            break
+        rows.append(dict(row))
+
+    return rows
+
+
+def _format_size_bytes(size_bytes: int | None) -> str:
+    """Format byte count as human-readable string."""
+    if size_bytes is None:
+        return "unknown"
+    if size_bytes == 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_idx = 0
+    size = float(size_bytes)
+    while size >= 1024 and unit_idx < len(units) - 1:
+        size /= 1024
+        unit_idx += 1
+    if unit_idx == 0:
+        return f"{int(size)} {units[unit_idx]}"
+    return f"{size:.1f} {units[unit_idx]}"
+
+
+def _format_count(count: int) -> str:
+    """Format large numbers with K/M suffix."""
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.1f}K"
+    return str(count)
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace Dataset Hub CLI commands
+# ---------------------------------------------------------------------------
+
+
+@app.command(name="search")
+def search_datasets(
+    query: str = typer.Argument(..., help="Search query for HuggingFace datasets"),
+    limit: int = typer.Option(20, "--limit", "-l", help="Maximum results to show"),
+    sort: str = typer.Option(
+        "downloads", "--sort", "-s",
+        help="Sort by: downloads, likes, lastModified, trending, createdAt",
+    ),
+):
+    """Search HuggingFace Hub for datasets."""
+    valid_sorts = {"downloads", "likes", "lastModified", "trending", "createdAt"}
+    if sort not in valid_sorts:
+        console.print(
+            f"[red]Invalid sort: {sort}[/]\n"
+            f"Valid options: {', '.join(sorted(valid_sorts))}"
+        )
+        raise typer.Exit(1)
+
+    try:
+        datasets = list_datasets(search=query, sort=sort, limit=limit)
+    except ImportError:
+        console.print(
+            "[red]huggingface_hub not available.[/]\n"
+            "Install with: [bold]pip install huggingface-hub[/]"
+        )
+        raise typer.Exit(1)
+    except Exception as exc:
+        console.print(f"[red]Search failed: {exc}[/]")
+        raise typer.Exit(1)
+
+    if not datasets:
+        console.print(f"[yellow]No datasets found for '{query}'.[/]")
+        return
+
+    table = Table(title=f"HuggingFace Datasets: '{query}'")
+    table.add_column("Dataset", style="bold cyan", max_width=45)
+    table.add_column("Downloads", justify="right")
+    table.add_column("Likes", justify="right")
+    table.add_column("Tags", max_width=30)
+
+    # HF-hub metadata (ids, tags) is attacker-authored — escape before it
+    # reaches a Rich table (MarkupError crash / phishing-link injection).
+    from rich.markup import escape as _escape
+
+    for ds_item in datasets[:limit]:
+        ds_tags = getattr(ds_item, "tags", []) or []
+        tag_str = ", ".join(str(t) for t in ds_tags[:5])
+        if len(ds_tags) > 5:
+            tag_str += "..."
+        table.add_row(
+            _escape(str(ds_item.id)),
+            _format_count(getattr(ds_item, "downloads", 0) or 0),
+            _format_count(getattr(ds_item, "likes", 0) or 0),
+            _escape(tag_str),
+        )
+
+    console.print(table)
+    console.print(f"[dim]Showing {min(limit, len(datasets))} results.[/]")
+
+
+@app.command(name="preview")
+def preview_dataset(
+    dataset_id: str = typer.Argument(
+        ..., help="HuggingFace dataset ID (e.g. teknium/OpenHermes-2.5)"
+    ),
+):
+    """Preview a remote HuggingFace dataset: metadata, splits, features."""
+    try:
+        info = _hf_dataset_info(dataset_id)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    except ImportError:
+        console.print(
+            "[red]huggingface_hub not available.[/]\n"
+            "Install with: [bold]pip install huggingface-hub[/]"
+        )
+        raise typer.Exit(1)
+
+    # HF-hub metadata (id, description, tags, feature/split names) is
+    # attacker-authored — escape before it reaches a Rich table.
+    from rich.markup import escape as _escape
+
+    table = Table(title=f"Dataset: {_escape(str(info['id']))}")
+    table.add_column("Field", style="bold")
+    table.add_column("Value", max_width=80)
+
+    table.add_row("ID", _escape(str(info["id"])))
+    desc = info["description"]
+    if len(desc) > 200:
+        desc = desc[:200] + "..."
+    table.add_row("Description", _escape(desc) if desc else "[dim]No description[/]")
+    table.add_row("Downloads", _format_count(info["downloads"]))
+    table.add_row("Likes", _format_count(info["likes"]))
+    table.add_row("Size", _format_size_bytes(info["size_bytes"]))
+
+    if info["splits"]:
+        splits_str = ", ".join(
+            f"{_escape(str(name))} ({_format_count(count)})"
+            for name, count in info["splits"].items()
+        )
+        table.add_row("Splits", splits_str)
+    else:
+        table.add_row("Splits", "[dim]Not available (use streaming to explore)[/]")
+
+    if info["features"]:
+        table.add_row("Features", ", ".join(_escape(str(f)) for f in info["features"]))
+
+    if info["tags"]:
+        table.add_row("Tags", ", ".join(_escape(str(t)) for t in info["tags"][:10]))
+
+    console.print(table)
+
+
+@app.command(name="download")
+def download_dataset(
+    dataset_id: str = typer.Argument(
+        ..., help="HuggingFace dataset ID (e.g. teknium/OpenHermes-2.5)"
+    ),
+    output: str = typer.Option(
+        None, "--output", "-o",
+        help="Output file path (default: <dataset-name>.jsonl)",
+    ),
+    split: str = typer.Option(
+        "train", "--split",
+        help="Dataset split to download (e.g. train, test, train[:1000])",
+    ),
+    samples: int = typer.Option(
+        None, "--samples", "-n",
+        help="Max number of samples to download (streams, no full download)",
+    ),
+    fmt: str = typer.Option(
+        None, "--format", "-f",
+        help="Convert to Soup format after download: alpaca, sharegpt, chatml",
+    ),
+    trust_remote_code: bool = typer.Option(
+        False,
+        "--trust-remote-code",
+        help=(
+            "Allow datasets that ship custom Python loaders. Default deny "
+            "(v0.36.0). Only enable if you trust the source."
+        ),
+    ),
+    hub: str = typer.Option(
+        "hf",
+        "--hub",
+        help=(
+            "Source hub: hf (default) / modelscope / modelers. "
+            "Non-HF hubs require the matching SDK (v0.53.8 #130)."
+        ),
+    ),
+):
+    """Download a HuggingFace dataset and save as JSONL."""
+    # v0.53.8 #130 — validate --hub at the CLI boundary; only `hf` is wired
+    # for live dataset download in this release (modelscope / modelers
+    # dataset SDKs differ from snapshot_download; live wiring tracked for
+    # v0.53.9). Non-HF hubs surface a friendly error.
+    from souplite.utils.hubs import validate_hub_name
+
+    try:
+        hub_canonical = validate_hub_name(hub)
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=2) from exc
+    # v0.53.10 #153 — non-HF hub live dataset download. ModelScope uses
+    # the ``MsDataset`` API (different shape from snapshot_download), so
+    # we dispatch here instead of going through utils.hubs.download_repo.
+    if hub_canonical != "hf":
+        from souplite.utils.hubs import download_repo as _download_repo
+
+        try:
+            if hub_canonical == "modelscope":
+                try:
+                    from modelscope.msdatasets import (
+                        MsDataset,  # type: ignore[import-not-found]
+                    )
+                except ImportError as exc:
+                    console.print(
+                        "[red]modelscope is not installed. "
+                        "Install with: pip install modelscope[/]"
+                    )
+                    raise typer.Exit(1) from exc
+                _ms_ds = MsDataset.load(  # noqa: F841 — touched for side effect
+                    dataset_id, split=split
+                )
+                console.print(
+                    f"[dim]ModelScope dataset {dataset_id} loaded; "
+                    "use souplite.utils.hubs.download_repo for raw "
+                    "snapshot download.[/]"
+                )
+            else:  # modelers
+                try:
+                    out_dir = _download_repo(
+                        hub_canonical,
+                        dataset_id,
+                        local_dir=str(Path.cwd() / ".soup_hub_cache"
+                                      / "datasets"
+                                      / dataset_id.replace("/", "__")),
+                        repo_type="dataset",
+                    )
+                except ImportError as exc:
+                    console.print(f"[red]{exc}[/]")
+                    raise typer.Exit(1) from exc
+                console.print(
+                    f"[green]Downloaded {dataset_id} from {hub_canonical} → "
+                    f"{out_dir}[/]"
+                )
+        except (TypeError, ValueError) as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(2) from exc
+        return
+    max_download_samples = 1_000_000
+    if samples is not None and samples > max_download_samples:
+        console.print(
+            f"[red]--samples cannot exceed {max_download_samples:,}.[/]"
+        )
+        raise typer.Exit(1)
+
+    # Resolve output path
+    from souplite.utils.paths import is_under_cwd
+
+    if output is None:
+        ds_name = dataset_id.split("/")[-1] if "/" in dataset_id else dataset_id
+        # Strip embedded path separators to prevent traversal
+        ds_name = Path(ds_name).name
+        out_path = (Path.cwd() / f"{ds_name}.jsonl").resolve()
+        # realpath + commonpath (is_under_cwd) — Path.resolve()+relative_to()
+        # breaks on Windows 8.3 short names.
+        if not is_under_cwd(out_path):
+            console.print(
+                "[red]Derived output path escapes working directory.[/]"
+            )
+            raise typer.Exit(1)
+    else:
+        out_path = Path(output).resolve()
+        if not is_under_cwd(output):
+            console.print(
+                "[red]Output path must be under the current working directory.[/]"
+            )
+            raise typer.Exit(1)
+
+    from rich.panel import Panel
+
+    console.print(Panel(
+        "[bold yellow]Warning:[/] Downloading this dataset may execute a "
+        "remote dataset loading script from HuggingFace Hub.\n\n"
+        "Only download datasets from sources you trust.",
+        title="Remote Code Warning",
+        border_style="yellow",
+    ))
+    console.print(f"[dim]Downloading {dataset_id} (split={split})...[/]")
+
+    try:
+        data = _hf_download_dataset(
+            dataset_id, split=split, samples=samples,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    except ImportError:
+        console.print(
+            "[red]datasets library not available.[/]\n"
+            "Install with: [bold]pip install datasets[/]"
+        )
+        raise typer.Exit(1)
+
+    if not data:
+        console.print("[red]No data downloaded (dataset may be empty).[/]")
+        raise typer.Exit(1)
+
+    # Optional format conversion
+    if fmt:
+        from souplite.data.formats import (
+            CONVERTIBLE_FORMATS,
+            detect_format,
+            format_to_messages,
+            messages_to_format,
+        )
+
+        if fmt not in CONVERTIBLE_FORMATS:
+            console.print(
+                f"[red]Invalid format: {fmt}[/]\n"
+                f"Supported: {', '.join(CONVERTIBLE_FORMATS)}"
+            )
+            raise typer.Exit(1)
+
+        try:
+            src_fmt = detect_format(data)
+        except ValueError:
+            src_fmt = None
+
+        if src_fmt and src_fmt != fmt:
+            converted = []
+            for row in data:
+                messages = format_to_messages(row, src_fmt)
+                if messages is not None:
+                    result = messages_to_format(messages, fmt)
+                    if result is not None:
+                        converted.append(result)
+            if converted:
+                data = converted
+                console.print(
+                    f"[dim]Converted {len(data)} rows to {fmt} format.[/]"
+                )
+
+    # Apply samples limit if data came from non-streaming path
+    if samples is not None and len(data) > samples:
+        data = data[:samples]
+
+    _write_jsonl(out_path, data)
+    console.print(
+        f"[green]Downloaded {len(data)} rows.[/]\n"
+        f"Output: [bold]{out_path}[/]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dataset registry CLI commands
+# ---------------------------------------------------------------------------
+
+
+def _get_registry_path() -> Path:
+    """Get the default registry path (~/.soup/datasets.json)."""
+    from souplite.utils.registry import _default_registry_path
+
+    return _default_registry_path()
+
+
+@app.command(name="augment")
+def augment_data(
+    input_path: str = typer.Option(..., "--input", "-i", help="Source JSONL file"),
+    output_path: str = typer.Option(
+        "augmented.jsonl", "--output", "-o", help="Output JSONL path"
+    ),
+    strategy: str = typer.Option(
+        "rephrase", "--strategy", "-s",
+        help="Augmentation strategy: rephrase, translate, style",
+    ),
+    provider: str = typer.Option(
+        "ollama", "--provider", "-p",
+        help="LLM provider: ollama, anthropic, vllm",
+    ),
+    model: str = typer.Option(
+        "", "--model", help="Provider model id (default per provider)"
+    ),
+    base_url: str = typer.Option(
+        "", "--base-url", help="Provider base URL (ollama/vllm; defaults to loopback)"
+    ),
+    count: int = typer.Option(
+        2, "--count", "-c", min=1, max=10,
+        help="Augmentation multiplier (1-10)",
+    ),
+    lang: str = typer.Option(
+        "", "--lang", help="Comma-separated target languages for translate",
+    ),
+    styles: str = typer.Option(
+        "", "--styles", help="Comma-separated styles for style strategy",
+    ),
+    requests_per_minute: int = typer.Option(
+        60, "--requests-per-minute", min=1, max=600,
+        help="Rate limit for provider requests",
+    ),
+    dedup: bool = typer.Option(
+        False, "--dedup", help="Deduplicate augmented + original data",
+    ),
+):
+    """Augment a dataset via LLM (rephrase / translate / style)."""
+    from souplite.data.augment import STRATEGIES
+
+    if strategy not in STRATEGIES:
+        console.print(
+            f"[red]Unknown strategy: {strategy}. "
+            f"Options: {', '.join(STRATEGIES.keys())}[/]"
+        )
+        raise typer.Exit(1)
+
+    # Path containment + symlink rejection via the project-standard helper
+    # (realpath + commonpath — NOT Path.resolve()+relative_to, which breaks on
+    # Windows 8.3 short names). v0.71.6 #75 hardening of the touched command.
+    from souplite.utils.paths import enforce_under_cwd_and_no_symlink
+
+    try:
+        enforce_under_cwd_and_no_symlink(input_path, "--input")
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    if not os.path.lexists(input_path):
+        console.print(f"[red]Input file not found: {input_path}[/]")
+        raise typer.Exit(1)
+    input_resolved = Path(os.path.realpath(input_path))
+
+    try:
+        enforce_under_cwd_and_no_symlink(output_path, "--output")
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(2) from exc
+
+    # Load data
+    data = load_raw_data(input_resolved)
+    if not data:
+        console.print("[red]Input dataset is empty.[/]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[dim]Loaded {len(data)} examples from {input_resolved.name}[/]"
+    )
+
+    # Load provider
+    try:
+        provider_instance = _load_augment_provider(
+            provider, requests_per_minute, model=model, base_url=base_url
+        )
+    except (TypeError, ValueError, ImportError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(2) from exc
+
+    max_entries = 10
+    max_entry_len = 32
+
+    def _bounded_list(raw: str, field: str) -> list[str]:
+        parts = [s.strip() for s in raw.split(",") if s.strip()]
+        if len(parts) > max_entries:
+            raise ValueError(
+                f"--{field} accepts at most {max_entries} entries"
+            )
+        for entry in parts:
+            if len(entry) > max_entry_len:
+                raise ValueError(
+                    f"--{field} entries must be <= {max_entry_len} chars"
+                )
+        return parts
+
+    # Run strategy
+    augment_fn = STRATEGIES[strategy]
+    try:
+        if strategy == "translate":
+            target_langs = _bounded_list(lang, "lang")
+            augmented = augment_fn(
+                data, provider=provider_instance,
+                languages=target_langs or None,
+            )
+        elif strategy == "style":
+            target_styles = _bounded_list(styles, "styles")
+            augmented = augment_fn(
+                data, provider=provider_instance, styles=target_styles or None,
+            )
+        else:
+            augmented = augment_fn(data, provider=provider_instance, count=count)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    # Optional dedup
+    if dedup:
+        seen = set()
+        deduped: list[dict] = []
+        for row in data + augmented:
+            key = json.dumps(row, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+        final_rows = deduped
+    else:
+        final_rows = data + augmented
+
+    # Atomic write (cwd-contained + symlink-rejected) via the shared helper.
+    from souplite.utils.paths import atomic_write_text
+
+    payload = "".join(
+        json.dumps(row, ensure_ascii=False) + "\n" for row in final_rows
+    )
+    written = atomic_write_text(payload, output_path, field="--output")
+
+    console.print(
+        f"[green]Augmentation complete:[/] {len(data)} → {len(final_rows)} "
+        f"({strategy} via {provider})\n"
+        f"  Output: {written}"
+    )
+
+
+class _AugmentProvider:
+    """Adapter exposing ``generate(prompt) -> str`` over a judge-provider fn.
+
+    v0.71.6 #75: ``data augment`` previously imported ``OllamaProvider`` /
+    ``AnthropicProvider`` / ``VllmProvider`` classes that never existed in the
+    provider modules (they ship *functions*), so every ``--provider`` choice
+    raised ``ImportError``. This delegates to the v0.53.7 hardened
+    ``make_judge_provider_fn`` (SSRF-validated, env-only Anthropic key) and
+    unwraps its ``{"text": ...}`` reply to the ``.generate`` contract the
+    augment strategies expect.
+    """
+
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def generate(self, prompt: str) -> str:
+        from collections.abc import Mapping as _Mapping
+
+        reply = self._fn(prompt)
+        if isinstance(reply, _Mapping):
+            text = reply.get("text", "")
+            return text if isinstance(text, str) else ""
+        return ""
+
+
+_AUGMENT_DEFAULT_MODELS = {
+    "ollama": "llama3.1",
+    "anthropic": "claude-3-5-haiku-20241022",
+    "vllm": "local",
+}
+
+
+def _load_augment_provider(
+    provider: str,
+    rpm: int,
+    *,
+    model: str = "",
+    base_url: str = "",
+):
+    """Construct an LLM provider instance with a ``generate(prompt)`` method."""
+    from souplite.utils.data_forge import JUDGE_PROVIDERS, make_judge_provider_fn
+
+    canonical = provider.strip().lower()
+    if canonical not in JUDGE_PROVIDERS:
+        raise ValueError(
+            f"Unknown provider '{provider}'. Options: {sorted(JUDGE_PROVIDERS)}."
+        )
+    fn = make_judge_provider_fn(
+        canonical,
+        model=model or _AUGMENT_DEFAULT_MODELS[canonical],
+        base_url=base_url or None,
+    )
+    return _AugmentProvider(fn)
+
+
+@app.command(name="register")
+def register_data(
+    name_arg: Optional[str] = typer.Argument(
+        None, help="Dataset name (positional alternative to --name)",
+    ),
+    path_arg: Optional[str] = typer.Argument(
+        None, help="Path to dataset file (positional alternative to --path)",
+    ),
+    name: Optional[str] = typer.Option(None, "--name", "-n", help="Dataset name"),
+    path: Optional[str] = typer.Option(
+        None, "--path", "-p", help="Path to dataset file"
+    ),
+    fmt: str = typer.Option(
+        "auto", "--format", "-f",
+        help="Dataset format: alpaca, sharegpt, chatml, dpo, kto, auto",
+    ),
+):
+    """Register a local dataset by name for use in soup.yaml.
+
+    Accepts both ``--name X --path Y`` and positional ``X Y``.
+    """
+    from souplite.utils.registry import register_dataset
+
+    # Resolve positional vs option, with conflict detection
+    final_name = name if name is not None else name_arg
+    final_path = path if path is not None else path_arg
+    if final_name is None or final_path is None:
+        console.print(
+            "[red]Provide both name and path "
+            "(positional `<name> <path>` or `--name --path`).[/]"
+        )
+        raise typer.Exit(2)
+    if name is not None and name_arg is not None and name != name_arg:
+        console.print("[red]Conflict: --name and positional name differ.[/]")
+        raise typer.Exit(2)
+    if path is not None and path_arg is not None and path != path_arg:
+        console.print("[red]Conflict: --path and positional path differ.[/]")
+        raise typer.Exit(2)
+
+    # Path traversal protection — use os.path.realpath + commonpath
+    # (project standard; Windows 8.3 short-name safe).
+    import os as _os
+
+    from souplite.utils.paths import is_under_cwd
+
+    if not is_under_cwd(final_path):
+        console.print(
+            "[red]Dataset path must be under the current working directory.[/]"
+        )
+        raise typer.Exit(1)
+    resolved = Path(_os.path.realpath(final_path))
+
+    registry_path = _get_registry_path()
+
+    try:
+        register_dataset(final_name, str(resolved), fmt, registry_path=registry_path)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]Registered dataset '[bold]{final_name}[/bold]'[/]\n"
+        f"  Path: {final_path}\n"
+        f"  Format: {fmt}"
+    )
+
+
+@app.command(name="unregister")
+def unregister_data(
+    name_arg: Optional[str] = typer.Argument(
+        None, help="Dataset name (positional alternative to --name)",
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", "-n", help="Dataset name to remove"
+    ),
+):
+    """Remove a dataset from the local registry.
+
+    Accepts both ``--name X`` and positional ``X``.
+    """
+    from souplite.utils.registry import unregister_dataset
+
+    final_name = name if name is not None else name_arg
+    if final_name is None:
+        console.print(
+            "[red]Provide a dataset name "
+            "(positional `<name>` or `--name`).[/]"
+        )
+        raise typer.Exit(2)
+    if name is not None and name_arg is not None and name != name_arg:
+        console.print("[red]Conflict: --name and positional name differ.[/]")
+        raise typer.Exit(2)
+
+    registry_path = _get_registry_path()
+    removed = unregister_dataset(final_name, registry_path=registry_path)
+
+    if removed:
+        console.print(f"[green]Removed dataset '{final_name}' from registry.[/]")
+    else:
+        console.print(f"[red]Dataset '{final_name}' not found in registry.[/]")
+        raise typer.Exit(1)
+
+
+@app.command(name="from-traces")
+def from_traces_cmd(
+    logs: str = typer.Option(
+        ..., "--logs", help="Path to JSONL trace log (or directory for soup-serve)",
+    ),
+    format: str = typer.Option(
+        ..., "--format", help="Trace format: langchain | openai | soup-serve",
+    ),
+    signal: str = typer.Option(
+        "thumbs_up", "--signal",
+        help="Signal to extract pairs from: thumbs_up | regenerations | user_edit",
+    ),
+    output: str = typer.Option(
+        "prefs.jsonl", "--output", "-o",
+        help="Output path for preference pairs (JSONL)",
+    ),
+    judge: bool = typer.Option(
+        False, "--judge",
+        help="Filter pairs via LLM-as-a-judge confidence (v0.40.3 #33).",
+    ),
+    judge_provider: str = typer.Option(
+        "openai", "--judge-provider",
+        help="Judge backend: openai | server | ollama. Used with --judge.",
+    ),
+    judge_model: str = typer.Option(
+        "gpt-4o-mini", "--judge-model",
+        help="Judge model id (e.g. 'gpt-4o-mini', 'llama3', 'qwen2.5'). Used with --judge.",
+    ),
+    judge_api_base: Optional[str] = typer.Option(
+        None, "--judge-api-base",
+        help="Judge API base URL. SSRF-protected. Used with --judge.",
+    ),
+    min_confidence: float = typer.Option(
+        0.7, "--min-confidence",
+        help="Drop pairs with judge-confidence below this threshold (0.0 - 1.0).",
+    ),
+) -> None:
+    """Harvest preference pairs from production traces.
+
+    Prominent reminder: traces may contain sensitive user data; review
+    before sharing or uploading to external systems.
+    """
+    import json as _json
+
+    from rich.markup import escape as _escape
+    from rich.panel import Panel
+
+    from souplite.data.traces import (
+        SUPPORTED_FORMATS,
+        SUPPORTED_SIGNALS,
+        build_pairs,
+        parse_langchain,
+        parse_openai,
+        parse_soup_serve,
+    )
+    from souplite.utils.paths import is_under_cwd as _under_cwd
+
+    if format not in SUPPORTED_FORMATS:
+        console.print(
+            f"[red]Unknown format '{format}'. "
+            f"Supported: {', '.join(SUPPORTED_FORMATS)}[/]"
+        )
+        raise typer.Exit(1)
+    if signal not in SUPPORTED_SIGNALS:
+        console.print(
+            f"[red]Unknown signal '{signal}'. "
+            f"Supported: {', '.join(SUPPORTED_SIGNALS)}[/]"
+        )
+        raise typer.Exit(1)
+
+    logs_path = Path(logs)
+    if not _under_cwd(logs_path):
+        console.print(f"[red]--logs '{logs}' is outside cwd - refusing[/]")
+        raise typer.Exit(1)
+    if not logs_path.exists():
+        console.print(f"[red]--logs not found: {logs}[/]")
+        raise typer.Exit(1)
+
+    output_path = Path(output)
+    if not _under_cwd(output_path):
+        console.print(f"[red]--output '{output}' is outside cwd - refusing[/]")
+        raise typer.Exit(1)
+
+    console.print(Panel(
+        "[yellow]Traces may contain sensitive user data.[/]\n"
+        "Review the output before sharing or uploading.",
+        title="PII reminder", border_style="yellow",
+    ))
+
+    max_trace_lines = 100_000  # matches eval / human-eval caps in the project
+    events: list[dict] = []
+    if format == "soup-serve":
+        trace_iter = parse_soup_serve(str(logs_path))
+    else:
+        if logs_path.is_file():
+            with logs_path.open("r", encoding="utf-8") as fh:
+                for line_no, line in enumerate(fh, start=1):
+                    if line_no > max_trace_lines:
+                        console.print(
+                            f"[yellow]--logs exceeds cap of {max_trace_lines} "
+                            "lines; truncating.[/]"
+                        )
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        events.append(_json.loads(line))
+                    except _json.JSONDecodeError:
+                        continue
+        if format == "langchain":
+            trace_iter = parse_langchain(events)
+        else:  # openai
+            trace_iter = parse_openai(events)
+
+    pairs = list(build_pairs(trace_iter, signal=signal))
+
+    if judge:
+        # v0.40.3 (#33 (a)) — LLM-judge confidence filter.
+        from souplite.data.traces.quality import judge_filter_pairs
+        from souplite.eval.judge import VALID_PROVIDERS, JudgeEvaluator
+
+        # Friendly early validation matches the existing CLI conventions —
+        # fall through to the constructor only after the obvious typo is caught.
+        if judge_provider not in VALID_PROVIDERS:
+            console.print(
+                f"[red]--judge-provider '{_escape(judge_provider)}' is invalid. "
+                f"Choose: {', '.join(sorted(VALID_PROVIDERS))}[/]"
+            )
+            raise typer.Exit(1)
+
+        try:
+            judge_evaluator = JudgeEvaluator(
+                provider=judge_provider,
+                model=judge_model,
+                api_base=judge_api_base,
+            )
+        except ValueError as exc:
+            console.print(f"[red]--judge config error:[/] {_escape(str(exc))}")
+            raise typer.Exit(1) from exc
+
+        # Cost-shock warning: each pair → TWO judge calls (chosen + rejected).
+        projected = len(pairs) * 2
+        console.print(
+            f"[yellow]Judge filter will issue ~{projected} backend calls "
+            f"({len(pairs)} pairs × 2). Cost depends on provider and model. "
+            f"Use --min-confidence to tune throughput.[/]"
+        )
+
+        try:
+            filtered, report = judge_filter_pairs(
+                pairs, judge=judge_evaluator, min_confidence=min_confidence,
+            )
+        except (TypeError, ValueError) as exc:
+            console.print(f"[red]--judge runtime error:[/] {_escape(str(exc))}")
+            raise typer.Exit(1) from exc
+
+        console.print(
+            f"[green]Judge filter:[/] kept={report.kept} dropped={report.dropped} "
+            f"errors={report.errors} (min_confidence={min_confidence:.2f})"
+        )
+        pairs = filtered
+
+    with output_path.open("w", encoding="utf-8") as fh:
+        for pair in pairs:
+            fh.write(_json.dumps(pair.to_jsonl_dict(), ensure_ascii=False) + "\n")
+
+    console.print(
+        f"[green]Wrote {len(pairs)} preference pair(s)[/] to "
+        f"[cyan]{_escape(str(output_path))}[/]"
+    )
+
+
+@app.command(name="review")
+def review_cmd(
+    input_file: str = typer.Argument(
+        ..., metavar="INPUT", help="Path to preference JSONL (chosen/rejected)",
+    ),
+    sample: int = typer.Option(
+        10, "--sample", "-s",
+        help="How many pairs to preview (1-100)",
+    ),
+) -> None:
+    """Preview preference pairs for manual review."""
+    import json as _json
+
+    from rich.markup import escape as _escape
+    from rich.panel import Panel
+
+    sample = max(1, min(int(sample), 100))
+    path = Path(input_file)
+    if not path.exists():
+        console.print(f"[red]File not found:[/] {input_file}")
+        raise typer.Exit(1)
+
+    shown = 0
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if shown >= sample:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            prompt = str(entry.get("prompt", ""))
+            chosen = str(entry.get("chosen", ""))
+            rejected = str(entry.get("rejected", ""))
+            console.print(Panel(
+                f"[bold cyan]Prompt:[/] {_escape(prompt[:400])}\n\n"
+                f"[green]Chosen:[/] {_escape(chosen[:400])}\n\n"
+                f"[red]Rejected:[/] {_escape(rejected[:400])}",
+                title=f"Pair {shown + 1}",
+                border_style="blue",
+            ))
+            shown += 1
+
+    if shown == 0:
+        console.print("[yellow]No pairs found in file.[/]")
+
+
+@app.command(name="registry")
+def list_registry():
+    """List all registered datasets."""
+    from souplite.utils.registry import load_registry
+
+    registry_path = _get_registry_path()
+    registry = load_registry(registry_path)
+
+    if not registry:
+        console.print("[yellow]No datasets registered.[/]")
+        console.print(
+            "[dim]Register with: "
+            "soup data register --name my-data --path data.jsonl --format alpaca[/]"
+        )
+        return
+
+    table = Table(title="Registered Datasets")
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Path")
+    table.add_column("Format")
+
+    from rich.markup import escape
+
+    for ds_name, ds_info in sorted(registry.items()):
+        table.add_row(
+            escape(ds_name),
+            escape(ds_info.get("path", "")),
+            escape(ds_info.get("format", "")),
+        )
+
+    console.print(table)
+
+
+@app.command(name="push")
+def push_dataset_cmd(
+    input_path: str = typer.Option(
+        ...,
+        "--input",
+        "-i",
+        help="Path to local JSONL dataset file",
+    ),
+    hf_dataset: str = typer.Option(
+        ...,
+        "--hf-dataset",
+        help="HuggingFace dataset repo id (e.g. user/my-dataset)",
+    ),
+    private: bool = typer.Option(
+        False, "--private", help="Make the HF dataset repo private",
+    ),
+    commit_message: str = typer.Option(
+        "Upload dataset with SoupLite",
+        "--message",
+        help="Commit message for the dataset upload",
+    ),
+    hub: str = typer.Option(
+        "hf",
+        "--hub",
+        help=(
+            "Target hub: hf (default) / modelscope / modelers. Non-HF hubs "
+            "upload via the matching SDK (v0.71.5 #157) — repo_type=dataset, "
+            "commit message sanitised to first line + 200 chars."
+        ),
+    ),
+):
+    """Upload a local JSONL dataset to a model hub as a dataset repo."""
+    from souplite.utils.hf import (
+        get_hf_api,
+        resolve_endpoint,
+        resolve_token,
+        validate_repo_id,
+    )
+    from souplite.utils.hubs import validate_hub_name
+    from souplite.utils.paths import is_under_cwd
+
+    try:
+        hub_canonical = validate_hub_name(hub)
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(2) from exc
+
+    file_path = Path(input_path)
+    if not file_path.exists():
+        console.print(f"[red]Dataset file not found: {file_path}[/]")
+        raise typer.Exit(1)
+    if not file_path.is_file():
+        console.print(f"[red]Expected a file, got a directory: {file_path}[/]")
+        raise typer.Exit(1)
+    if not is_under_cwd(file_path):
+        console.print(
+            "[red]Dataset path must stay under the current working directory.[/]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        validate_repo_id(hf_dataset)
+    except ValueError as exc:
+        console.print(f"[red]Invalid --{hub_canonical}-dataset repo id:[/] {exc}")
+        raise typer.Exit(1) from exc
+
+    # v0.71.5 #157 — non-HF hubs route through the shared upload_repo adapter.
+    # ModelScope / Modelers SDKs upload a folder, so the single JSONL is
+    # staged into a temp dir and uploaded as a dataset repo.
+    if hub_canonical != "hf":
+        _push_dataset_non_hf(
+            hub_canonical, hf_dataset, file_path, commit_message
+        )
+        return
+
+    token = resolve_token()
+    if token is None:
+        console.print(
+            "[red]No HuggingFace token found.[/]\n"
+            "Set HF_TOKEN env var or run: [bold]huggingface-cli login[/]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        endpoint = resolve_endpoint()
+    except ValueError as exc:
+        console.print(f"[red]HF_ENDPOINT invalid:[/] {exc}")
+        raise typer.Exit(1) from exc
+
+    try:
+        api = get_hf_api(token=token, endpoint=endpoint)
+    except ImportError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+
+    # Sanitise commit message to a single short line — prevents multi-line
+    # injection into HF commit history.
+    safe_commit = (commit_message.splitlines()[0][:200] if commit_message else "")
+    try:
+        api.create_repo(
+            repo_id=hf_dataset, repo_type="dataset",
+            private=private, exist_ok=True,
+        )
+        api.upload_file(
+            path_or_fileobj=str(file_path),
+            path_in_repo=file_path.name,
+            repo_id=hf_dataset,
+            repo_type="dataset",
+            commit_message=safe_commit,
+        )
+    except Exception as exc:
+        console.print(f"[red]Upload failed:[/] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print(
+        f"[green]Uploaded to[/] https://huggingface.co/datasets/{hf_dataset}"
+    )
+
+
+def _push_dataset_non_hf(
+    hub: str, repo_id: str, file_path: Path, commit_message: str
+) -> None:
+    """Upload a single JSONL to a non-HF hub as a dataset (v0.71.5 #157).
+
+    ``upload_repo`` uploads a folder, so the file is staged into a temp dir
+    first. ``upload_repo`` already sanitises the commit message (first line +
+    200 chars) and validates the repo id shape.
+    """
+    import shutil
+    import tempfile
+
+    from rich.markup import escape
+
+    from souplite.utils.hubs import upload_repo
+
+    # Stage UNDER cwd — `upload_repo` enforces cwd-containment on folder_path
+    # (the system tempdir would be rejected).
+    staging = tempfile.mkdtemp(prefix=".soup_dataset_push.", dir=os.getcwd())
+    try:
+        shutil.copy2(str(file_path), os.path.join(staging, file_path.name))
+        try:
+            upload_repo(
+                hub,
+                repo_id,
+                folder_path=staging,
+                commit_message=commit_message,
+                repo_type="dataset",
+            )
+        except ImportError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(1) from exc
+        except (TypeError, ValueError) as exc:
+            console.print(f"[red]Upload failed:[/] {exc}")
+            raise typer.Exit(1) from exc
+        except Exception as exc:  # noqa: BLE001 — surface SDK errors generically
+            console.print(f"[red]Upload failed:[/] {exc}")
+            raise typer.Exit(1) from exc
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    console.print(
+        f"[green]Uploaded[/] {escape(file_path.name)} to {escape(hub)} "
+        f"dataset [bold]{escape(repo_id)}[/]"
+    )
+
+
+# --- v0.42.0 Part C / F: AOT preprocess + document ingestion ---------------
+
+
+def _cache_key_dataset_path(cfg) -> str:
+    """Dataset-path input fed to make_preprocess_cache_key (#443 list-aware).
+
+    A list data.train folds data.interleave's strategy/probs into the key
+    too, since the same file set under a different mixture must not
+    collide on a stale, mis-mixed cache entry. Extracted as its own
+    function so it can be exercised directly by
+    tests/test_issue443_interleave_wiring.py's enumerating test.
+    """
+    from souplite.utils.data_pipeline import preprocess_dataset_key_input
+
+    return preprocess_dataset_key_input(cfg.data)
+
+
+def _mask_labels_for_cache_row(
+    messages, tokenizer, mask_mode: str, max_length: int, input_ids: list
+) -> list:
+    """Loss mask for one cached chat row, from the live path's own builders (#1054).
+
+    ``mask_mode`` comes from ``preprocess_mask_mode``, which mirrors
+    ``data.sft_format.build_format_row``'s selection — so a cache and the
+    equivalent live run mask the same tokens. Every flag that reaches the live
+    builder has to be read back out of the mode string here: dropping one caches
+    a different mask under a key that says otherwise, which is #1054 again.
+
+    Suffixes are matched with ``in``, not ``endswith`` — with both suffixes
+    present the mode is ``responses_only+eot+mask_history``, and ``endswith``
+    would silently drop the EOT from every such cache.
+
+    The builders tokenize through ``add_special_tokens=False`` while this path is
+    pinned to the rendered template's own tokenization, so their mask is aligned
+    back onto ``input_ids`` rather than replacing it (``align_labels_to_ids``).
+    """
+    from souplite.data.loss_mask import (
+        align_labels_to_ids,
+        build_assistant_only_labels,
+        build_per_message_train_labels,
+    )
+
+    if mask_mode == "full":
+        return list(input_ids)
+    if mask_mode == "train_field":
+        built = build_per_message_train_labels(
+            messages, tokenizer, max_length=max_length
+        )
+    else:
+        built = build_assistant_only_labels(
+            messages,
+            tokenizer,
+            max_length=max_length,
+            include_eot="+eot" in mask_mode,
+            mask_history="+mask_history" in mask_mode,
+        )
+    return align_labels_to_ids(
+        built["input_ids"], built["labels"], input_ids
+    )
+
+
+@app.command(name="preprocess")
+def preprocess_dataset(
+    config_path: str = typer.Argument(
+        ..., help="Path to soup.yaml — uses data.train + tokenizer + max_length"
+    ),
+    output_dir: str = typer.Option(
+        "./.soup-tokenized", "--output", "-o",
+        help="Cache directory under cwd",
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip confirmation prompt"),
+) -> None:
+    """AOT-tokenize a dataset and cache to disk for reuse across runs.
+
+    v0.53.7 #86: live tokenize loop. Lazy-imports ``transformers``/``datasets``,
+    iterates ``data.train``, renders each row through chat template (or raw
+    text for pretrain), tokenizes with ``max_length=data.max_length`` +
+    ``truncation=True``, writes Arrow shards under
+    ``<output>/<cache_key>/`` via ``Dataset.save_to_disk``. Writes
+    ``metadata.json`` with cache_key + row_count + tokenizer_name + max_length.
+
+    Rows capped at 10M to defend against pathological dataset sizes.
+    """
+    import json as _json
+
+    from souplite.config.loader import load_config
+    from souplite.data.chat_templates import resolve_chat_template
+    from souplite.utils.data_pipeline import (
+        make_preprocess_cache_key,
+        preprocess_mask_mode,
+    )
+    from souplite.utils.paths import is_under_cwd
+
+    cfg_real = os.path.realpath(config_path)
+    if not is_under_cwd(cfg_real):
+        console.print(
+            f"[red]--config must stay under cwd[/] (got {config_path!r})"
+        )
+        raise typer.Exit(1)
+    if not Path(cfg_real).is_file():
+        console.print(f"[red]Config not found:[/] {config_path}")
+        raise typer.Exit(1)
+
+    cfg = load_config(cfg_real)
+    out_real = os.path.realpath(output_dir)
+    if not is_under_cwd(out_real):
+        console.print(
+            f"[red]--output must stay under cwd[/] (got {output_dir!r})"
+        )
+        raise typer.Exit(1)
+
+    dataset_path = _cache_key_dataset_path(cfg)
+    # #1067: render with data.chat_template, as the live path does, and key on it.
+    try:
+        chat_template = resolve_chat_template(cfg.data.chat_template)
+    except KeyError as exc:
+        console.print(f"[red]Invalid data.chat_template:[/] {for_terminal(exc.args[0])}")
+        raise typer.Exit(1) from exc
+    train_display = (
+        ", ".join(cfg.data.train) if isinstance(cfg.data.train, list) else cfg.data.train
+    )
+    mask_mode = preprocess_mask_mode(cfg.data, getattr(cfg, "training", None))
+    cache_key = make_preprocess_cache_key(
+        dataset_path=dataset_path,
+        tokenizer_name=cfg.base,
+        max_length=cfg.data.max_length,
+        format_name=cfg.data.format,
+        chat_template=chat_template,
+        mask_mode=mask_mode,
+    )
+    target = Path(out_real) / cache_key
+    console.print(f"[cyan]Dataset:[/] {train_display}")
+    console.print(f"[cyan]Tokenizer:[/] {cfg.base}")
+    console.print(f"[cyan]max_length:[/] {cfg.data.max_length}")
+    console.print(f"[cyan]Loss mask:[/] {mask_mode}")
+    console.print(f"[cyan]Cache key:[/] {cache_key}")
+    console.print(f"[cyan]Target:[/] {target}")
+
+    if target.exists() and not yes:
+        console.print(
+            f"[yellow]Target already exists:[/] {target}\n"
+            "[dim]Re-run with --yes to overwrite.[/]"
+        )
+        raise typer.Exit(0)
+
+    # Lazy imports — defer heavy deps until the actual tokenize loop runs.
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        console.print(
+            "[red]transformers not installed.[/] Run: pip install transformers"
+        )
+        raise typer.Exit(1) from None
+    try:
+        from datasets import Dataset
+    except ImportError:
+        console.print(
+            "[red]datasets not installed.[/] Run: pip install datasets"
+        )
+        raise typer.Exit(1) from None
+    from souplite.data.loader import load_dataset
+
+    # DoS cap (10M rows).
+    max_preprocess_rows = 10_000_000
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.base, trust_remote_code=False
+    )
+    if chat_template is not None:
+        tokenizer.chat_template = chat_template
+
+    try:
+        dataset = load_dataset(cfg.data)
+    except (TypeError, ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]Failed to load dataset:[/] {exc}")
+        raise typer.Exit(1) from exc
+
+    raw_rows = dataset.get("train", []) if isinstance(dataset, dict) else []
+    max_length = int(cfg.data.max_length)
+    is_pretrain = cfg.task == "pretrain"
+
+    # #876: measured once, not per row -- how many leading BOS the tokenizer's
+    # post-processor prepends, so the chat path can keep only the template's own.
+    bos_added_by_post_processor = None
+    if not is_pretrain:
+        from souplite.data.loss_mask import post_processor_leading_bos_count
+
+        bos_added_by_post_processor = post_processor_leading_bos_count(tokenizer)
+
+    rendered_rows: list[dict] = []
+    for idx, row in enumerate(raw_rows):
+        if idx >= max_preprocess_rows:
+            console.print(
+                f"[yellow]Reached row cap {max_preprocess_rows}, truncating.[/]"
+            )
+            break
+        if is_pretrain:
+            # Pretrain uses raw text.
+            text = ""
+            if isinstance(row, dict):
+                text = row.get("text") or row.get("content") or ""
+            if not isinstance(text, str):
+                continue
+            if not text:
+                continue
+        else:
+            messages = row.get("messages") if isinstance(row, dict) else None
+            if not messages or not getattr(tokenizer, "chat_template", None):
+                continue
+            try:
+                text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False
+                )
+            except Exception:  # noqa: BLE001 — tokenizer template errors vary
+                continue
+            if not isinstance(text, str) or not text:
+                continue
+        try:
+            tokens = tokenizer(
+                text,
+                max_length=max_length,
+                truncation=True,
+                padding=False,
+                return_attention_mask=True,
+                # Tokenise exactly as ``main`` (add_special_tokens defaults to
+                # True). This keeps ``main``'s truncation reservation — a
+                # truncated row still ends on the post-processor's EOS — and the
+                # post-processor BOS/EOS. #785 removed the one doubled leading BOS
+                # here; #791 then applies TRL's training EOS rule below, both only
+                # for the chat path.
+            )
+        except Exception:  # noqa: BLE001 — tokenizer errors vary
+            continue
+        input_ids = tokens["input_ids"]
+        attention_mask = tokens.get("attention_mask", [1] * len(input_ids))
+        if not is_pretrain:
+            # #785/#788/#876: add_special_tokens=True prepends the post-processor's
+            # BOS, which the live path (add_special_tokens=False) never trains on.
+            # Keep only the BOS the template itself renders: one for a
+            # ``{{ bos_token }}`` template (#785's doubled case), zero for a
+            # ``data.chat_template`` preset (#876). Pretrain feeds raw document
+            # text with no template, so it keeps ``main``'s encoding untouched.
+            from souplite.data.loss_mask import (
+                append_training_eos,
+                strip_post_processor_leading_bos,
+            )
+
+            # Decide "was this row truncated" BEFORE removing a BOS. Afterwards a
+            # row cut to the budget reads as one token short of it, and the EOS
+            # check below would hand it a stop token the live path (append, then
+            # truncate) does not have. Only the exact-fit length is ambiguous, so
+            # only that row is re-measured without truncation.
+            truncated = False
+            if len(input_ids) >= max_length:
+                try:
+                    full = tokenizer(text, truncation=False, verbose=False)
+                    truncated = len(full["input_ids"]) > max_length
+                except Exception:  # noqa: BLE001 — tokenizer errors vary
+                    truncated = True
+            input_ids, attention_mask = strip_post_processor_leading_bos(
+                tokenizer, input_ids, attention_mask, bos_added_by_post_processor
+            )
+            # #791: the live training path appends ``eos_token`` (TRL 0.29.1's
+            # ``add_eos``, ``sft_trainer.py:1026-1038``) to every chat row that
+            # does not already end on it, before tokenizing. This cache path
+            # tokenizes directly, so on a template that renders no EOS and a
+            # tokenizer whose post-processor appends none (Qwen-shaped) the cached
+            # row carried zero stop tokens while the live path trained on one —
+            # run-on generation, and silent (the loss curve looks normal and
+            # ``soup data doctor`` renders the live path, not the cache). Reproduce
+            # the rule in token space so the cache trains on the same EOS count.
+            # Only when the row is under the length budget: a row that filled
+            # ``max_length`` was truncated, and the live path (append-then-truncate)
+            # keeps no trailing EOS there either, so matching it means not pushing
+            # the row past the budget.
+            if not truncated and len(input_ids) < max_length:
+                with_eos = append_training_eos(tokenizer, input_ids)
+                if len(with_eos) != len(input_ids):
+                    input_ids = with_eos
+                    attention_mask = attention_mask + [1]
+            # #1054: without a ``labels`` column TRL's collator falls back to
+            # ``labels = input_ids`` and the cached run trains on the prompt
+            # too, silently diverging from the equivalent live chatml run. Build
+            # the mask with the very helpers the live path uses, then align it
+            # onto this path's ids, which are left exactly as the tokenization
+            # above produced them — only ``labels`` is new here.
+            labels = _mask_labels_for_cache_row(
+                messages, tokenizer, mask_mode, max_length, input_ids
+            )
+        else:
+            # Pretrain trains on every token by design — no masking.
+            labels = list(input_ids)
+        rendered_rows.append(
+            {
+                "input_ids": input_ids,
+                "labels": labels,
+                "attention_mask": attention_mask,
+            }
+        )
+
+    if not rendered_rows:
+        console.print(
+            "[red]No rows tokenized.[/] Check data.format and tokenizer "
+            "chat_template."
+        )
+        raise typer.Exit(1)
+
+    ds = Dataset.from_list(rendered_rows)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # v0.53.7 M-H: atomic write via temp dir + os.replace so a partial
+    # write (e.g. SIGKILL mid-save) does not leave a corrupt dataset at
+    # ``target``. save_to_disk overwrites silently; we route through a
+    # sibling temp dir to defend against that too.
+    import shutil as _shutil
+
+    tmp_dir = target.parent / (".tmp_" + target.name)
+    if tmp_dir.exists():
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+    try:
+        ds.save_to_disk(str(tmp_dir))
+        if target.exists():
+            _shutil.rmtree(target, ignore_errors=True)
+        os.replace(str(tmp_dir), str(target))
+    except Exception:
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    from souplite import __version__ as _soup_version
+
+    metadata = {
+        "cache_key": cache_key,
+        "row_count": len(rendered_rows),
+        "tokenizer_name": cfg.base,
+        "max_length": max_length,
+        "format": cfg.data.format,
+        "chat_template": cfg.data.chat_template,
+        "mask_mode": mask_mode,
+        "task": cfg.task,
+        "soup_version": _soup_version,
+    }
+    metadata_path = target / "metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        _json.dump(metadata, f, indent=2)
+
+    console.print(
+        f"[green]Wrote {len(rendered_rows)} tokenized rows to[/] {target}"
+    )
+    console.print(
+        f"[dim]Set data.tokenized_path={target} + data.format=pre_tokenized "
+        "in your soup.yaml to short-circuit tokenization on subsequent runs.[/]"
+    )
+
+
+@app.command(name="ingest")
+def ingest_document(
+    file: str = typer.Argument(..., help="PDF / DOCX / MD / TXT file"),
+    output: str = typer.Option(
+        "./ingested.jsonl", "--output", "-o", help="Output JSONL path"
+    ),
+) -> None:
+    """Ingest a document into JSONL with one row per page / heading.
+
+    Lazy-imports the per-format extractor so missing optional deps don't
+    break the rest of `soup data --help`. Supported formats:
+    - .pdf  → pypdf
+    - .docx → python-docx
+    - .md   → markdown
+    - .txt  → built-in
+    """
+    import stat
+
+    from souplite.utils.data_pipeline import detect_ingest_format
+    from souplite.utils.paths import is_under_cwd
+
+    # Reject symlinks at the input path (TOCTOU defence — mirrors v0.33.0 #22
+    # prune_checkpoints policy).
+    try:
+        lst = os.lstat(file)
+    except OSError as exc:
+        console.print(f"[red]File not found:[/] {file}")
+        raise typer.Exit(1) from exc
+    if stat.S_ISLNK(lst.st_mode):
+        console.print(
+            f"[red]Input file must not be a symlink[/] (got {file!r})"
+        )
+        raise typer.Exit(1)
+
+    in_real = os.path.realpath(file)
+    if not is_under_cwd(in_real):
+        console.print(f"[red]Input must stay under cwd[/] (got {file!r})")
+        raise typer.Exit(1)
+    if not Path(in_real).is_file():
+        console.print(f"[red]File not found:[/] {file}")
+        raise typer.Exit(1)
+
+    out_real = os.path.realpath(output)
+    if not is_under_cwd(out_real):
+        console.print("[red]--output must stay under cwd[/]")
+        raise typer.Exit(1)
+
+    try:
+        kind = detect_ingest_format(file)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+
+    rows: list[dict] = []
+    if kind == "txt":
+        with open(in_real, encoding="utf-8") as f:
+            text = f.read()
+        rows.append({"text": text, "source": Path(in_real).name})
+    elif kind == "markdown":
+        # v0.53.7 #88 — heading-aware split. One row per ATX heading section
+        # (``^#{1,6}\s``); preamble before the first heading is emitted as a
+        # row with ``section=None`` + ``level=None``. Closes the v0.42.0 #88
+        # known limitation.
+        from souplite.utils.data_pipeline import split_markdown_by_headings
+
+        with open(in_real, encoding="utf-8") as f:
+            text = f.read()
+        sections = split_markdown_by_headings(text)
+        if not sections:
+            # Empty markdown file — keep parity with v0.42.0 single-row shape.
+            rows.append(
+                {
+                    "text": "",
+                    "section": None,
+                    "level": None,
+                    "source": Path(in_real).name,
+                }
+            )
+        else:
+            for sec in sections:
+                rows.append(
+                    {
+                        "text": sec["text"],
+                        "section": sec["section"],
+                        "level": sec["level"],
+                        "source": Path(in_real).name,
+                    }
+                )
+    elif kind == "pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            console.print(
+                "[red]pypdf not installed.[/] Run: pip install pypdf"
+            )
+            raise typer.Exit(1) from None
+        reader = PdfReader(in_real)
+        for index, page in enumerate(reader.pages):
+            rows.append({
+                "text": page.extract_text() or "",
+                "source": Path(in_real).name,
+                "page": index,
+            })
+    elif kind == "docx":
+        try:
+            from docx import Document
+        except ImportError:
+            console.print(
+                "[red]python-docx not installed.[/] Run: pip install python-docx"
+            )
+            raise typer.Exit(1) from None
+        doc = Document(in_real)
+        for index, para in enumerate(doc.paragraphs):
+            text = para.text.strip()
+            if text:
+                rows.append({
+                    "text": text,
+                    "source": Path(in_real).name,
+                    "para": index,
+                })
+    else:
+        console.print(f"[red]Unhandled ingest kind:[/] {kind}")
+        raise typer.Exit(1)
+
+    Path(out_real).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_real, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    console.print(f"[green]Wrote {len(rows)} rows to[/] {output}")
+
+
+@app.command(name="demo")
+def demo_bundle(
+    name: str = typer.Argument(
+        None,
+        help="Bundle name (alpaca_demo / sharegpt_demo / dpo_demo / grpo_demo). "
+        "Omit to list available bundles.",
+    ),
+    output: str = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Destination JSONL path (defaults to ./<name>.jsonl).",
+    ),
+) -> None:
+    """List or copy a bundled demo dataset (v0.43.0).
+
+    `soup data demo` lists available bundles. `soup data demo <name>` copies
+    the JSONL fixture to the current directory. Bundles are version-locked
+    JSONL fixtures shipped under `examples/data/`.
+    """
+    from rich.markup import escape as _esc
+    from rich.table import Table
+
+    from souplite.utils.demo_bundles import (
+        copy_bundle_to,
+        get_bundle,
+        list_bundles,
+    )
+
+    if name is None:
+        table = Table(title="Available demo bundles", show_lines=False)
+        table.add_column("Name", style="cyan")
+        table.add_column("Format", style="green")
+        table.add_column("Description")
+        for bundle in list_bundles():
+            table.add_row(bundle.name, bundle.format, bundle.description)
+        console.print(table)
+        console.print(
+            "[dim]Run: soup data demo <name> --output <path>[/]"
+        )
+        return
+
+    try:
+        bundle = get_bundle(name)
+    except ValueError as exc:
+        console.print(f"[red]{_esc(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+
+    target = output or f"./{bundle.name}.jsonl"
+    try:
+        written = copy_bundle_to(bundle.name, target)
+    except FileExistsError as exc:
+        console.print(f"[red]{_esc(str(exc))}[/]")
+        raise typer.Exit(1) from exc
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]{_esc(str(exc))}[/]")
+        raise typer.Exit(1) from exc
+    console.print(
+        f"[green]Copied bundle '{bundle.name}' to[/] {_esc(written)}"
+    )
+
+
+@app.command(name="recipe")
+def recipe(
+    path: str = typer.Argument(..., help="Path to recipe.yaml under cwd"),
+    execute: bool = typer.Option(
+        False,
+        "--execute",
+        help=(
+            "Run the validated DAG end-to-end (v0.53.7 #106 — live per-node "
+            "execution: seed / llm_text / code / judge / validator / sampler)."
+        ),
+    ),
+    output: Optional[str] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Output dir for sampler node (required with --execute).",
+    ),
+    provider: Optional[str] = typer.Option(
+        None,
+        "--provider",
+        help="LLM provider for llm_text/judge nodes: ollama, anthropic, or vllm.",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Provider model name (defaults to llama3.1).",
+    ),
+    base_url: Optional[str] = typer.Option(
+        None,
+        "--base-url",
+        help="Provider base URL (Ollama/vLLM; defaults to loopback).",
+    ),
+    offline: bool = typer.Option(
+        False,
+        "--offline",
+        help="Explicitly allow placeholder generation and accept-all judging.",
+    ),
+) -> None:
+    """Validate a Data Recipe DAG and optionally execute every node."""
+    from rich.markup import escape as _escape
+
+    from souplite.utils.recipe_dag import load_recipe_yaml
+
+    try:
+        dag = load_recipe_yaml(path)
+    except FileNotFoundError as exc:
+        console.print(f"[red]Recipe not found: {_escape(str(exc))}[/]")
+        raise typer.Exit(1) from exc
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]Invalid recipe: {_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+
+    console.print(
+        f"[green]Recipe validated.[/] {len(dag.nodes)} node(s), "
+        f"{len(dag.edges)} edge(s)."
+    )
+    console.print(
+        "Topological order: "
+        + ", ".join(_escape(name) for name in dag.topo_order)
+    )
+
+    if execute:
+        # `is None` guard — empty-string `--output ""` is a distinct
+        # operator error that should NOT be silently mapped to "missing"
+        # (matches v0.40.6 project policy on `is None` over falsy).
+        if output is None:
+            console.print(
+                "[red]--execute requires --output <dir>[/]"
+            )
+            raise typer.Exit(2)
+        # Defence-in-depth: enforce cwd containment at the CLI boundary
+        # BEFORE handing off to run_recipe. Today run_recipe is a stub,
+        # so this only protects against future v0.53.7 live-runner bugs —
+        # the docstring contract on run_recipe.output_dir says
+        # cwd-contained, and we never want the live runner to be the
+        # first/only enforcement point.
+        from souplite.utils.paths import is_under_cwd
+        from souplite.utils.recipe_run import run_recipe
+
+        if not output or not is_under_cwd(output):
+            console.print(
+                "[red]--output must be a non-empty path under the current directory[/]"
+            )
+            raise typer.Exit(2)
+
+        if provider is not None and offline:
+            console.print("[red]--provider and --offline cannot be used together.[/]")
+            raise typer.Exit(2)
+        if provider is None and (model is not None or base_url is not None):
+            console.print("[red]--model and --base-url require --provider.[/]")
+            raise typer.Exit(2)
+        if provider is not None:
+            from souplite.utils.data_forge import JUDGE_PROVIDERS
+
+            provider = provider.strip().lower()
+            if provider not in JUDGE_PROVIDERS:
+                options = ", ".join(sorted(JUDGE_PROVIDERS))
+                console.print(
+                    f"[red]Unknown --provider '{_escape(provider)}'; choose: {options}.[/]"
+                )
+                raise typer.Exit(2)
+        has_llm_nodes = any(node.kind in {"llm_text", "judge"} for node in dag.nodes)
+        if has_llm_nodes and provider is None and not offline:
+            console.print(
+                "[red]This recipe contains llm_text or judge nodes. Pass --provider "
+                "<ollama|anthropic|vllm>, or explicitly opt in to placeholder output "
+                "with --offline.[/]"
+            )
+            raise typer.Exit(2)
+        if offline and has_llm_nodes:
+            console.print(
+                "[yellow]Offline recipe mode: llm_text writes placeholder text and judge "
+                "accepts every row.[/]"
+            )
+
+        # v0.53.7 #106: live runner. Per-node handlers + checkpoint + resume
+        # land here; ``NotImplementedError`` is no longer raised on the live
+        # surface but we keep the catch for defence-in-depth (a future schema
+        # change might re-introduce a stub for an unknown node kind).
+        try:
+            result = run_recipe(
+                dag,
+                output_dir=output,
+                judge_provider=provider,
+                judge_model=model,
+                judge_base_url=base_url,
+                offline=offline,
+            )
+        except NotImplementedError as exc:
+            console.print(f"[yellow]{_escape(str(exc))}[/]")
+            raise typer.Exit(2) from exc
+        except (TypeError, ValueError) as exc:
+            console.print(f"[red]Recipe failed: {_escape(str(exc))}[/]")
+            raise typer.Exit(1) from exc
+        provider_calls = result.get("provider_call_count", 0)
+        provider_failures = result.get("provider_failure_count", 0)
+        provider_summary = ""
+        if isinstance(provider_calls, int) and provider_calls:
+            call_label = "call" if provider_calls == 1 else "calls"
+            failure_label = "failure" if provider_failures == 1 else "failures"
+            provider_summary = (
+                f" {provider_calls} provider {call_label}, "
+                f"{provider_failures} {failure_label}."
+            )
+        console.print(
+            f"[green]Recipe executed.[/] "
+            f"{len(result.get('completed_nodes', ()))} node(s) completed."
+            f"{provider_summary}"
+        )
+        return
+
+    console.print(
+        "[dim]Re-run with --execute --output <dir> to run the DAG.[/]"
+    )
+
+
+# v0.69.0 Part C — Magpie synthetic data generator.
+@app.command(name="gen-magpie")
+def gen_magpie(
+    base: str = typer.Option(..., "--base", help="Aligned chat-tuned base model id"),
+    provider: str = typer.Option(..., "--provider", help="ollama | anthropic | vllm"),
+    target: int = typer.Option(..., "--target", help="Target row count [1, 1_000_000]"),
+    output: str = typer.Option(
+        "", "--output", "-o", help="Output JSONL path (required unless --plan-only)"
+    ),
+    base_url: str = typer.Option(
+        "", "--base-url", help="Provider base URL (ollama/vllm; defaults to loopback)"
+    ),
+    max_tokens: int = typer.Option(
+        512, "--max-tokens", help="Max tokens per generation [1, 16384]"
+    ),
+    quality_filter: bool = typer.Option(
+        True,
+        "--quality-filter/--no-quality-filter",
+        help="Apply non-empty + educational heuristics (not a toxicity classifier)",
+    ),
+    plan_only: bool = typer.Option(
+        False, "--plan-only", help="Validate + print plan; do not generate."
+    ),
+) -> None:
+    """Generate synthetic data from a chat-template prefix.
+
+    Feeds the chat-template prefix only to ``--base`` and harvests user-side
+    turns via ``--provider`` (ollama / vllm raw completion). With ``--plan-only``
+    only the resolved plan is printed.
+    """
+    from rich.markup import escape as _escape
+    from rich.panel import Panel
+
+    from souplite.utils.magpie import build_magpie_config, run_magpie
+
+    try:
+        cfg = build_magpie_config(
+            base=base,
+            provider=provider,
+            target=target,
+            quality_filter=quality_filter,
+        )
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]{_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+
+    console.print(
+        Panel(
+            f"Base model:     [bold]{_escape(cfg.base_model)}[/]\n"
+            f"Provider:       [bold]{_escape(cfg.provider)}[/]\n"
+            f"Target rows:    [bold]{cfg.target_rows}[/]\n"
+            f"Quality filter: [bold]{cfg.quality_filter}[/]",
+            title="soup data gen-magpie — plan",
+        )
+    )
+
+    if plan_only:
+        return
+
+    if not output:
+        console.print("[red]--output is required unless --plan-only is set.[/]")
+        raise typer.Exit(2)
+
+    try:
+        result = run_magpie(
+            cfg,
+            output_path=output,
+            base_url=base_url or None,
+            max_tokens=max_tokens,
+        )
+    except (TypeError, ValueError, ImportError) as exc:
+        console.print(f"[red]{_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+
+    console.print(
+        Panel(
+            f"Rows kept:    [bold]{result.rows_kept}[/]\n"
+            f"Filtered:     [bold]{result.rows_filtered}[/]\n"
+            f"Duplicates:   [bold]{result.duplicates}[/]\n"
+            f"Attempts:     [bold]{result.attempts}[/]\n"
+            f"Output:       [bold]{_escape(os.path.relpath(result.output_path))}[/]",
+            title="soup data gen-magpie — done",
+        )
+    )
+    if result.rows_kept == 0:
+        console.print(
+            "[yellow]Warning:[/] 0 rows generated — is the provider reachable "
+            "and the model pulled?"
+        )
+
+
+# v0.71.31 — Best-of-N rejection sampling (local/provider sampling + judge).
+_BON_MAX_PROMPTS = 100_000
+_BON_MAX_JSONL_BYTES = 100 * 1024 * 1024  # 100 MiB
+_BON_PROVIDER_SAMPLERS = ("ollama", "vllm")
+
+
+def _load_bon_model(
+    base: str, device: str, trust: bool, revision: Optional[str] = None
+):
+    """Seam: load ``(model, tokenizer)`` for best-of-n (patched in tests)."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    load_kwargs: dict[str, object] = {"trust_remote_code": trust}
+    if revision:
+        load_kwargs["revision"] = revision
+    tok = AutoTokenizer.from_pretrained(base, **load_kwargs)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    dev_map = "cpu" if device == "cpu" else "auto"
+    model = AutoModelForCausalLM.from_pretrained(
+        base, device_map=dev_map, **load_kwargs
+    )
+    return model, tok
+
+
+def _prompt_text_or_none(row: dict) -> str | None:
+    """Extract one usable prompt without exposing row contents."""
+    text = None
+    if isinstance(row.get("prompt"), str):
+        text = row["prompt"]
+    elif isinstance(row.get("instruction"), str):
+        text = row["instruction"]
+    elif isinstance(row.get("messages"), list):
+        users = [
+            message.get("content")
+            for message in row["messages"]
+            if isinstance(message, dict) and message.get("role") == "user"
+        ]
+        if users and isinstance(users[-1], str):
+            text = users[-1]
+    if text is None or not text.strip():
+        return None
+    return text
+
+
+def _bon_prompt_text(row: dict, line_number: int) -> str:
+    """Extract one strict Best-of-N prompt with a private, line-numbered error."""
+    text = _prompt_text_or_none(row)
+    if text is None:
+        raise ValueError(
+            f"prompt JSONL line {line_number} has no non-empty prompt, "
+            "instruction, or user message"
+        )
+    return text
+
+
+def _bon_load_prompt_records(path: str) -> list[tuple[str, int]]:
+    """Read prompt JSONL strictly as ``(text, source_line)`` records."""
+    from souplite.utils.paths import enforce_under_cwd_and_no_symlink
+
+    enforce_under_cwd_and_no_symlink(path, "--prompts path")
+    real = os.path.realpath(path)
+    if not os.path.isfile(real):
+        raise FileNotFoundError(path)
+    if os.path.getsize(real) > _BON_MAX_JSONL_BYTES:
+        raise ValueError(f"--prompts file exceeds {_BON_MAX_JSONL_BYTES} bytes")
+    prompts: list[tuple[str, int]] = []
+    with open(real, "r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if len(prompts) >= _BON_MAX_PROMPTS:
+                raise ValueError(f"--prompts file exceeds {_BON_MAX_PROMPTS} rows")
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"prompt JSONL line {line_number} is not valid JSON"
+                ) from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"prompt JSONL line {line_number} must be a JSON object")
+            prompts.append((_bon_prompt_text(row, line_number), line_number))
+    return prompts
+
+
+def _evolve_load_prompts(path: str) -> list[str]:
+    """Read evolve seeds while preserving its historical skip-invalid policy."""
+    from souplite.utils.paths import enforce_under_cwd_and_no_symlink
+
+    enforce_under_cwd_and_no_symlink(path, "--input path")
+    real = os.path.realpath(path)
+    if not os.path.isfile(real):
+        raise FileNotFoundError(path)
+    if os.path.getsize(real) > _BON_MAX_JSONL_BYTES:
+        raise ValueError(f"--input file exceeds {_BON_MAX_JSONL_BYTES} bytes")
+    prompts: list[str] = []
+    with open(real, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if len(prompts) >= _BON_MAX_PROMPTS:
+                raise ValueError(f"--input file exceeds {_BON_MAX_PROMPTS} rows")
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            text = _prompt_text_or_none(row)
+            if text is not None:
+                prompts.append(text)
+    return prompts
+
+
+@app.command(name="best-of-n")
+def best_of_n(
+    base: str = typer.Option("", "--base", help="Local base model id/path to sample from"),
+    prompts: str = typer.Option("", "--prompts", help="JSONL of {prompt|messages} rows"),
+    judge: str = typer.Option(
+        "", "--judge", help="Judge URL (ollama://|https://|http://localhost)"
+    ),
+    provider: str = typer.Option("", "--provider", help="Provider sampler: ollama | vllm"),
+    model: str = typer.Option("", "--model", help="Provider sampler model id"),
+    base_url: str = typer.Option("", "--base-url", help="Provider sampler base URL"),
+    n: int = typer.Option(8, "--n", help="Candidates per prompt [2, 64]"),
+    output: str = typer.Option(
+        "", "--output", "-o", help="Output SFT JSONL (required unless --plan-only)"
+    ),
+    emit_pairs: str = typer.Option(
+        "", "--emit-pairs", help="Also write winner/loser DPO pairs to this JSONL"
+    ),
+    checkpoint: str = typer.Option(
+        "",
+        "--checkpoint",
+        help="Recovery journal (default: <output-or-artifact>.checkpoint.jsonl)",
+    ),
+    manifest: str = typer.Option(
+        "", "--manifest", help="Commit manifest (default: <output>.manifest.json)"
+    ),
+    resume: bool = typer.Option(False, "--resume", help="Resume a matching checkpoint"),
+    export_candidates: str = typer.Option(
+        "", "--export-candidates", help="Sampling-only candidate artifact JSONL"
+    ),
+    candidate_artifact: str = typer.Option(
+        "", "--candidate-artifact", help="Offline candidate artifact to materialize"
+    ),
+    judgments: str = typer.Option(
+        "", "--judgments", help="Offline verified judgments JSONL"
+    ),
+    temperature: float = typer.Option(1.0, "--temperature", help="Sampling temp [0, 2]"),
+    max_new_tokens: int = typer.Option(
+        256, "--max-new-tokens", help="Max new tokens per candidate [1, 4096]"
+    ),
+    device: str = typer.Option("", "--device", help="Local sampler device: cuda | cpu"),
+    seed: int = typer.Option(0, "--seed", help="Local sampling seed"),
+    revision: str = typer.Option("", "--revision", help="Pinned local model revision"),
+    trust_remote_code: bool = typer.Option(
+        False, "--trust-remote-code", help="Allow custom model code on local --base"
+    ),
+    plan_only: bool = typer.Option(False, "--plan-only", help="Validate + print plan"),
+) -> None:
+    """Best-of-N rejection sampling: sample N per prompt, a judge picks the winner.
+
+    Samples ``--n`` candidates from local ``--base`` (the default) or an Ollama /
+    vLLM raw-completion ``--provider``, scores each with ``--judge`` pointwise,
+    and writes the winner as an SFT chat row (with ``_best_of_n`` provenance).
+    ``--emit-pairs`` additionally writes winner-vs-loser DPO pairs. BOND-lite
+    (Best-of-N distillation, v0.71.31; provider sampling #299).
+    """
+    from rich.markup import escape as _escape
+    from rich.panel import Panel
+
+    from souplite.utils import best_of_n as bon
+    from souplite.utils import best_of_n_artifact as bon_artifact
+    from souplite.utils import best_of_n_checkpoint as bon_checkpoint
+    from souplite.utils.magpie import make_magpie_generate_fn
+    from souplite.utils.paths import enforce_under_cwd_and_no_symlink
+    from souplite.utils.trust_remote import (
+        model_requires_trust_remote_code,
+        resolve_trust_remote_code,
+    )
+
+    # --- Bounds ---
+    if not isinstance(n, int) or isinstance(n, bool) or not (2 <= n <= 64):
+        console.print("[red]--n must be between 2 and 64[/]")
+        raise typer.Exit(2)
+    if not (0.0 <= temperature <= 2.0):
+        console.print("[red]--temperature must be in [0, 2][/]")
+        raise typer.Exit(2)
+    if not (1 <= max_new_tokens <= 4096):
+        console.print("[red]--max-new-tokens must be in [1, 4096][/]")
+        raise typer.Exit(2)
+
+    offline_mode = bool(candidate_artifact or judgments)
+    export_mode = bool(export_candidates)
+    if offline_mode and export_mode:
+        console.print("[red]offline materialization and --export-candidates are exclusive[/]")
+        raise typer.Exit(2)
+    if offline_mode:
+        from souplite.utils import best_of_n_stream as bon_stream
+
+        if not candidate_artifact or not judgments:
+            console.print("[red]provide both --candidate-artifact and --judgments[/]")
+            raise typer.Exit(2)
+        if resume or checkpoint:
+            console.print(
+                "[red]offline materialization does not support --resume or --checkpoint; "
+                "rerun with the same candidate and judgment artifacts[/]"
+            )
+            raise typer.Exit(2)
+        if any(
+            (
+                base,
+                prompts,
+                judge,
+                provider,
+                model,
+                base_url,
+                device,
+                revision,
+                trust_remote_code,
+                seed != 0,
+                checkpoint,
+                resume,
+                n != 8,
+                temperature != 1.0,
+                max_new_tokens != 256,
+            )
+        ):
+            console.print(
+                "[red]offline materialization does not accept sampling or judge options[/]"
+            )
+            raise typer.Exit(2)
+        if not output and not plan_only:
+            console.print("[red]--output is required unless --plan-only is set.[/]")
+            raise typer.Exit(2)
+        manifest_path = manifest or (f"{output}.manifest.json" if output else "")
+        try:
+            paths = [candidate_artifact, judgments]
+            if output:
+                enforce_under_cwd_and_no_symlink(output, "--output path")
+                paths.append(output)
+            if emit_pairs:
+                enforce_under_cwd_and_no_symlink(emit_pairs, "--emit-pairs path")
+                paths.append(emit_pairs)
+            if manifest_path:
+                enforce_under_cwd_and_no_symlink(manifest_path, "--manifest path")
+                paths.append(manifest_path)
+            if len({os.path.normcase(os.path.realpath(path)) for path in paths}) != len(paths):
+                raise ValueError("offline input and output paths must be distinct")
+        except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+            console.print(f"[red]Invalid offline artifact: {_escape(str(exc))}[/]")
+            raise typer.Exit(2) from exc
+        publication_started = False
+        try:
+            with bon_stream.index_offline_artifacts(
+                candidate_artifact, judgments
+            ) as offline_index:
+                console.print(
+                    Panel(
+                        f"Candidate groups: [bold]{offline_index.group_count}[/]\n"
+                        f"Matched rows:     [bold]{offline_index.group_count}[/]\n"
+                        "Network/model:    [bold]disabled[/]",
+                        title="soup data best-of-n — offline plan",
+                    )
+                )
+                if plan_only:
+                    offline_index.validate_all()
+                    return
+                staged = bon_stream.stage_offline_datasets(
+                    offline_index, output, emit_pairs
+                )
+                if staged.sft_count != offline_index.group_count:
+                    staged.cleanup()
+                    raise ValueError(
+                        "judgments must cover every candidate group exactly once"
+                    )
+                publication_started = True
+                try:
+                    stale_dpo = ""
+                    if not emit_pairs and os.path.lexists(manifest_path):
+                        stale_dpo = bon_artifact.find_committed_sibling_dpo(
+                            manifest_path, sft_path=output
+                        )
+                    manifest_bytes = bon_artifact.offline_manifest_from_digests(
+                        candidate_artifact_sha256=offline_index.candidate_sha256,
+                        judgments_sha256=offline_index.judgments_sha256,
+                        sft_path=output,
+                        sft_sha256=staged.sft_sha256,
+                        sft_count=staged.sft_count,
+                        dpo_path=emit_pairs,
+                        dpo_sha256=staged.dpo_sha256,
+                        dpo_count=staged.dpo_count,
+                    ).encode("utf-8")
+                    bon_stream.publish_staged_datasets(
+                        staged,
+                        output,
+                        emit_pairs,
+                        manifest_path=manifest_path,
+                        manifest_bytes=manifest_bytes,
+                        stale_dpo_path=stale_dpo,
+                    )
+                finally:
+                    staged.cleanup()
+                sft_count = staged.sft_count
+                dpo_count = staged.dpo_count
+        except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+            if not publication_started:
+                console.print(f"[red]Invalid offline artifact: {_escape(str(exc))}[/]")
+                raise typer.Exit(2) from exc
+            console.print(f"[red]Failed to write output: {_escape(str(exc))}[/]")
+            raise typer.Exit(1) from exc
+        body = (
+            f"SFT rows:   [bold]{sft_count}[/]\n"
+            f"Output:     [bold]{_escape(os.path.relpath(output))}[/]"
+        )
+        if emit_pairs:
+            body += (
+                f"\nDPO pairs:  [bold]{dpo_count}[/]\n"
+                f"Pairs out:  [bold]{_escape(os.path.relpath(emit_pairs))}[/]"
+            )
+        body += f"\nManifest:   [bold]{_escape(os.path.relpath(manifest_path))}[/]"
+        console.print(Panel(body, title="soup data best-of-n — offline done"))
+        return
+
+    if export_mode:
+        if judge or output or emit_pairs or manifest:
+            console.print(
+                "[red]--export-candidates cannot be combined with judge or final outputs[/]"
+            )
+            raise typer.Exit(2)
+    elif not judge:
+        console.print("[red]--judge is required for the online workflow[/]")
+        raise typer.Exit(2)
+    if not prompts:
+        console.print("[red]--prompts is required for sampling[/]")
+        raise typer.Exit(2)
+
+    evaluator = None
+    if not export_mode:
+        from souplite.eval.gate import _parse_judge_url
+        from souplite.eval.judge import JudgeEvaluator
+
+        # JudgeEvaluator construction validates the URL against SSRF.
+        try:
+            judge_provider, judge_model_id, api_base = _parse_judge_url(judge)
+            evaluator = JudgeEvaluator(
+                provider=judge_provider, model=judge_model_id, api_base=api_base
+            )
+        except (ValueError, TypeError) as exc:
+            console.print(f"[red]Invalid --judge: {_escape(str(exc))}[/]")
+            raise typer.Exit(2) from exc
+
+    checkpoint_path = ""
+    manifest_path = ""
+    if not export_mode:
+        checkpoint_path = checkpoint or (f"{output}.checkpoint.jsonl" if output else "")
+        manifest_path = manifest or (f"{output}.manifest.json" if output else "")
+
+    # --- Prompt and output paths ---
+    try:
+        prompt_records = _bon_load_prompt_records(prompts)
+        if output:
+            enforce_under_cwd_and_no_symlink(output, "--output path")
+        if emit_pairs:
+            enforce_under_cwd_and_no_symlink(emit_pairs, "--emit-pairs path")
+        if checkpoint_path:
+            enforce_under_cwd_and_no_symlink(checkpoint_path, "--checkpoint path")
+        if manifest_path:
+            enforce_under_cwd_and_no_symlink(manifest_path, "--manifest path")
+        if export_candidates:
+            enforce_under_cwd_and_no_symlink(
+                export_candidates, "--export-candidates path"
+            )
+            checkpoint_path = checkpoint or f"{export_candidates}.checkpoint.jsonl"
+            enforce_under_cwd_and_no_symlink(checkpoint_path, "--checkpoint path")
+            export_paths = [prompts, export_candidates, checkpoint_path]
+            if len(
+                {os.path.normcase(os.path.realpath(path)) for path in export_paths}
+            ) != len(export_paths):
+                raise ValueError(
+                    "prompt source, candidate artifact, and checkpoint paths "
+                    "must be distinct"
+                )
+    except (FileNotFoundError, TypeError, ValueError) as exc:
+        console.print(f"[red]{_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+    if not prompt_records:
+        console.print("[red]--prompts produced no usable rows[/]")
+        raise typer.Exit(2)
+    prompt_list = [prompt for prompt, _source_line in prompt_records]
+    if resume and not export_mode and not output:
+        console.print("[red]--resume requires --output[/]")
+        raise typer.Exit(2)
+
+    # --- Sampler selection ---
+    generate_fn = None
+    sampling_provider = ""
+    trust = False
+    if provider:
+        if base:
+            console.print("[red]--base and --provider are mutually exclusive[/]")
+            raise typer.Exit(2)
+        if device or revision or trust_remote_code or seed != 0:
+            console.print(
+                "[red]--device, --revision, --seed and --trust-remote-code "
+                "apply only to local --base[/]"
+            )
+            raise typer.Exit(2)
+        sampling_provider = provider.strip().lower()
+        if sampling_provider == "anthropic":
+            console.print(
+                "[red]anthropic has no raw-completion endpoint; "
+                "--provider must be ollama or vllm[/]"
+            )
+            raise typer.Exit(2)
+        if sampling_provider not in _BON_PROVIDER_SAMPLERS:
+            console.print("[red]--provider must be ollama or vllm[/]")
+            raise typer.Exit(2)
+        try:
+            generate_fn = make_magpie_generate_fn(
+                sampling_provider,
+                model=model,
+                base_url=base_url or None,
+                temperature=temperature,
+                max_tokens=max_new_tokens,
+            )
+        except (TypeError, ValueError, ImportError) as exc:
+            console.print(f"[red]{_escape(str(exc))}[/]")
+            raise typer.Exit(2) from exc
+    else:
+        if not base:
+            console.print("[red]either local --base or --provider is required[/]")
+            raise typer.Exit(2)
+        if model or base_url:
+            console.print("[red]--model and --base-url require --provider[/]")
+            raise typer.Exit(2)
+        trust = resolve_trust_remote_code(
+            base,
+            requested=trust_remote_code,
+            console=console,
+            requires_remote_code=model_requires_trust_remote_code(base) or False,
+        )
+
+    sampler_label = f"{sampling_provider}:{model}" if generate_fn is not None else base
+    if generate_fn is not None:
+        default_endpoint = {
+            "ollama": "http://localhost:11434",
+            "vllm": "http://localhost:8000",
+        }[sampling_provider]
+        sampler_spec = {
+            "kind": "provider",
+            "provider": sampling_provider,
+            "model": model,
+            "n": n,
+            "temperature": temperature,
+            "max_new_tokens": max_new_tokens,
+        }
+        sampler_identity = bon_artifact.sampler_identity_fingerprint(
+            "provider-endpoint", base_url or default_endpoint
+        )
+    else:
+        is_local_path = os.path.exists(base) or os.path.isabs(base) or ntpath.isabs(base)
+        public_model = "<local-model>" if is_local_path else base
+        model_identity = os.path.realpath(base) if is_local_path else base
+        model_fingerprint_parts = [
+            "local-model",
+            model_identity,
+            revision or "unspecified",
+        ]
+        if is_local_path and export_mode:
+            model_fingerprint_parts.append(
+                bon_artifact.local_model_content_fingerprint(base)
+            )
+        sampler_spec = {
+            "kind": "local",
+            "model": public_model,
+            "revision": revision or "unspecified",
+            "n": n,
+            "temperature": temperature,
+            "max_new_tokens": max_new_tokens,
+            "device": device or "auto",
+            "seed": seed,
+            "trust_remote_code": trust,
+        }
+        sampler_identity = bon_artifact.sampler_identity_fingerprint(
+            *model_fingerprint_parts
+        )
+
+    digest = ""
+    if not export_mode:
+        digest = bon_checkpoint.run_digest(
+            prompt_list,
+            {
+                "base": base,
+                "provider": sampling_provider,
+                "model": model,
+                "base_url": base_url,
+                "n": n,
+                "temperature": temperature,
+                "max_new_tokens": max_new_tokens,
+                "device": device,
+                "revision": revision,
+                "seed": seed,
+                "trust_remote_code": trust,
+                "judge": judge,
+                "emit_pairs": bool(emit_pairs),
+            },
+        )
+
+    console.print(
+        Panel(
+            f"Sampler:      [bold]{_escape(sampler_label)}[/]\n"
+            f"Prompts:      [bold]{len(prompt_records)}[/]\n"
+            f"N candidates: [bold]{n}[/]\n"
+            f"Judge:        [bold]{_escape(judge) if judge else 'offline artifact'}[/]\n"
+            f"Checkpoint:   [bold]"
+            f"{_escape(os.path.relpath(checkpoint_path)) if checkpoint_path else '-'}[/]",
+            title="soup data best-of-n — plan",
+        )
+    )
+    if plan_only:
+        return
+    if not export_mode and not output:
+        console.print("[red]--output is required unless --plan-only is set.[/]")
+        raise typer.Exit(2)
+
+    dev = device or None
+    if export_mode:
+        from souplite.utils import best_of_n_stream as bon_stream
+
+        checkpoint_path = checkpoint or f"{export_candidates}.checkpoint.jsonl"
+        completed = 0
+        try:
+            completed = bon_stream.prepare_candidate_checkpoint(
+                checkpoint_path,
+                prompt_records,
+                sampler_spec,
+                sampler_identity,
+                resume=resume,
+            )
+            local_model = None
+            tokenizer = None
+            local_torch = None
+            if generate_fn is None and completed < len(prompt_list):
+                import torch
+
+                local_torch = torch
+                if revision:
+                    local_model, tokenizer = _load_bon_model(
+                        base, device, trust, revision=revision
+                    )
+                else:
+                    local_model, tokenizer = _load_bon_model(base, device, trust)
+            for index in range(completed, len(prompt_records)):
+                prompt, source_line = prompt_records[index]
+                if local_torch is not None:
+                    local_torch.manual_seed(bon_checkpoint.prompt_seed(seed, index))
+                candidates = bon.sample_candidates(
+                    local_model,
+                    tokenizer,
+                    prompt,
+                    n=n,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                    device=dev,
+                    generate_fn=generate_fn,
+                )
+                group = bon_artifact.build_candidate_group(
+                    prompt,
+                    index,
+                    candidates,
+                    sampler_spec,
+                    source_line=source_line,
+                )
+                bon_stream.append_candidate_group(checkpoint_path, group)
+                completed = index + 1
+            bon_stream.publish_candidate_checkpoint(
+                checkpoint_path,
+                export_candidates,
+                prompt_records,
+                sampler_spec,
+                sampler_identity,
+            )
+        except Exception as exc:
+            console.print(
+                "[red]Candidate export failed before publication.[/]\n"
+                f"Reason:           [bold]{_escape(str(exc))}[/]\n"
+                f"Completed groups: [bold]{completed}/{len(prompt_list)}[/]\n"
+                f"Resume with: [bold]--resume --checkpoint "
+                f"{_escape(os.path.relpath(checkpoint_path))}[/]"
+            )
+            raise typer.Exit(1) from exc
+        console.print(
+            Panel(
+                f"Candidate groups: [bold]{completed}[/]\n"
+                f"Output:           [bold]{_escape(os.path.relpath(export_candidates))}[/]\n"
+                f"Checkpoint:       [bold]{_escape(os.path.relpath(checkpoint_path))}[/]",
+                title="soup data best-of-n — candidates exported",
+            )
+        )
+        return
+
+    completed_entries = []
+    try:
+        targets = [output, checkpoint_path, manifest_path]
+        if emit_pairs:
+            targets.append(emit_pairs)
+        if len({os.path.normcase(os.path.realpath(path)) for path in targets}) != len(
+            targets
+        ):
+            raise ValueError(
+                "output, pairs, checkpoint, and manifest paths must be distinct"
+            )
+        if resume:
+            completed_entries = bon_checkpoint.load_checkpoint(
+                checkpoint_path, digest=digest, total=len(prompt_list)
+            )
+        else:
+            bon_checkpoint.initialise_checkpoint(
+                checkpoint_path, digest=digest, total=len(prompt_list)
+            )
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        console.print(f"[red]Invalid checkpoint: {_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+
+    local_model = None
+    tokenizer = None
+    local_torch = None
+    if generate_fn is None and len(completed_entries) < len(prompt_list):
+        import torch
+
+        local_torch = torch
+        if revision:
+            local_model, tokenizer = _load_bon_model(
+                base, device, trust, revision=revision
+            )
+        else:
+            local_model, tokenizer = _load_bon_model(base, device, trust)
+
+    sft_rows = [entry[0] for entry in completed_entries]
+    pair_rows = [entry[1] for entry in completed_entries if entry[1] is not None]
+    assert evaluator is not None
+    for index in range(len(completed_entries), len(prompt_records)):
+        prompt, source_line = prompt_records[index]
+        try:
+            if local_torch is not None:
+                # Bind stochastic sampling to the prompt index rather than the
+                # process RNG position so an interrupted/resumed run produces
+                # the same candidates as an uninterrupted run (#549).
+                local_torch.manual_seed(bon_checkpoint.prompt_seed(seed, index))
+            candidates = bon.sample_candidates(
+                local_model,
+                tokenizer,
+                prompt,
+                n=n,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                device=dev,
+                generate_fn=generate_fn,
+            )
+            pick = bon.judge_pick_best(prompt, candidates, evaluator)
+            row = bon.build_sft_row(prompt, pick, judge_model=judge)
+            row["_best_of_n"]["source_line"] = source_line
+            if generate_fn is not None:
+                row["_best_of_n"]["sampler"] = {
+                    "provider": sampling_provider,
+                    "model": model,
+                }
+            pair = bon.build_dpo_pair(prompt, pick, candidates) if emit_pairs else None
+            bon_checkpoint.append_checkpoint(
+                checkpoint_path, index=index, sft=row, dpo=pair
+            )
+        except bon.BestOfNRuntimeError as exc:
+            console.print(
+                f"[red]Best-of-N stopped after {index}/{len(prompt_list)} prompts.[/]\n"
+                f"Resume with [bold]--resume[/]; checkpoint: "
+                f"[bold]{_escape(os.path.relpath(checkpoint_path))}[/]"
+            )
+            raise typer.Exit(1) from exc
+        except ValueError:
+            # Deterministic validation failures (for example a non-finite
+            # judge score) cannot be repaired by resuming. Preserve the
+            # established fail-closed ValueError contract instead of
+            # presenting a misleading recovery instruction.
+            raise
+        except Exception as exc:
+            console.print(
+                f"[red]Best-of-N stopped after {index}/{len(prompt_list)} prompts.[/]\n"
+                f"Resume with [bold]--resume[/]; checkpoint: "
+                f"[bold]{_escape(os.path.relpath(checkpoint_path))}[/]"
+            )
+            raise typer.Exit(1) from exc
+        sft_rows.append(row)
+        if pair is not None:
+            pair_rows.append(pair)
+
+    # Snapshot every prior target before replacement, commit the manifest last,
+    # and restore the complete old generation if any publication step fails.
+    sft_text = bon_checkpoint.dataset_text(sft_rows)
+    pair_text = bon_checkpoint.dataset_text(pair_rows)
+    try:
+        bon_checkpoint.publish_generation(
+            sft_path=output,
+            sft_text=sft_text,
+            pair_path=emit_pairs,
+            pair_text=pair_text,
+            manifest_path=manifest_path,
+            manifest_text_value=bon_checkpoint.manifest_text(
+                digest=digest,
+                sft_path=output,
+                sft_text=sft_text,
+                sft_count=len(sft_rows),
+                pair_path=emit_pairs,
+                pair_text=pair_text,
+                pair_count=len(pair_rows),
+            ),
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        console.print(f"[red]Failed to write output: {_escape(str(exc))}[/]")
+        raise typer.Exit(1) from exc
+    sft_count = len(sft_rows)
+    pair_count = len(pair_rows)
+
+    body = (
+        f"SFT rows:   [bold]{sft_count}[/]\n"
+        f"Output:     [bold]{_escape(os.path.relpath(output))}[/]"
+    )
+    if emit_pairs:
+        body += (
+            f"\nDPO pairs:  [bold]{pair_count}[/]\n"
+            f"Pairs out:  [bold]{_escape(os.path.relpath(emit_pairs))}[/]"
+        )
+    body += f"\nManifest:   [bold]{_escape(os.path.relpath(manifest_path))}[/]"
+    console.print(Panel(body, title="soup data best-of-n — done"))
+
+
+# v0.71.31 — Evol-Instruct (WizardLM depth/breadth) instruction evolution.
+@app.command(name="evolve")
+def evolve(
+    input_path: str = typer.Option(
+        ..., "--input", help="Seed JSONL ({prompt|instruction|messages} per row)"
+    ),
+    provider: str = typer.Option(..., "--provider", help="ollama | vllm"),
+    model: str = typer.Option(..., "--model", help="Provider model id"),
+    strategy: str = typer.Option("depth", "--strategy", help="depth | breadth"),
+    rounds: int = typer.Option(1, "--rounds", help="Evolution rounds [1, 5]"),
+    output: str = typer.Option(
+        "", "--output", "-o", help="Output JSONL (required unless --plan-only)"
+    ),
+    base_url: str = typer.Option("", "--base-url", help="Provider base URL"),
+    temperature: float = typer.Option(1.0, "--temperature", help="Sampling temp [0, 2]"),
+    max_tokens: int = typer.Option(512, "--max-tokens", help="Max tokens [1, 16384]"),
+    plan_only: bool = typer.Option(False, "--plan-only", help="Validate + print plan"),
+) -> None:
+    """Evol-Instruct: deepen (depth) or diversify (breadth) seed instructions.
+
+    Reads ``--input`` seeds, evolves each for ``--rounds`` rounds via a live
+    ``--provider`` (ollama / vllm raw completion), and writes evolved user-turn
+    rows (``{"messages": [...], "_evolve": {...}}``). Completes the synthetic
+    suite (Magpie / Forge / Persona / evolve). (v0.71.31)
+    """
+    from rich.markup import escape as _escape
+    from rich.panel import Panel
+
+    from souplite.utils.evolve import STRATEGIES, run_evolve
+    from souplite.utils.magpie import make_magpie_generate_fn
+    from souplite.utils.paths import atomic_write_text, enforce_under_cwd_and_no_symlink
+
+    if strategy not in STRATEGIES:
+        console.print(
+            f"[red]--strategy must be one of {', '.join(STRATEGIES)}; got {strategy!r}[/]"
+        )
+        raise typer.Exit(2)
+    if not isinstance(rounds, int) or isinstance(rounds, bool) or not (1 <= rounds <= 5):
+        console.print("[red]--rounds must be in [1, 5][/]")
+        raise typer.Exit(2)
+
+    try:
+        seeds = _evolve_load_prompts(input_path)
+        if output:
+            enforce_under_cwd_and_no_symlink(output, "--output path")
+        generate_fn = make_magpie_generate_fn(
+            provider,
+            model=model,
+            base_url=base_url or None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    except (FileNotFoundError, TypeError, ValueError, ImportError) as exc:
+        console.print(f"[red]{_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+    if not seeds:
+        console.print("[red]--input produced no usable seed instructions[/]")
+        raise typer.Exit(2)
+
+    console.print(
+        Panel(
+            f"Seeds:     [bold]{len(seeds)}[/]\n"
+            f"Provider:  [bold]{_escape(provider)}[/]\n"
+            f"Strategy:  [bold]{_escape(strategy)}[/]\n"
+            f"Rounds:    [bold]{rounds}[/]",
+            title="soup data evolve — plan",
+        )
+    )
+    if plan_only:
+        return
+    if not output:
+        console.print("[red]--output is required unless --plan-only is set.[/]")
+        raise typer.Exit(2)
+
+    evolved_rows = run_evolve(seeds, strategy, rounds, generate_fn)
+    out_lines = [
+        json.dumps(
+            {
+                "messages": [{"role": "user", "content": row.instruction}],
+                "_evolve": {
+                    "seed": row.seed,
+                    "strategy": row.strategy,
+                    "round": row.round,
+                },
+            },
+            ensure_ascii=False,
+        )
+        for row in evolved_rows
+    ]
+    try:
+        atomic_write_text(
+            ("\n".join(out_lines) + "\n") if out_lines else "", output, field="output"
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        console.print(f"[red]Failed to write output: {_escape(str(exc))}[/]")
+        raise typer.Exit(1) from exc
+
+    console.print(
+        Panel(
+            f"Evolved rows: [bold]{len(evolved_rows)}[/]\n"
+            f"Output:       [bold]{_escape(os.path.relpath(output))}[/]",
+            title="soup data evolve — done",
+        )
+    )
+    if not evolved_rows:
+        console.print(
+            "[yellow]Warning:[/] 0 rows — is the provider reachable and the "
+            "model pulled? (all evolutions may have been eliminated)"
+        )
+
+
+# v0.69.0 Part D — Persona-Hub diversity sampler.
+@app.command(name="persona-mix")
+def persona_mix(
+    prompts: str = typer.Option(..., "--prompts", help="JSONL file with one prompt per row"),
+    n: int = typer.Option(..., "--n", help="Number of rows to emit [1, 1_000_000]"),
+    output: str = typer.Option(..., "--output", help="Output JSONL path"),
+    personas: str = typer.Option(
+        "", "--personas", help="Optional JSONL of personas (defaults to bundled set)"
+    ),
+    styles: str = typer.Option(
+        "", "--styles", help="Optional JSONL of styles (defaults to bundled set)"
+    ),
+    seed: int = typer.Option(0, "--seed", help="Deterministic seed"),
+) -> None:
+    """Sample a prompt × persona × style matrix.
+
+    Reads ``--prompts`` (JSONL with ``prompt`` field per row); writes
+    ``--output`` JSONL with ``{prompt, persona, style}`` rows. When
+    ``--personas`` / ``--styles`` are omitted the bundled diversity set is used.
+    """
+    import os
+    import tempfile
+
+    from rich.markup import escape as _escape
+    from rich.panel import Panel
+
+    from souplite.utils.paths import enforce_under_cwd_and_no_symlink
+    from souplite.utils.persona_hub import (
+        list_bundled_personas,
+        list_bundled_styles,
+        sample_persona_matrix,
+    )
+
+    max_jsonl_bytes = 100 * 1024 * 1024  # 100 MiB cap on field inputs
+    max_values = 100_000  # cap matches persona_hub._MAX_LIST_LEN
+
+    def _load_jsonl_field(path: str, field: str) -> list:
+        # Delegate to centralised TOCTOU helper (v0.59.0).
+        enforce_under_cwd_and_no_symlink(path, f"--{field}s path")
+        if not os.path.lexists(path):
+            raise FileNotFoundError(path)
+        real = os.path.realpath(path)
+        if not os.path.isfile(real):
+            raise FileNotFoundError(real)
+        if os.path.getsize(real) > max_jsonl_bytes:
+            raise ValueError(
+                f"--{field}s file exceeds {max_jsonl_bytes} bytes"
+            )
+        values: list = []
+        with open(real, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                if len(values) >= max_values:
+                    raise ValueError(
+                        f"--{field}s file exceeds {max_values} entries"
+                    )
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                val = row.get(field) if isinstance(row, dict) else None
+                if isinstance(val, str) and val:
+                    values.append(val)
+        return values
+
+    try:
+        prompt_list = _load_jsonl_field(prompts, "prompt")
+        if not prompt_list:
+            raise ValueError("prompts file produced no rows with a 'prompt' field")
+        persona_list = (
+            _load_jsonl_field(personas, "persona")
+            if personas
+            else list(list_bundled_personas())
+        )
+        if not persona_list:
+            raise ValueError("personas file produced no rows with a 'persona' field")
+        style_list = (
+            _load_jsonl_field(styles, "style")
+            if styles
+            else list(list_bundled_styles())
+        )
+        if not style_list:
+            raise ValueError("styles file produced no rows with a 'style' field")
+
+        # Output containment + TOCTOU symlink rejection at the write target.
+        enforce_under_cwd_and_no_symlink(output, "--output")
+        rows = sample_persona_matrix(
+            prompts=prompt_list,
+            personas=persona_list,
+            styles=style_list,
+            n=n,
+            seed=seed,
+        )
+    except (FileNotFoundError, TypeError, ValueError) as exc:
+        console.print(f"[red]{_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+
+    # Atomic write via tempfile + os.replace.
+    parent = os.path.dirname(os.path.realpath(output)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".soup.", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, output)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    console.print(
+        Panel(
+            f"Rows written: [bold]{len(rows)}[/]\n"
+            f"Output:       [bold]{_escape(output)}[/]",
+            title="soup data persona-mix",
+        )
+    )
+
+
+# v0.69.0 Part E — Brain-rot detector.
+@app.command(name="brain-rot")
+def brain_rot_cmd(
+    data: str = typer.Argument(..., help="Path to JSONL dataset"),
+    strict: bool = typer.Option(
+        False, "--strict", help="Exit 3 on MAJOR verdict (CI gate mode)"
+    ),
+    max_major_fraction: float = typer.Option(
+        0.25, "--max-major-fraction", help="Strict-mode MAJOR-row fraction cap [0, 1]"
+    ),
+    lang: str = typer.Option(
+        "en",
+        "--lang",
+        help=(
+            "Per-language heuristic bundle: "
+            "en | es | fr | de | ru | auto. Closes issue #234."
+        ),
+    ),
+) -> None:
+    """Score a dataset for brain-rot per arXiv 2510.13928.
+
+    Reports a per-row OK/MINOR/MAJOR verdict + an aggregate verdict. With
+    ``--strict`` the command exits 3 when the MAJOR fraction exceeds
+    ``--max-major-fraction`` (default 25%), so CI pipelines can refuse
+    training on excessive slop. ``--lang`` selects a per-language
+    low-effort-token + clickbait-phrase bundle (closes #234); ``--lang auto``
+    routes through the optional ``langdetect`` package (``[data-pro]`` extras)
+    and falls back silently to English when detection is unavailable.
+    """
+    import math as _math
+    import os
+
+    from rich.markup import escape as _escape
+    from rich.table import Table
+
+    from souplite.utils.brain_rot import (
+        refuse_if_rotten,
+        score_dataset_brain_rot,
+    )
+    from souplite.utils.brain_rot_lang import validate_lang_code
+    from souplite.utils.paths import enforce_under_cwd_and_no_symlink
+
+    max_brain_rot_bytes = 1_073_741_824  # 1 GiB
+    max_brain_rot_rows = 1_000_000
+
+    # Validate --max-major-fraction at the CLI boundary so a flag of NaN /
+    # inf / bool / out-of-range is rejected BEFORE the heavy scoring pass
+    # (security review M2).
+    if isinstance(max_major_fraction, bool):
+        console.print("[red]--max-major-fraction must be a number, not bool[/]")
+        raise typer.Exit(2)
+    if not isinstance(max_major_fraction, (int, float)):
+        console.print("[red]--max-major-fraction must be a number[/]")
+        raise typer.Exit(2)
+    if not _math.isfinite(float(max_major_fraction)):
+        console.print("[red]--max-major-fraction must be finite[/]")
+        raise typer.Exit(2)
+    if not (0.0 <= float(max_major_fraction) <= 1.0):
+        console.print("[red]--max-major-fraction must be in [0.0, 1.0][/]")
+        raise typer.Exit(2)
+
+    # Validate --lang at the CLI boundary so unknown ISO codes / typos
+    # fail fast with exit 2 (matches v0.41.0 / v0.51.0 / v0.65.0 strict
+    # CLI-boundary policy; closes #234).
+    try:
+        lang_canonical = validate_lang_code(lang)
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]{_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+
+    if not isinstance(data, str) or not data:
+        console.print("[red]data path must be a non-empty string[/]")
+        raise typer.Exit(2)
+    try:
+        enforce_under_cwd_and_no_symlink(data, "data path")
+    except (TypeError, ValueError) as exc:
+        console.print(f"[red]{_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+    if not os.path.lexists(data):
+        console.print(f"[red]data file not found: {_escape(data)}[/]")
+        raise typer.Exit(2)
+    real = os.path.realpath(data)
+    if not os.path.isfile(real):
+        console.print(f"[red]data file not found: {_escape(real)}[/]")
+        raise typer.Exit(2)
+    if os.path.getsize(real) > max_brain_rot_bytes:
+        console.print(
+            f"[red]data file exceeds {max_brain_rot_bytes} bytes[/]"
+        )
+        raise typer.Exit(2)
+
+    rows: list = []
+    with open(real, "r", encoding="utf-8") as handle:
+        for line_no, raw_line in enumerate(handle, start=1):
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if line_no > max_brain_rot_rows:
+                console.print(
+                    f"[red]data file exceeds {max_brain_rot_rows} rows[/]"
+                )
+                raise typer.Exit(2)
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+
+    report = score_dataset_brain_rot(rows, lang=lang_canonical)
+
+    table = Table(title="Brain-rot report")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("Rows scored", str(report.num_rows))
+    table.add_row("Mean score", f"{report.mean_score:.3f}")
+    table.add_row("Verdict OK", str(report.num_ok))
+    table.add_row("Verdict MINOR", str(report.num_minor))
+    table.add_row("Verdict MAJOR", str(report.num_major))
+    table.add_row("Overall", report.overall_verdict)
+    table.add_row("Lang", _escape(lang_canonical))
+    console.print(table)
+
+    if strict:
+        try:
+            refuse_if_rotten(
+                rows,
+                max_major_fraction=max_major_fraction,
+                lang=lang_canonical,
+            )
+        except (TypeError, ValueError) as exc:
+            console.print(f"[red]{_escape(str(exc))}[/]")
+            raise typer.Exit(3) from exc

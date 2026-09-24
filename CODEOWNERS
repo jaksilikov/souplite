@@ -1,0 +1,13 @@
+# Default owner for everything
+* @MakazhanAlpamys
+
+# Core config and schema
+src/soup_cli/config/ @MakazhanAlpamys
+
+# Training wrappers
+src/soup_cli/trainer/ @MakazhanAlpamys
+
+# Security-sensitive areas
+src/soup_cli/ui/ @MakazhanAlpamys
+src/soup_cli/data/providers/ @MakazhanAlpamys
+src/soup_cli/utils/ollama.py @MakazhanAlpamys

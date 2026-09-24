@@ -1,0 +1,1194 @@
+"""v0.53.11 — GRPO Plus finish + preference live (#123, #126, #127, #119, #68).
+
+Tests the math kernels + dispatch logic. Live GPU smoke runs are documented
+in plan.md and require a CUDA box.
+"""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+
+from tests._windows_ci import skip_on_windows_ci
+
+# Skip the whole module when torch is unavailable — the math kernels are
+# torch-based by design.
+torch = pytest.importorskip("torch")
+
+
+# ---------------------------------------------------------------------------
+# #123 — GRPO variant live loss kernels
+# ---------------------------------------------------------------------------
+
+
+class TestGRPOVariantKernels:
+    def _toy_inputs(self, batch=2, seq=4):
+        logp_new = torch.zeros(batch, seq)
+        logp_old = torch.zeros(batch, seq)
+        advantages = torch.tensor([1.0, -1.0])
+        return logp_new, logp_old, advantages
+
+    def test_standard_returns_none(self):
+        from souplite.utils.grpo_variants import apply_variant_loss
+
+        logp_new, logp_old, adv = self._toy_inputs()
+        assert apply_variant_loss(
+            "standard", logp_new=logp_new, logp_old=logp_old, advantages=adv
+        ) is None
+
+    @pytest.mark.parametrize("variant", ["gspo", "dapo", "dr_grpo", "bnpo", "rft"])
+    def test_variant_returns_finite_scalar(self, variant):
+        from souplite.utils.grpo_variants import apply_variant_loss
+
+        logp_new, logp_old, adv = self._toy_inputs()
+        out = apply_variant_loss(
+            variant, logp_new=logp_new, logp_old=logp_old, advantages=adv
+        )
+        assert out is not None
+        assert out.shape == ()  # scalar
+        assert math.isfinite(float(out))
+
+    def test_two_sided_requires_delta(self):
+        from souplite.utils.grpo_variants import apply_variant_loss
+
+        logp_new, logp_old, adv = self._toy_inputs()
+        with pytest.raises(ValueError, match="grpo_delta"):
+            apply_variant_loss(
+                "two_sided", logp_new=logp_new, logp_old=logp_old, advantages=adv
+            )
+
+    def test_two_sided_with_delta(self):
+        from souplite.utils.grpo_variants import apply_variant_loss
+
+        logp_new, logp_old, adv = self._toy_inputs()
+        out = apply_variant_loss(
+            "two_sided",
+            logp_new=logp_new,
+            logp_old=logp_old,
+            advantages=adv,
+            delta=0.2,
+        )
+        assert math.isfinite(float(out))
+
+    def test_completion_mask_zeros_padding(self):
+        from souplite.utils.grpo_variants import apply_variant_loss
+
+        logp_new, logp_old, adv = self._toy_inputs()
+        mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+        out = apply_variant_loss(
+            "gspo",
+            logp_new=logp_new,
+            logp_old=logp_old,
+            advantages=adv,
+            completion_mask=mask,
+        )
+        assert math.isfinite(float(out))
+
+    def test_gspo_masked_token_cannot_change_loss(self):
+        """A masked (padding) token must not shift the gspo batch-mean
+        statistic other rows are centered against (#723)."""
+        from souplite.utils.grpo_variants import apply_variant_loss
+
+        logp_old = torch.zeros(4, 2)
+        adv = torch.tensor([1.0, 0.6, -0.3, 0.2])
+        mask = torch.tensor([[1.0, 0.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]])
+
+        losses = []
+        for delta in (-2.0, -6.0):
+            logp_new = torch.zeros(4, 2)
+            logp_new[0, 1] = delta  # masked position
+            out = apply_variant_loss(
+                "gspo",
+                logp_new=logp_new,
+                logp_old=logp_old,
+                advantages=adv,
+                completion_mask=mask,
+            )
+            losses.append(float(out))
+        assert losses[0] == pytest.approx(losses[1])
+
+    def test_gspo_masked_token_zero_gradient(self):
+        """Every masked gspo token must receive exactly zero gradient (#723)."""
+        from souplite.utils.grpo_variants import apply_variant_loss
+
+        logp_old = torch.zeros(4, 2)
+        adv = torch.tensor([1.0, 0.6, -0.3, 0.2])
+        mask = torch.tensor([[1.0, 0.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]])
+        logp_new = torch.zeros(4, 2, requires_grad=True)
+        with torch.no_grad():
+            logp_new[0, 1] = -6.0
+        out = apply_variant_loss(
+            "gspo",
+            logp_new=logp_new,
+            logp_old=logp_old,
+            advantages=adv,
+            completion_mask=mask,
+        )
+        out.backward()
+        assert float(logp_new.grad[0, 1]) == pytest.approx(0.0)
+
+    def test_gspo_all_masked_column_no_nan(self):
+        """A column with zero unmasked entries must not divide by zero."""
+        from souplite.utils.grpo_variants import apply_variant_loss
+
+        logp_new, logp_old, adv = self._toy_inputs()
+        mask = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+        out = apply_variant_loss(
+            "gspo",
+            logp_new=logp_new,
+            logp_old=logp_old,
+            advantages=adv,
+            completion_mask=mask,
+        )
+        assert math.isfinite(float(out))
+
+    def test_bool_beta_rejected(self):
+        from souplite.utils.grpo_variants import apply_variant_loss
+
+        logp_new, logp_old, adv = self._toy_inputs()
+        with pytest.raises(TypeError, match="bool"):
+            apply_variant_loss(
+                "gspo",
+                logp_new=logp_new,
+                logp_old=logp_old,
+                advantages=adv,
+                beta=True,
+            )
+
+    def test_unknown_variant_rejected(self):
+        from souplite.utils.grpo_variants import apply_variant_loss
+
+        logp_new, logp_old, adv = self._toy_inputs()
+        with pytest.raises(ValueError, match="grpo_variant"):
+            apply_variant_loss(
+                "nonsense", logp_new=logp_new, logp_old=logp_old, advantages=adv
+            )
+
+    def test_no_more_deferred_live(self):
+        from souplite.utils.grpo_variants import _DEFERRED_LIVE
+
+        assert _DEFERRED_LIVE == frozenset()
+
+    def test_variant_metadata_live_wired(self):
+        from souplite.utils.grpo_variants import _VARIANT_METADATA
+
+        for name, spec in _VARIANT_METADATA.items():
+            assert spec.live_wired is True, f"{name} not flipped to live"
+
+
+# ---------------------------------------------------------------------------
+# #119 — LongLoRA forward override
+# ---------------------------------------------------------------------------
+
+
+class TestLongLoRAShift:
+    def test_shift_heads_for_s2_basic(self):
+        from souplite.utils.longlora import shift_heads_for_s2
+
+        # [B=1, H=4, T=8, D=2]
+        t = torch.arange(64, dtype=torch.float32).reshape(1, 4, 8, 2)
+        shifted = shift_heads_for_s2(t, group_size=4)
+        assert shifted.shape == t.shape
+        # First half unchanged
+        assert torch.equal(shifted[:, :2, :, :], t[:, :2, :, :])
+        # Second half shifted by group_size//2 = 2
+        assert not torch.equal(shifted[:, 2:, :, :], t[:, 2:, :, :])
+
+    def test_shift_rejects_bool_group_size(self):
+        from souplite.utils.longlora import shift_heads_for_s2
+
+        t = torch.zeros(1, 4, 8, 2)
+        with pytest.raises(TypeError, match="bool"):
+            shift_heads_for_s2(t, group_size=True)
+
+    def test_shift_rejects_small_group_size(self):
+        from souplite.utils.longlora import shift_heads_for_s2
+
+        t = torch.zeros(1, 4, 8, 2)
+        with pytest.raises(ValueError, match=">= 2"):
+            shift_heads_for_s2(t, group_size=1)
+
+    def test_shift_rejects_non_4d(self):
+        from souplite.utils.longlora import shift_heads_for_s2
+
+        t = torch.zeros(1, 4, 8)
+        with pytest.raises(ValueError, match="4-D"):
+            shift_heads_for_s2(t, group_size=4)
+
+    def test_shift_single_head_no_change(self):
+        from souplite.utils.longlora import shift_heads_for_s2
+
+        t = torch.arange(16, dtype=torch.float32).reshape(1, 1, 8, 2)
+        out = shift_heads_for_s2(t, group_size=4)
+        assert torch.equal(out, t)
+
+    def test_apply_longlora_forward_override_returns_context(self):
+        from souplite.utils.longlora import (
+            LongLoRAForwardOverride,
+            apply_longlora_forward_override,
+        )
+
+        # Minimal model stub with .modules() iterator.
+        class _Stub:
+            def modules(self):
+                return iter([])
+
+        result = apply_longlora_forward_override(_Stub(), group_size=4)
+        assert isinstance(result, LongLoRAForwardOverride)
+        # Restoration is no-op on empty model.
+        with result:
+            pass
+
+    def test_override_restore_on_exit(self):
+        # v0.71.12 #158 — the shift now patches q_proj / k_proj (NOT the
+        # attention output). The attention forward itself is untouched.
+        from souplite.utils.longlora import apply_longlora_forward_override
+
+        class _Proj:
+            def forward(self, x):
+                return x
+
+        class LlamaAttention:  # exact name the regex matches
+            def __init__(self):
+                self.head_dim = 2
+                self.q_proj = _Proj()
+                self.k_proj = _Proj()
+
+            def forward(self, x):
+                return (x,)
+
+        class _Model:
+            def __init__(self):
+                self.attn = LlamaAttention()
+
+            def modules(self):
+                yield self.attn
+
+        model = _Model()
+        override = apply_longlora_forward_override(model, group_size=4)
+        with override:
+            # q_proj / k_proj forwards are now the shift wrapper.
+            assert getattr(model.attn.q_proj.forward, "__name__", None) == "s2_proj_shift"
+            assert getattr(model.attn.k_proj.forward, "__name__", None) == "s2_proj_shift"
+            # The attention output forward is left alone.
+            assert getattr(model.attn.forward, "__name__", None) != "s2_proj_shift"
+        # After exit, the patched closure is gone and the bound method is back.
+        assert getattr(model.attn.q_proj.forward, "__name__", None) != "s2_proj_shift"
+        assert not getattr(model.attn.q_proj.forward, "_soup_longlora_patched", False)
+        assert model.attn.q_proj.forward("hello") == "hello"
+
+
+# ---------------------------------------------------------------------------
+# #126 — PRMTrainerWrapper + compute_prm_loss kernel
+# ---------------------------------------------------------------------------
+
+
+class TestPRMKernel:
+    def test_compute_prm_loss_perfect_match(self):
+        from souplite.utils.prm import compute_prm_loss
+
+        preds = torch.tensor([1.0, 2.0, 3.0])
+        labels = torch.tensor([1.0, 2.0, 3.0])
+        out = compute_prm_loss(preds, labels)
+        assert float(out) == pytest.approx(0.0)
+
+    def test_compute_prm_loss_mse(self):
+        from souplite.utils.prm import compute_prm_loss
+
+        preds = torch.tensor([1.0, 2.0])
+        labels = torch.tensor([0.0, 0.0])
+        out = compute_prm_loss(preds, labels)
+        assert float(out) == pytest.approx((1.0 + 4.0) / 2)
+
+    def test_compute_prm_loss_mask(self):
+        from souplite.utils.prm import compute_prm_loss
+
+        preds = torch.tensor([1.0, 2.0, 100.0])
+        labels = torch.tensor([0.0, 0.0, 0.0])
+        mask = torch.tensor([1.0, 1.0, 0.0])
+        out = compute_prm_loss(preds, labels, mask=mask)
+        # Masked → only first two contribute.
+        assert float(out) == pytest.approx((1.0 + 4.0) / 2)
+
+    def test_compute_prm_loss_shape_mismatch(self):
+        from souplite.utils.prm import compute_prm_loss
+
+        preds = torch.tensor([1.0, 2.0])
+        labels = torch.tensor([1.0, 2.0, 3.0])
+        with pytest.raises(ValueError, match="shape mismatch"):
+            compute_prm_loss(preds, labels)
+
+    def test_build_prm_trainer_returns_wrapper(self):
+        # The factory no longer raises NotImplementedError — it returns a
+        # configured wrapper. The actual trust_remote_code probe inside
+        # the wrapper will read None for a stub base, so we use a string.
+        from souplite.trainer.prm import PRMTrainerWrapper
+        from souplite.utils.prm import build_prm_trainer
+
+        class _Cfg:
+            base = "hf-internal-testing/tiny-random-gpt2"
+            task = "prm"
+
+        wrapper = build_prm_trainer(config=_Cfg())
+        assert isinstance(wrapper, PRMTrainerWrapper)
+
+    def test_build_prm_trainer_rejects_unknown_kwarg(self):
+        from souplite.utils.prm import build_prm_trainer
+
+        class _Cfg:
+            base = "test"
+
+        with pytest.raises(TypeError, match="unexpected kwargs"):
+            build_prm_trainer(config=_Cfg(), bogus_kwarg=1)
+
+
+# ---------------------------------------------------------------------------
+# #127 — GRPO stability callback
+# ---------------------------------------------------------------------------
+
+
+class TestGRPOStabilityCallback:
+    def test_update_ema(self):
+        from souplite.monitoring.grpo_stability_callback import update_ema
+
+        ref = {"w": torch.zeros(2)}
+        pol = {"w": torch.ones(2)}
+        out = update_ema(ref, pol, alpha=0.5)
+        assert torch.equal(out["w"], torch.full((2,), 0.5))
+
+    def test_update_ema_bool_rejected(self):
+        from souplite.monitoring.grpo_stability_callback import update_ema
+
+        with pytest.raises(TypeError, match="bool"):
+            update_ema({}, {}, alpha=True)
+
+    def test_update_ema_alpha_bounds(self):
+        from souplite.monitoring.grpo_stability_callback import update_ema
+
+        with pytest.raises(ValueError, match="\\(0, 1\\]"):
+            update_ema({}, {}, alpha=0.0)
+        with pytest.raises(ValueError, match="\\(0, 1\\]"):
+            update_ema({}, {}, alpha=1.5)
+
+    def test_check_tis_threshold(self):
+        from souplite.monitoring.grpo_stability_callback import check_tis_threshold
+
+        log_ratio = torch.tensor([0.1, 0.2, 0.5])
+        assert check_tis_threshold(log_ratio, 0.3) is True
+        assert check_tis_threshold(log_ratio, 1.0) is False
+
+    def test_filter_zero_advantage(self):
+        from souplite.monitoring.grpo_stability_callback import filter_zero_advantage
+
+        adv = torch.tensor([0.0, 1.0, -1.0, 1e-10])
+        mask = filter_zero_advantage(adv)
+        assert mask[0].item() is False or mask[0].item() == 0
+        assert bool(mask[1]) is True
+        assert bool(mask[2]) is True
+        assert bool(mask[3]) is False
+
+    def test_callback_construct_with_all_fields(self):
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        cb = GRPOStabilityCallback(
+            ref_model_ema_alpha=0.99,
+            replay_buffer_size=10,
+            async_grpo_prefetch=True,
+            tis_threshold=2.0,
+            mask_truncated_completions=True,
+            defer_rerolling=True,
+            skip_zero_advantage=True,
+            off_policy_mask_threshold=0.5,
+        )
+        assert cb.ref_model_ema_alpha == 0.99
+        assert cb.replay_size() == 0
+        assert cb.tis_alerts() == 0
+
+    def test_callback_replay_buffer(self):
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        cb = GRPOStabilityCallback(replay_buffer_size=2)
+        cb.push_rollout("a")
+        cb.push_rollout("b")
+        cb.push_rollout("c")
+        assert cb.replay_size() == 2  # bounded
+
+    def test_callback_tis_alert(self):
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        cb = GRPOStabilityCallback(tis_threshold=0.3)
+        cb.record_tis_alert(torch.tensor([0.1, 0.2]))  # below threshold
+        assert cb.tis_alerts() == 0
+        cb.record_tis_alert(torch.tensor([0.5, 0.6]))  # above threshold
+        assert cb.tis_alerts() == 1
+
+    def test_callback_bool_rejected_on_numeric_fields(self):
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        with pytest.raises(TypeError, match="bool"):
+            GRPOStabilityCallback(ref_model_ema_alpha=True)
+        with pytest.raises(TypeError, match="bool"):
+            GRPOStabilityCallback(replay_buffer_size=True)
+
+
+class TestAttachGRPOStabilityCallback:
+    def test_no_field_set_returns_false(self):
+        from souplite.utils.peft_wiring import attach_grpo_stability_callback
+
+        class _TCfg:
+            ref_model_ema_alpha = None
+            replay_buffer_size = None
+            async_grpo_prefetch = False
+            tis_threshold = None
+            mask_truncated_completions = False
+            defer_rerolling = False
+            skip_zero_advantage = False
+            off_policy_mask_threshold = None
+
+        class _Trainer:
+            def add_callback(self, cb):
+                pass
+
+        assert attach_grpo_stability_callback(_Trainer(), _TCfg()) is False
+
+    def test_attaches_when_set(self):
+        from souplite.utils.peft_wiring import attach_grpo_stability_callback
+
+        class _TCfg:
+            ref_model_ema_alpha = 0.99
+            replay_buffer_size = None
+            async_grpo_prefetch = False
+            tis_threshold = None
+            mask_truncated_completions = False
+            defer_rerolling = False
+            skip_zero_advantage = False
+            off_policy_mask_threshold = None
+
+        added = []
+
+        class _Trainer:
+            def add_callback(self, cb):
+                added.append(cb)
+
+        assert attach_grpo_stability_callback(_Trainer(), _TCfg()) is True
+        assert len(added) == 1
+
+
+# ---------------------------------------------------------------------------
+# #68 — weighted preference combine live wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestWeightedCombineHook:
+    def test_attaches_to_trainer_with_compute_loss(self):
+        from souplite.utils.preference_combine import (
+            attach_weighted_preference_combine,
+        )
+
+        class _Trainer:
+            def compute_loss(self, model, inputs, return_outputs=False):
+                return torch.tensor(2.0)
+
+        trainer = _Trainer()
+        ok = attach_weighted_preference_combine(
+            trainer, {"dpo": 0.5, "simpo": 0.5}
+        )
+        assert ok is True
+        # Re-attach is idempotent.
+        assert attach_weighted_preference_combine(
+            trainer, {"dpo": 0.5, "simpo": 0.5}
+        ) is True
+
+    def test_returns_false_without_compute_loss(self):
+        from souplite.utils.preference_combine import (
+            attach_weighted_preference_combine,
+        )
+
+        class _NoComputeLoss:
+            pass
+
+        assert attach_weighted_preference_combine(
+            _NoComputeLoss(), {"dpo": 1.0}
+        ) is False
+
+    def test_rejects_bco_mixed_with_paired(self):
+        from souplite.utils.preference_combine import (
+            attach_weighted_preference_combine,
+        )
+
+        class _Trainer:
+            def compute_loss(self, *args, **kwargs):
+                return torch.tensor(1.0)
+
+        with pytest.raises(ValueError, match="bco"):
+            attach_weighted_preference_combine(
+                _Trainer(), {"bco": 0.5, "dpo": 0.5}
+            )
+
+    def test_blended_loss_scales_with_weight(self):
+        from souplite.utils.preference_combine import (
+            attach_weighted_preference_combine,
+        )
+
+        class _Trainer:
+            def compute_loss(self, model, inputs, return_outputs=False):
+                return torch.tensor(2.0)
+
+        trainer = _Trainer()
+        attach_weighted_preference_combine(
+            trainer, {"dpo": 0.7, "simpo": 0.3}
+        )
+        # Primary is dpo (highest weight). Loss = 2.0 * 0.7 = 1.4
+        out = trainer.compute_loss(None, None)
+        assert float(out) == pytest.approx(1.4)
+
+
+# ---------------------------------------------------------------------------
+# Version bump sanity
+# ---------------------------------------------------------------------------
+
+
+def test_version_bump():
+    import souplite
+
+    major, minor, patch = (int(x) for x in souplite.__version__.split("."))
+    assert (major, minor, patch) >= (0, 53, 11)
+
+
+# ---------------------------------------------------------------------------
+# v0.53.11 #123 — _GRPOTrainerVariant subclass factory
+# ---------------------------------------------------------------------------
+
+
+class TestGRPOTrainerVariantFactory:
+    def test_factory_returns_subclass(self):
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        class _FakeGRPOTrainer:
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                return torch.tensor(1.0)
+
+        variant_cls = make_grpo_trainer_variant(_FakeGRPOTrainer, "gspo")
+        assert issubclass(variant_cls, _FakeGRPOTrainer)
+        assert variant_cls._soup_grpo_variant == "gspo"
+
+    def test_factory_cached_by_variant(self):
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        class _FakeGRPOTrainer:
+            def compute_loss(self, *a, **k):
+                return torch.tensor(0.0)
+
+        a = make_grpo_trainer_variant(_FakeGRPOTrainer, "gspo")
+        b = make_grpo_trainer_variant(_FakeGRPOTrainer, "gspo")
+        assert a is b
+
+    def test_variant_compute_loss_routes_through_kernel(self):
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        class _FakeGRPOTrainer:
+            def __init__(self):
+                self.args = type("Args", (), {"beta": 0.1})()
+
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                return torch.tensor(99.0)
+
+        variant_cls = make_grpo_trainer_variant(_FakeGRPOTrainer, "gspo")
+        trainer = variant_cls()
+        inputs = {
+            "per_token_logps": torch.zeros(2, 4),
+            "old_per_token_logps": torch.zeros(2, 4),
+            "advantages": torch.tensor([1.0, -1.0]),
+        }
+        # Variant kernel should compute a real (non-99.0) loss.
+        result = trainer.compute_loss(model=None, inputs=inputs)
+        assert isinstance(result, torch.Tensor)
+
+    def test_variant_falls_back_on_missing_inputs(self):
+        """When TRL renames inputs, fall back to original loss (defence-in-depth)."""
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        class _FakeGRPOTrainer:
+            def __init__(self):
+                self.args = type("Args", (), {"beta": 0.1})()
+
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                return torch.tensor(42.0)
+
+        variant_cls = make_grpo_trainer_variant(_FakeGRPOTrainer, "gspo")
+        trainer = variant_cls()
+        # No expected keys — falls back to original.
+        result = trainer.compute_loss(model=None, inputs={})
+        assert float(result) == 42.0
+
+
+class TestGRPOVariantRuntimeContract:
+    """Regression tests for GRPO variant execution on realistic TRL runtime contracts.
+
+    Tests that variants do NOT require per_token_logps to be pre-injected in inputs,
+    and instead resolve logps in a single forward pass via _get_per_token_logps_and_entropies
+    without triggering fallback to stock TRL loss.
+    """
+
+    class _MockTRLTrainer:
+        def __init__(self, beta=0.0):
+            self.args = type("Args", (), {"beta": beta})()
+            self.model = type("Model", (), {"training": True})()
+            self.current_gradient_accumulation_steps = 1
+            self._get_logps_called = 0
+
+        def _get_per_token_logps_and_entropies(
+            self, model, input_ids, attention_mask, logits_to_keep, **kwargs
+        ):
+            self._get_logps_called += 1
+            b = input_ids.size(0)
+            t = logits_to_keep
+            # Distinct logps to test math
+            logps = torch.tensor(
+                [[-0.1, -0.2, -0.3], [-0.4, -0.5, -0.6]], requires_grad=True
+            )
+            return logps, torch.zeros(b, t)
+
+        def _compute_loss(self, model, inputs):
+            return torch.tensor(777.0)
+
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            return self._compute_loss(model, inputs)
+
+    @pytest.fixture
+    def realistic_batch(self):
+        return {
+            "prompt_ids": torch.tensor([[1, 2], [3, 4]]),
+            "prompt_mask": torch.tensor([[1, 1], [1, 1]]),
+            "completion_ids": torch.tensor([[5, 6, 7], [8, 9, 10]]),
+            "completion_mask": torch.tensor([[1, 1, 1], [1, 1, 1]]),
+            "advantages": torch.tensor([1.2, -0.8]),
+            "num_items_in_batch": 2,
+        }
+
+    def test_realistic_batch_without_precomputed_logps_computes_variant_loss(
+        self, realistic_batch
+    ):
+        """Realistic batch (no per_token_logps in inputs) must execute variant without fallback."""
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        variant_cls = make_grpo_trainer_variant(self._MockTRLTrainer, "gspo")
+        trainer = variant_cls()
+        loss = trainer.compute_loss(model=None, inputs=realistic_batch)
+
+        assert not trainer._soup_fallback_warned
+        assert float(loss.detach()) != 777.0
+        assert trainer._get_logps_called == 1
+
+    @pytest.mark.parametrize("variant", ["gspo", "dapo", "dr_grpo", "bnpo", "rft"])
+    def test_all_variants_execute_without_fallback_on_realistic_batch(
+        self, realistic_batch, variant
+    ):
+        """Every supported variant must execute cleanly without fallback."""
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        variant_cls = make_grpo_trainer_variant(self._MockTRLTrainer, variant)
+        trainer = variant_cls()
+        loss = trainer.compute_loss(model=None, inputs=realistic_batch)
+
+        assert not trainer._soup_fallback_warned
+        assert float(loss.detach()) != 777.0
+
+    def test_two_sided_variant_with_delta_executes(self, realistic_batch):
+        """two_sided variant with delta executes cleanly without fallback."""
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        variant_cls = make_grpo_trainer_variant(self._MockTRLTrainer, "two_sided")
+        trainer = variant_cls()
+        trainer._soup_grpo_delta = 0.2
+        loss = trainer.compute_loss(model=None, inputs=realistic_batch)
+
+        assert not trainer._soup_fallback_warned
+        assert float(loss.detach()) != 777.0
+
+    def test_standard_variant_delegates_to_stock_loss_without_warning(
+        self, realistic_batch
+    ):
+        """'standard' variant delegates directly to stock _compute_loss."""
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        variant_cls = make_grpo_trainer_variant(self._MockTRLTrainer, "standard")
+        trainer = variant_cls()
+        loss = trainer.compute_loss(model=None, inputs=realistic_batch)
+
+        assert not trainer._soup_fallback_warned
+        assert float(loss) == 777.0
+
+    def test_fallback_warns_once_on_corrupted_inputs(self):
+        """Corrupted inputs missing prompt_ids and logps must trigger fallback with warning."""
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        variant_cls = make_grpo_trainer_variant(self._MockTRLTrainer, "gspo")
+        trainer = variant_cls()
+        loss = trainer.compute_loss(model=None, inputs={"corrupted": True})
+
+        assert trainer._soup_fallback_warned
+        assert float(loss) == 777.0
+
+    def test_variant_loss_differs_from_stock_and_between_objectives(
+        self, realistic_batch
+    ):
+        """Different objectives produce mathematically distinct losses on identical data."""
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        losses = {}
+        for var in ["gspo", "dapo", "dr_grpo", "bnpo", "rft"]:
+            cls_ = make_grpo_trainer_variant(self._MockTRLTrainer, var)
+            tr = cls_()
+            losses[var] = float(tr.compute_loss(model=None, inputs=realistic_batch).detach())
+
+        # rft computes NLL on positive advantages whereas gspo uses centered ratio
+        assert losses["rft"] != losses["gspo"]
+
+    @skip_on_windows_ci
+    def test_real_trl_grpotrainer_end_to_end_step(self, tmp_path):
+        """End-to-end single step with real trl.GRPOTrainer and tiny model."""
+        from datasets import Dataset
+        from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
+        from trl import GRPOConfig, GRPOTrainer
+
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        config = GPT2Config(
+            n_layer=1,
+            n_head=1,
+            n_embd=32,
+            vocab_size=50257,
+            attn_pdrop=0.0,
+            resid_pdrop=0.0,
+            embd_pdrop=0.0,
+        )
+        model = GPT2LMHeadModel(config)
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        tokenizer.pad_token = tokenizer.eos_token
+        dataset = Dataset.from_dict({"prompt": ["Hello", "World"]})
+
+        training_args = GRPOConfig(
+            output_dir=str(tmp_path / "grpo_out"),
+            per_device_train_batch_size=2,
+            num_generations=2,
+            max_completion_length=4,
+            report_to="none",
+            learning_rate=1e-4,
+            max_steps=1,
+            use_cpu=True,
+        )
+
+        variant_cls = make_grpo_trainer_variant(GRPOTrainer, "gspo")
+        trainer = variant_cls(
+            model=model,
+            reward_funcs=lambda prompts, completions, **k: [1.0] * len(completions),
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+        )
+
+        assert not trainer._soup_fallback_warned
+        trainer.train()
+        assert not trainer._soup_fallback_warned
+
+
+# ---------------------------------------------------------------------------
+# v0.53.11 #126 — PRM Trainer subclass factory + dataset prep
+# ---------------------------------------------------------------------------
+
+
+class TestPRMTrainerSubclass:
+    def test_factory_returns_subclass(self):
+        from souplite.trainer.prm import make_prm_trainer_class
+
+        class _FakeTrainer:
+            pass
+
+        prm_cls = make_prm_trainer_class(_FakeTrainer)
+        assert issubclass(prm_cls, _FakeTrainer)
+        assert hasattr(prm_cls, "compute_loss")
+
+    def test_prepare_dataset_skips_mismatched(self):
+        from souplite.trainer.prm import _prepare_prm_dataset
+
+        class _Tok:
+            def __call__(self, text, add_special_tokens=False):
+                return {"input_ids": list(range(len(text.split())))}
+
+        rows = [
+            {"prompt": "hi", "completions": ["a", "b"], "labels": [1.0]},  # mismatch
+            {"prompt": "hi", "completions": ["a"], "labels": [0.5]},  # ok
+            {},  # missing fields
+        ]
+        prepared = _prepare_prm_dataset(rows, _Tok(), max_length=100)
+        assert len(prepared) == 1
+        assert prepared[0]["step_positions"] == [1]
+        assert prepared[0]["labels"] == [0.5]
+
+    def test_prepare_dataset_truncates_long(self):
+        from souplite.trainer.prm import _prepare_prm_dataset
+
+        class _Tok:
+            def __call__(self, text, add_special_tokens=False):
+                return {"input_ids": [1] * 50}
+
+        rows = [{"prompt": "p", "completions": ["a", "b", "c"], "labels": [1, 2, 3]}]
+        prepared = _prepare_prm_dataset(rows, _Tok(), max_length=80)
+        # Should truncate to fit max_length.
+        assert len(prepared) == 1
+        assert all(p < 80 for p in prepared[0]["step_positions"])
+
+
+# ---------------------------------------------------------------------------
+# v0.53.11 #68 — true weighted combine path
+# ---------------------------------------------------------------------------
+
+
+class TestTrueWeightedCombine:
+    def test_uses_combine_when_logps_available(self):
+        from souplite.utils.preference_combine import (
+            attach_weighted_preference_combine,
+        )
+
+        class _Trainer:
+            beta = 0.1
+            simpo_gamma = 1.0
+
+            def compute_loss(self, model, inputs, return_outputs=False):
+                # Returns primary loss; should be REPLACED by weighted combine.
+                return torch.tensor(99.0)
+
+        trainer = _Trainer()
+        attach_weighted_preference_combine(
+            trainer, {"dpo": 0.5, "simpo": 0.5}
+        )
+        # Provide per-batch logps so the true-weighted path activates.
+        inputs = {
+            "policy_chosen_logps": torch.tensor([0.0, 0.1]),
+            "policy_rejected_logps": torch.tensor([-0.5, -0.6]),
+            "reference_chosen_logps": torch.tensor([0.0, 0.0]),
+            "reference_rejected_logps": torch.tensor([0.0, 0.0]),
+        }
+        out = trainer.compute_loss(model=None, inputs=inputs)
+        # Result is the TRUE weighted combine, not the 99.0 placeholder.
+        assert float(out) != 99.0
+        assert math.isfinite(float(out))
+
+    def test_falls_back_when_logps_missing(self):
+        from souplite.utils.preference_combine import (
+            attach_weighted_preference_combine,
+        )
+
+        class _Trainer:
+            def compute_loss(self, model, inputs, return_outputs=False):
+                return torch.tensor(2.0)
+
+        trainer = _Trainer()
+        attach_weighted_preference_combine(
+            trainer, {"dpo": 0.7, "simpo": 0.3}
+        )
+        # No logps → fallback to primary scaling.
+        out = trainer.compute_loss(model=None, inputs={})
+        assert float(out) == pytest.approx(2.0 * 0.7)
+
+
+# ---------------------------------------------------------------------------
+# v0.53.11 #127 — live EMA hook in callback
+# ---------------------------------------------------------------------------
+
+
+class TestStabilityCallbackEMA:
+    def test_on_step_end_runs_ema_update(self):
+        # v0.71.11 #160 — on_step_end now mutates the ref parameters in
+        # place (no full state_dict / load_state_dict round-trip).
+        import torch.nn as nn
+
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        cb = GRPOStabilityCallback(ref_model_ema_alpha=0.5)
+        ref = nn.Linear(2, 2)
+        pol = nn.Linear(2, 2)
+        with torch.no_grad():
+            ref.weight.fill_(0.0)
+            pol.weight.fill_(1.0)
+        cb._policy_model = pol
+        cb._ref_model = ref
+
+        class _State:
+            log_history: list = []
+
+        state = _State()
+        cb.on_step_end(args=None, state=state, control=None, model=pol)
+        # ref mutated in place to the midpoint 0.5.
+        assert torch.allclose(ref.weight, torch.full_like(ref.weight, 0.5))
+
+    def test_on_step_end_logs_counters(self):
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        cb = GRPOStabilityCallback(replay_buffer_size=4, tis_threshold=1.0)
+        cb.push_rollout("a")
+        cb.record_tis_alert(torch.tensor([2.0]))
+
+        class _State:
+            log_history: list = []
+
+        state = _State()
+        cb.on_step_end(args=None, state=state, control=None)
+        assert state.log_history
+        last = state.log_history[-1]
+        assert last["tis_alerts"] == 1
+        assert last["replay_size"] == 1
+
+    def test_on_train_begin_captures_models(self):
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        cb = GRPOStabilityCallback(ref_model_ema_alpha=0.99)
+        policy = object()
+        ref = object()
+
+        class _Trainer:
+            ref_model = ref
+
+        cb.on_train_begin(
+            args=None, state=None, control=None, model=policy, trainer=_Trainer()
+        )
+        assert cb._policy_model is policy
+        assert cb._ref_model is ref
+
+
+# ---------------------------------------------------------------------------
+# v0.53.11 review-fix coverage gaps (tdd-guide findings)
+# ---------------------------------------------------------------------------
+
+
+class TestReviewFixCoverage:
+    """Tests added in response to v0.53.11 tdd-guide HIGH/MEDIUM findings."""
+
+    # --- HIGH: bool / bounds rejection on remaining numeric fields ---
+
+    @pytest.mark.parametrize("field", [
+        "ref_model_ema_alpha",
+        "replay_buffer_size",
+        "tis_threshold",
+        "off_policy_mask_threshold",
+    ])
+    def test_callback_bool_rejected_all_numeric_fields(self, field):
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        with pytest.raises(TypeError, match="bool"):
+            GRPOStabilityCallback(**{field: True})
+
+    @pytest.mark.parametrize("value", [0.0, 100.5])
+    def test_callback_tis_threshold_bounds(self, value):
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        with pytest.raises(ValueError, match="tis_threshold"):
+            GRPOStabilityCallback(tis_threshold=value)
+
+    @pytest.mark.parametrize("value", [-0.1, 1.1])
+    def test_callback_off_policy_bounds(self, value):
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        with pytest.raises(ValueError, match="off_policy_mask_threshold"):
+            GRPOStabilityCallback(off_policy_mask_threshold=value)
+
+    @pytest.mark.parametrize("value", [0, 1_000_001])
+    def test_callback_replay_buffer_size_bounds(self, value):
+        from souplite.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+        with pytest.raises(ValueError, match="replay_buffer_size"):
+            GRPOStabilityCallback(replay_buffer_size=value)
+
+    def test_check_tis_threshold_bool_rejected(self):
+        from souplite.monitoring.grpo_stability_callback import check_tis_threshold
+
+        with pytest.raises(TypeError, match="bool"):
+            check_tis_threshold(torch.tensor([1.0]), True)
+
+    def test_update_ema_nan_rejected(self):
+        from souplite.monitoring.grpo_stability_callback import update_ema
+
+        with pytest.raises(ValueError, match="finite"):
+            update_ema({}, {}, alpha=float("nan"))
+
+    # --- HIGH: variant compute_loss return_outputs=True path ---
+
+    def test_variant_compute_loss_return_outputs_true(self):
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        class _FakeGRPOTrainer:
+            def __init__(self):
+                self.args = type("Args", (), {"beta": 0.1})()
+
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                return (torch.tensor(99.0), {"fake": True})
+
+        variant_cls = make_grpo_trainer_variant(_FakeGRPOTrainer, "gspo")
+        trainer = variant_cls()
+        inputs = {
+            "per_token_logps": torch.zeros(2, 4),
+            "old_per_token_logps": torch.zeros(2, 4),
+            "advantages": torch.tensor([1.0, -1.0]),
+        }
+        result = trainer.compute_loss(
+            model=None, inputs=inputs, return_outputs=True
+        )
+        # When kernel handles the loss we return (variant_loss, None) per
+        # the implementation — outputs are not reproducible without a full
+        # forward pass.
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        loss, _outputs = result
+        assert isinstance(loss, torch.Tensor)
+
+    # --- HIGH: source-grep regression — callback wired into grpo.py ---
+
+    def test_grpo_trainer_wires_stability_callback_source_grep(self):
+        import inspect
+
+        import souplite.trainer.grpo as grpo_mod
+
+        body = inspect.getsource(grpo_mod)
+        assert "attach_grpo_stability_callback" in body, (
+            "GRPOTrainerWrapper.setup must call attach_grpo_stability_callback"
+        )
+
+    def test_preference_wires_weighted_combine_source_grep(self):
+        import inspect
+
+        import souplite.trainer.preference as pref_mod
+
+        body = inspect.getsource(pref_mod)
+        assert "attach_weighted_preference_combine" in body, (
+            "PreferenceTrainerWrapper.setup must wire attach_weighted_preference_combine"
+        )
+
+    # --- MEDIUM: idempotent attach + restore-on-exception ---
+
+    def test_attach_weighted_preference_not_double_wrapped(self):
+        from souplite.utils.preference_combine import (
+            attach_weighted_preference_combine,
+        )
+
+        class _Trainer:
+            def compute_loss(self, model, inputs, return_outputs=False):
+                return torch.tensor(2.0)
+
+        trainer = _Trainer()
+        attach_weighted_preference_combine(trainer, {"dpo": 0.6, "simpo": 0.4})
+        first_wrapper = trainer.compute_loss
+        # Second attach must short-circuit; compute_loss unchanged.
+        attach_weighted_preference_combine(trainer, {"dpo": 0.6, "simpo": 0.4})
+        assert trainer.compute_loss is first_wrapper
+
+    def test_longlora_idempotent_install(self):
+        from souplite.utils.longlora import apply_longlora_forward_override
+
+        class _Proj:
+            def forward(self, x):
+                return x
+
+        class LlamaAttention:
+            def __init__(self):
+                self.head_dim = 2
+                self.q_proj = _Proj()
+                self.k_proj = _Proj()
+
+            def forward(self, x):
+                return (x,)
+
+        class _Model:
+            def __init__(self):
+                self.attn = LlamaAttention()
+
+            def modules(self):
+                yield self.attn
+
+        model = _Model()
+        ovr1 = apply_longlora_forward_override(model, group_size=4)
+        with ovr1:
+            wrapped_once = model.attn.q_proj.forward
+            # Nested context on the same projection must NOT double-wrap.
+            ovr2 = apply_longlora_forward_override(model, group_size=4)
+            with ovr2:
+                assert model.attn.q_proj.forward is wrapped_once
+        # After exiting, original projection forward restored.
+        assert not getattr(model.attn.q_proj.forward, "_soup_longlora_patched", False)
+
+    def test_longlora_restores_on_exception(self):
+        from souplite.utils.longlora import apply_longlora_forward_override
+
+        class _Proj:
+            def forward(self, x):
+                return x
+
+        class LlamaAttention:
+            def __init__(self):
+                self.head_dim = 2
+                self.q_proj = _Proj()
+                self.k_proj = _Proj()
+
+            def forward(self, x):
+                return (x,)
+
+        class _Model:
+            def __init__(self):
+                self.attn = LlamaAttention()
+
+            def modules(self):
+                yield self.attn
+
+        model = _Model()
+        original = model.attn.q_proj.forward
+        ovr = apply_longlora_forward_override(model, group_size=4)
+        with pytest.raises(RuntimeError):
+            with ovr:
+                raise RuntimeError("simulated mid-training crash")
+        # Projection forwards restored despite the exception.
+        assert not getattr(model.attn.q_proj.forward, "_soup_longlora_patched", False)
+        _ = original  # silence lint
+
+    # --- MEDIUM: factory cache isolation between base classes ---
+
+    def test_variant_factory_isolates_by_base_class(self):
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        class _BaseA:
+            def compute_loss(self, *a, **k):
+                return torch.tensor(0.0)
+
+        class _BaseB:
+            def compute_loss(self, *a, **k):
+                return torch.tensor(0.0)
+
+        a = make_grpo_trainer_variant(_BaseA, "gspo")
+        b = make_grpo_trainer_variant(_BaseB, "gspo")
+        assert a is not b
+
+    def test_variant_factory_normalises_case(self):
+        """v0.53.11 review fix (security MEDIUM) — case-insensitive cache."""
+        from souplite.trainer.grpo import make_grpo_trainer_variant
+
+        class _Base:
+            def compute_loss(self, *a, **k):
+                return torch.tensor(0.0)
+
+        a = make_grpo_trainer_variant(_Base, "gspo")
+        b = make_grpo_trainer_variant(_Base, "GSPO")
+        assert a is b
+
+    # --- LOW: empty completions in PRM dataset prep ---
+
+    def test_prepare_prm_empty_completions(self):
+        from souplite.trainer.prm import _prepare_prm_dataset
+
+        class _Tok:
+            def __call__(self, text, add_special_tokens=False):
+                return {"input_ids": [1, 2, 3]}
+
+        rows = [{"prompt": "p", "completions": [], "labels": []}]
+        prepared = _prepare_prm_dataset(rows, _Tok(), max_length=100)
+        # Empty completions → zero output rows (does not crash).
+        assert prepared == []

@@ -1,0 +1,151 @@
+"""Shared Slack / Discord webhook helpers (v0.71.5 #207).
+
+Lifts the SSRF-hardened ``validate_webhook_url`` + best-effort ``post_webhook``
+out of ``utils/drift_alarm.py`` (v0.63.0 Part E) so every production-trace
+command can offer ``--slack-url`` / ``--discord-url`` without re-implementing
+the SSRF gate. ``drift_alarm`` now re-exports these for back-compat.
+
+SSRF policy — full parity with v0.29.0 ``HF_ENDPOINT`` / v0.30.0 OTLP /
+v0.51.0 ``validate_hub_endpoint`` / v0.63.0 drift-alarm:
+- scheme allowlist {http, https}
+- null-byte / control-char rejection
+- ``0.0.0.0`` rejected
+- plain HTTP only permitted for loopback hosts
+- private / link-local / reserved / multicast IPs rejected
+
+``post_webhook`` NEVER raises — webhook delivery must not crash the command
+that triggered it. ``httpx`` is lazy-imported so the runtime cost is paid only
+when an alarm actually fires.
+"""
+
+from __future__ import annotations
+
+from typing import List, Mapping, Optional, Tuple
+from urllib.parse import urlparse
+
+from souplite.utils.net_guard import LOOPBACK_HOSTS as _LOOPBACK_HOSTS
+from souplite.utils.net_guard import is_private_or_link_local as _is_private_or_link_local
+
+_MAX_WEBHOOK_URL_LEN = 4096
+
+
+def validate_webhook_url(url: object, *, allow_private_hosts: bool = False) -> str:
+    """SSRF-hardened webhook URL validator (returns the canonical URL).
+
+    ``allow_private_hosts`` defaults to ``False`` — the safe webhook policy that
+    rejects private / link-local / reserved IPs on BOTH http and https (so a
+    crafted ``https://169.254.169.254`` cloud-metadata URL cannot be reached).
+    A trusted, operator-controlled caller that legitimately targets a LAN box
+    (e.g. ``loop_stages.deploy_to_canary`` promoting an adapter to an on-prem
+    serve endpoint, which applies its own loopback/LAN tightening afterwards)
+    may pass ``allow_private_hosts=True``. Plain HTTP to a non-loopback host is
+    still rejected regardless.
+    """
+    if isinstance(url, bool):
+        raise TypeError("webhook URL must be str, not bool")
+    if not isinstance(url, str):
+        raise TypeError(f"webhook URL must be str, got {type(url).__name__}")
+    if not url:
+        raise ValueError("webhook URL must be non-empty")
+    if "\x00" in url:
+        raise ValueError("webhook URL must not contain null bytes")
+    if any(ord(c) < 0x20 for c in url):
+        raise ValueError("webhook URL must not contain control characters")
+    if len(url) > _MAX_WEBHOOK_URL_LEN:
+        raise ValueError(f"webhook URL must be <= {_MAX_WEBHOOK_URL_LEN} chars")
+    stripped = url.rstrip("/")
+    parsed = urlparse(stripped)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"webhook URL must use http/https scheme, got {parsed.scheme!r}"
+        )
+    if not parsed.netloc:
+        raise ValueError("webhook URL is missing a host")
+    host = parsed.hostname or ""
+    if host == "0.0.0.0":
+        raise ValueError(
+            "webhook URL 0.0.0.0 is ambiguous; use 127.0.0.1 or localhost"
+        )
+    # SSRF gate — runs for BOTH http and https. Nesting this inside the
+    # http-only branch (the pre-fix bug) let ``https://169.254.169.254`` and
+    # any ``https://10.x`` / ``192.168.x`` sail straight through to the return.
+    # Loopback hosts stay allowed (they are handled by the ``_LOOPBACK_HOSTS``
+    # guard below), so an explicit ``http://localhost`` webhook still works.
+    host_clean = host.lower().rstrip(".")
+    if host_clean not in _LOOPBACK_HOSTS:
+        if _is_private_or_link_local(host) and not allow_private_hosts:
+            raise ValueError(
+                "webhook URL private/link-local/reserved hosts are not "
+                "allowed (SSRF protection)"
+            )
+        if parsed.scheme == "http":
+            raise ValueError("webhook URL for remote hosts must use HTTPS")
+    return stripped
+
+
+def post_webhook(
+    *,
+    url: Optional[str],
+    payload: Mapping[str, object],
+    timeout_seconds: float = 5.0,
+) -> bool:
+    """POST ``payload`` as JSON to ``url``. Returns True on 2xx, False otherwise.
+
+    Never raises — webhook delivery must NOT crash the calling command.
+    """
+    if url is None:
+        return False
+    try:
+        validated = validate_webhook_url(url)
+    except (TypeError, ValueError):
+        return False
+    try:
+        import httpx  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+    try:
+        response = httpx.post(
+            validated,
+            json=dict(payload),
+            timeout=timeout_seconds,
+        )
+        return 200 <= response.status_code < 300
+    except Exception:  # noqa: BLE001 — webhook must never crash the command
+        return False
+
+
+def send_webhooks(
+    payload: Mapping[str, object],
+    *,
+    slack_url: Optional[str] = None,
+    discord_url: Optional[str] = None,
+    timeout_seconds: float = 5.0,
+) -> List[Tuple[str, bool]]:
+    """POST ``payload`` to each provided webhook; return per-target delivery.
+
+    Returns a list of ``(label, delivered)`` for every non-``None`` URL,
+    in ``slack`` then ``discord`` order. ``None`` URLs are skipped (not
+    attempted). Never raises (delegates to the never-raising
+    :func:`post_webhook`).
+    """
+    results: List[Tuple[str, bool]] = []
+    for label, url in (("slack", slack_url), ("discord", discord_url)):
+        if url:
+            results.append(
+                (
+                    label,
+                    post_webhook(
+                        url=url,
+                        payload=payload,
+                        timeout_seconds=timeout_seconds,
+                    ),
+                )
+            )
+    return results
+
+
+__all__ = [
+    "post_webhook",
+    "send_webhooks",
+    "validate_webhook_url",
+]

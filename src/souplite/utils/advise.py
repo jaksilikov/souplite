@@ -1,0 +1,1083 @@
+"""Pre-flight decision engine — `soup advise` (v0.54.0).
+
+Answers the question "should I fine-tune?" *before* the user spends 8 hours
+on a GPU. Heuristic-only — no GPU required for the verdict itself; the
+optional `--probe` runs a 10-minute pipeline that does load a tiny model.
+
+Layer above autopilot:
+  - autopilot (v0.25.0): picks hyperparameters AFTER you decided to train.
+  - advise   (v0.54.0): picks PROMPT_ENG / RAG / SFT / DPO / GRPO.
+
+Public surface
+--------------
+- Frozen dataclasses: ``DatasetProfile``, ``ROIEstimate``, ``Verdict``.
+- Constants: ``TASK_CATEGORIES``, ``CHOICES``.
+- Pure functions: ``classify_task``, ``compute_dataset_profile``,
+  ``build_verdict``, ``load_advise_dataset``, ``synth_probe_baselines``,
+  ``synth_probe_lora_delta``, ``format_verdict_rubric``.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import stat
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:  # pragma: no cover — annotation only, avoids circular import.
+    from souplite.utils.advise_history import HistoryEntry
+
+from souplite.utils.paths import is_under_cwd
+
+# ---------------------------------------------------------------------------
+# Public constants
+# ---------------------------------------------------------------------------
+
+# Task taxonomy — closed allowlist. Order is presentation order in rubrics.
+TASK_CATEGORIES: Tuple[str, ...] = (
+    "factual_lookup",
+    "style_shaping",
+    "format_conversion",
+    "reasoning",
+    "tool_use",
+    "summarization",
+    "classification",
+)
+
+# Verdict choices — closed allowlist.
+CHOICES: Tuple[str, ...] = ("PROMPT_ENG", "RAG", "SFT", "DPO", "GRPO")
+
+# Bounds — defence against pathological inputs.
+_MAX_ROWS = 1_000_000
+_MAX_FIELD_CHARS = 1_000_000  # per-field cap on text extraction
+_MAX_GOAL_CHARS = 4096
+_MAX_FILE_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
+_MIN_ROWS_FOR_TRAINING = 50
+# Higher bar for GRPO since RL needs more data to outpace SFT-on-traces
+# (code-review MEDIUM fix — prevents tiny reasoning datasets from being
+# routed into a GPU-intensive RL run).
+_MIN_ROWS_FOR_GRPO = 500
+
+# History-bias thresholds (v0.71.5 #163). A choice is "encouraged" when the
+# project has >= _HISTORY_MIN_PRECEDENTS accepted verdicts whose mean measured
+# outcome is >= _HISTORY_POSITIVE_OUTCOME; "discouraged" when the mean is
+# < _HISTORY_NEGATIVE_OUTCOME over the same minimum count. Encouraged choices
+# get a small confidence nudge and can flip a marginal tie; discouraged choices
+# are suppressed (their effective row-floor is raised).
+_HISTORY_MIN_PRECEDENTS = 3
+_HISTORY_POSITIVE_OUTCOME = 0.3
+_HISTORY_NEGATIVE_OUTCOME = 0.0
+_HISTORY_CONFIDENCE_NUDGE = 0.05
+
+# Probe defaults — tiny, no GPU required for the heuristic stubs.
+_PROBE_HOLDOUT_DEFAULT = 100
+_PROBE_LORA_STEPS_DEFAULT = 100
+
+
+# ---------------------------------------------------------------------------
+# Frozen dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DatasetProfile:
+    """Summary of a dataset: shape, diversity, proximity to base model."""
+
+    row_count: int
+    avg_input_chars: float
+    avg_output_chars: float
+    type_token_diversity: float  # [0, 1] — types/tokens ratio on outputs
+    label_variance: float  # [0, 1] — uniqueness of outputs (0 = all identical)
+    base_model_proximity: Optional[float] = None  # [0, 1] or None when unknown
+    has_chosen_rejected: bool = False  # preference-data shape detected
+    has_reasoning_traces: bool = False  # <think>...</think> markers detected
+
+
+@dataclass(frozen=True)
+class ROIEstimate:
+    """ROI deltas for each escalation path.
+
+    Each ``*_delta`` is a unitless score in roughly ``[-1, 1]``: positive
+    means the path improves on the base model, negative means regression.
+    None means the path was not measured.
+    """
+
+    prompt_eng_delta: Optional[float] = None
+    rag_delta: Optional[float] = None
+    sft_delta: Optional[float] = None
+    sft_wall_clock_secs: Optional[float] = None
+    sft_cost_usd: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """One-line decision the user came for, plus its supporting evidence."""
+
+    choice: str
+    confidence: float  # [0.0, 1.0]
+    reason: str
+    reverse_when: str
+    task_category: str
+    estimated_roi: ROIEstimate = field(default_factory=ROIEstimate)
+
+
+# ---------------------------------------------------------------------------
+# Input validation helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_goal(goal: Optional[str]) -> str:
+    if goal is None:
+        return ""
+    if not isinstance(goal, str):
+        raise TypeError("goal must be a string or None")
+    if "\x00" in goal:
+        raise ValueError("goal must not contain NUL")
+    if len(goal) > _MAX_GOAL_CHARS:
+        raise ValueError(f"goal exceeds {_MAX_GOAL_CHARS} characters")
+    return goal.strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# Dataset loader
+# ---------------------------------------------------------------------------
+
+def load_advise_dataset(path: str) -> List[Mapping[str, object]]:
+    """Load a JSONL dataset for advise, with cwd containment + symlink reject.
+
+    Mirrors v0.53.7 #106 TOCTOU policy: ``os.lstat`` on the raw path BEFORE
+    ``realpath`` so a symlink does not silently route reads elsewhere.
+    """
+    if not isinstance(path, str) or not path:
+        raise ValueError("path must be a non-empty string")
+    if "\x00" in path:
+        raise ValueError("path must not contain NUL")
+    # Symlink check on the RAW path first (TOCTOU defence).
+    try:
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            raise ValueError("dataset path must not be a symlink")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"dataset not found: {path}") from exc
+    if not is_under_cwd(path):
+        raise ValueError(f"dataset path '{path}' must stay under cwd")
+    size = os.path.getsize(path)
+    if size > _MAX_FILE_BYTES:
+        raise ValueError(
+            f"dataset exceeds {_MAX_FILE_BYTES} bytes ({size} found)"
+        )
+
+    rows: List[Mapping[str, object]] = []
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if len(rows) >= _MAX_ROWS:
+                raise ValueError(
+                    f"dataset exceeds {_MAX_ROWS} rows (line {line_no})"
+                )
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"line {line_no} is not valid JSON: {exc.msg}"
+                ) from exc
+            if not isinstance(row, dict):
+                # Allow JSON arrays at the row level only if they wrap a dict
+                # (we are strict: a JSONL row must be an object).
+                raise ValueError(f"line {line_no} must be a JSON object")
+            rows.append(row)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Field extraction
+# ---------------------------------------------------------------------------
+
+_INPUT_FIELDS = ("prompt", "instruction", "input", "question", "query")
+_OUTPUT_FIELDS = ("response", "completion", "output", "answer", "chosen")
+_CHOSEN_FIELDS = ("chosen",)
+_REJECTED_FIELDS = ("rejected",)
+
+
+def _extract_input_text(row: Mapping[str, object]) -> str:
+    """Pick the most input-like field from a row, with chat-message fallback."""
+    for key in _INPUT_FIELDS:
+        val = row.get(key)
+        if isinstance(val, str) and val:
+            return val[:_MAX_FIELD_CHARS]
+    msgs = row.get("messages")
+    if isinstance(msgs, list):
+        # Concatenate non-assistant turns as the "input".
+        parts: List[str] = []
+        for msg in msgs:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            content = msg.get("content")
+            if role != "assistant" and isinstance(content, str):
+                parts.append(content)
+        joined = "\n".join(parts)
+        return joined[:_MAX_FIELD_CHARS]
+    return ""
+
+
+def _extract_output_text(row: Mapping[str, object]) -> str:
+    """Pick the most output-like field from a row, with chat-message fallback."""
+    for key in _OUTPUT_FIELDS:
+        val = row.get(key)
+        if isinstance(val, str) and val:
+            return val[:_MAX_FIELD_CHARS]
+    msgs = row.get("messages")
+    if isinstance(msgs, list):
+        for msg in msgs:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "assistant":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    return content[:_MAX_FIELD_CHARS]
+    return ""
+
+
+def _has_chosen_rejected(rows: Sequence[Mapping[str, object]]) -> bool:
+    """True iff every probed row has both a 'chosen' AND a 'rejected' string."""
+    if not rows:
+        return False
+    probe = rows[: min(50, len(rows))]
+    for row in probe:
+        if not isinstance(row, Mapping):
+            return False
+        ch = row.get("chosen")
+        rj = row.get("rejected")
+        if not (isinstance(ch, str) and isinstance(rj, str)):
+            return False
+        if not ch or not rj:
+            return False
+    return True
+
+
+_REASONING_RE = re.compile(
+    r"<think\b|</think>|<\|begin_of_thought\|>|<\|end_of_thought\|>",
+    re.IGNORECASE,
+)
+
+
+def _has_reasoning(rows: Sequence[Mapping[str, object]]) -> bool:
+    if not rows:
+        return False
+    for row in rows[: min(50, len(rows))]:
+        if not isinstance(row, Mapping):
+            continue
+        out = _extract_output_text(row)
+        if out and _REASONING_RE.search(out):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Task taxonomy classifier (heuristic, pure-Python)
+# ---------------------------------------------------------------------------
+
+# Keyword signals — each tuple is (regex, category, weight). Weights are
+# advisory; the highest-scoring category wins. Ties break in TASK_CATEGORIES
+# declaration order for determinism.
+_TASK_KEYWORDS: Tuple[Tuple[re.Pattern[str], str, float], ...] = (
+    (re.compile(r"\b(classif\w*|label\w*|category|categori\w*)\b", re.IGNORECASE),
+     "classification", 1.0),
+    (re.compile(r"\b(summari[sz]\w*|tl;?dr|abstract)\b", re.IGNORECASE),
+     "summarization", 1.0),
+    (re.compile(r"\b(translate|translation|convert|format|json|yaml|sql)\b",
+                re.IGNORECASE), "format_conversion", 0.8),
+    (re.compile(r"\b(tool|function|api|call|invoke|action)\b", re.IGNORECASE),
+     "tool_use", 0.7),
+    (re.compile(r"\b(reason\w*|think\w*|step[- ]by[- ]step|math|prove)\b",
+                re.IGNORECASE), "reasoning", 1.0),
+    (re.compile(r"\b(style|tone|voice|brand|personali[sz]\w*|rewrite)\b",
+                re.IGNORECASE), "style_shaping", 1.0),
+    (re.compile(r"\b(fact\w*|lookup|retrieve|recall|knowledge|wiki)\b",
+                re.IGNORECASE), "factual_lookup", 1.0),
+)
+
+_TOOL_FIELD_KEY = "tool_calls"
+
+
+def classify_task(
+    rows: Sequence[Mapping[str, object]],
+    goal: Optional[str] = None,
+) -> str:
+    """Classify the task using keyword + structural signals.
+
+    Pure-Python, no ML. Returns one of ``TASK_CATEGORIES``.
+
+    The goal string (when supplied) carries the same weight as ~10 dataset
+    rows, since the user's stated intent is high-signal.
+    """
+    if not isinstance(rows, Sequence):
+        raise TypeError("rows must be a sequence of dict-like rows")
+    goal_text = _normalize_goal(goal)
+
+    scores: Dict[str, float] = {}
+
+    # Structural signal: tool_calls field → tool_use.
+    for row in rows[: min(50, len(rows))]:
+        if not isinstance(row, Mapping):
+            continue
+        if _TOOL_FIELD_KEY in row:
+            scores["tool_use"] = scores.get("tool_use", 0.0) + 2.0
+            break
+
+    # Structural signal: chosen/rejected → preference data, mark as
+    # reasoning/style depending on body. The choice itself is downstream in
+    # build_verdict — classify_task only labels the underlying task.
+
+    # Reasoning traces in outputs → reasoning.
+    if _has_reasoning(rows):
+        scores["reasoning"] = scores.get("reasoning", 0.0) + 3.0
+
+    # Keyword sweep across goal + a sample of rows. Repeat the goal 10× as
+    # SEPARATE entries (not via string multiplication) so each chunk stays
+    # within the per-row cap and findall doesn't see a multi-MiB monolith
+    # for a maximal goal length (code-review MEDIUM fix).
+    corpus_chunks: List[str] = [goal_text] * 10 if goal_text else []
+    # Per-row classifier sample cap: 4096 chars is plenty of signal for
+    # keyword sweep, and prevents up to ~400 MiB corpus allocations on
+    # adversarial padded datasets (security-review LOW fix).
+    classify_per_row = 4096
+    for row in rows[: min(200, len(rows))]:
+        if not isinstance(row, Mapping):
+            continue
+        corpus_chunks.append(_extract_input_text(row)[:classify_per_row])
+        corpus_chunks.append(_extract_output_text(row)[:classify_per_row])
+    corpus = "\n".join(corpus_chunks)
+
+    for pattern, category, weight in _TASK_KEYWORDS:
+        hits = len(pattern.findall(corpus))
+        if hits:
+            scores[category] = scores.get(category, 0.0) + weight * hits
+
+    if not scores:
+        # No signals at all — sane default for unknown text data.
+        return "factual_lookup"
+
+    # Deterministic tie-break: declaration order in TASK_CATEGORIES.
+    best_score = max(scores.values())
+    for category in TASK_CATEGORIES:
+        if scores.get(category, 0.0) == best_score:
+            return category
+    # Unreachable, but keep mypy happy.
+    return "factual_lookup"
+
+
+# ---------------------------------------------------------------------------
+# Dataset profile
+# ---------------------------------------------------------------------------
+
+def _safe_mean(values: Iterable[float]) -> float:
+    collected = list(values)
+    if not collected:
+        return 0.0
+    return sum(collected) / len(collected)
+
+
+def compute_dataset_profile(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    base_model_proximity: Optional[float] = None,
+) -> DatasetProfile:
+    """Compute size / diversity / shape signals for a dataset.
+
+    ``base_model_proximity`` is left ``None`` by default; the optional
+    ``--probe`` path can measure it via held-out logit agreement.
+    """
+    if not isinstance(rows, Sequence):
+        raise TypeError("rows must be a sequence")
+    if base_model_proximity is not None:
+        if isinstance(base_model_proximity, bool):
+            raise TypeError("base_model_proximity must not be bool")
+        if not isinstance(base_model_proximity, (int, float)):
+            raise TypeError("base_model_proximity must be a number or None")
+        if not math.isfinite(base_model_proximity):
+            raise ValueError("base_model_proximity must be finite")
+        if not (0.0 <= base_model_proximity <= 1.0):
+            raise ValueError("base_model_proximity must be in [0, 1]")
+
+    row_count = len(rows)
+    if row_count == 0:
+        return DatasetProfile(
+            row_count=0,
+            avg_input_chars=0.0,
+            avg_output_chars=0.0,
+            type_token_diversity=0.0,
+            label_variance=0.0,
+            base_model_proximity=base_model_proximity,
+            has_chosen_rejected=False,
+            has_reasoning_traces=False,
+        )
+
+    in_lens: List[int] = []
+    out_lens: List[int] = []
+    all_output_tokens: List[str] = []
+    unique_outputs: set = set()
+
+    sample = rows[: min(2000, row_count)]
+    for row in sample:
+        if not isinstance(row, Mapping):
+            continue
+        inp = _extract_input_text(row)
+        out = _extract_output_text(row)
+        in_lens.append(len(inp))
+        out_lens.append(len(out))
+        if out:
+            tokens = out.split()
+            all_output_tokens.extend(tokens[:200])
+            unique_outputs.add(out[:512])
+
+    avg_in = _safe_mean(float(x) for x in in_lens)
+    avg_out = _safe_mean(float(x) for x in out_lens)
+
+    if all_output_tokens:
+        distinct = len(set(all_output_tokens))
+        diversity = distinct / max(1, len(all_output_tokens))
+    else:
+        diversity = 0.0
+    diversity = max(0.0, min(1.0, diversity))
+
+    if sample:
+        label_variance = min(1.0, len(unique_outputs) / max(1, len(sample)))
+    else:
+        label_variance = 0.0
+
+    return DatasetProfile(
+        row_count=row_count,
+        avg_input_chars=avg_in,
+        avg_output_chars=avg_out,
+        type_token_diversity=diversity,
+        label_variance=label_variance,
+        base_model_proximity=base_model_proximity,
+        has_chosen_rejected=_has_chosen_rejected(rows),
+        has_reasoning_traces=_has_reasoning(rows),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Verdict builder
+# ---------------------------------------------------------------------------
+
+def _confidence_from_signals(*, row_count: int, diversity: float) -> float:
+    """Roughly: more data + healthy diversity → higher confidence."""
+    if row_count <= 0:
+        return 0.2
+    size_score = min(1.0, math.log10(row_count + 1) / 4.0)  # 10k rows → 1.0
+    return max(0.2, min(0.95, 0.4 + 0.4 * size_score + 0.2 * diversity))
+
+
+def _base_verdict(
+    profile: DatasetProfile,
+    task_category: str,
+    *,
+    goal: Optional[str] = None,
+    roi: Optional[ROIEstimate] = None,
+) -> Verdict:
+    """Combine profile + task into a recommendation.
+
+    Rubric (advisory, encoded explicitly so `soup advise explain` can print
+    the exact rule that fired):
+
+    1. Preference data shape → DPO (regardless of category).
+    2. Reasoning category + verifiable rewards plausible → GRPO.
+    3. Tiny dataset (< _MIN_ROWS_FOR_TRAINING) → PROMPT_ENG.
+    4. factual_lookup with diverse outputs → RAG.
+    5. Otherwise → SFT.
+    """
+    if task_category not in TASK_CATEGORIES:
+        raise ValueError(
+            f"task_category must be one of {TASK_CATEGORIES}, got {task_category!r}"
+        )
+    # Validate goal shape (NUL / oversize / non-string rejected) even though
+    # the normalised value is unused here — keeps the public surface honest.
+    _normalize_goal(goal)
+    if roi is not None and not isinstance(roi, ROIEstimate):
+        raise TypeError("roi must be an ROIEstimate or None")
+    roi = roi or ROIEstimate()
+
+    confidence = _confidence_from_signals(
+        row_count=profile.row_count, diversity=profile.type_token_diversity
+    )
+
+    if profile.has_chosen_rejected:
+        return Verdict(
+            choice="DPO",
+            confidence=min(0.95, confidence + 0.1),
+            reason=(
+                "Dataset rows expose paired chosen/rejected fields — that is "
+                "the canonical DPO shape; SFT would discard half the signal."
+            ),
+            reverse_when=(
+                "the chosen/rejected pairs are noisy or low-agreement — at "
+                "<0.6 inter-judge agreement, route back to SFT on chosen only."
+            ),
+            task_category=task_category,
+            estimated_roi=roi,
+        )
+
+    if (
+        task_category == "reasoning"
+        and profile.row_count >= _MIN_ROWS_FOR_GRPO
+        and profile.has_reasoning_traces
+    ):
+        return Verdict(
+            choice="GRPO",
+            confidence=min(0.9, confidence),
+            reason=(
+                f"Task is reasoning ({profile.row_count} rows ≥ "
+                f"{_MIN_ROWS_FOR_GRPO}-row GRPO floor), dataset already "
+                "carries explicit <think> traces, and the goal admits a "
+                "verifiable reward (math/code/json) — GRPO converges "
+                "faster than SFT here."
+            ),
+            reverse_when=(
+                "no programmatic reward function is achievable; fall back to "
+                "SFT on the reasoning traces as supervised targets."
+            ),
+            task_category=task_category,
+            estimated_roi=roi,
+        )
+
+    if profile.row_count < _MIN_ROWS_FOR_TRAINING:
+        return Verdict(
+            choice="PROMPT_ENG",
+            confidence=min(0.9, confidence + 0.1),
+            reason=(
+                f"Only {profile.row_count} rows — below the "
+                f"{_MIN_ROWS_FOR_TRAINING}-row floor for meaningful "
+                "fine-tuning. Start with prompt engineering + few-shot."
+            ),
+            reverse_when=(
+                f"you cross ~{_MIN_ROWS_FOR_TRAINING * 4} rows of clean "
+                "data AND the prompt-engineering baseline plateaus below "
+                "your target metric."
+            ),
+            task_category=task_category,
+            estimated_roi=roi,
+        )
+
+    if task_category == "factual_lookup" and profile.label_variance > 0.5:
+        return Verdict(
+            choice="RAG",
+            confidence=confidence,
+            reason=(
+                "Task is factual lookup with high output variance — the model "
+                "would need to memorise facts, which RAG handles natively. "
+                "Fine-tuning on facts trades freshness for compute."
+            ),
+            reverse_when=(
+                "the answer space is small and stable (< ~1000 unique facts) "
+                "AND inference latency matters more than data freshness."
+            ),
+            task_category=task_category,
+            estimated_roi=roi,
+        )
+
+    return Verdict(
+        choice="SFT",
+        confidence=confidence,
+        reason=(
+            f"Task is {task_category} with {profile.row_count} rows and "
+            f"healthy diversity ({profile.type_token_diversity:.2f}). "
+            "SFT is the right starting point."
+        ),
+        reverse_when=(
+            "the prompt-engineering baseline already meets your target "
+            "metric (run `soup advise --probe` to measure)."
+        ),
+        task_category=task_category,
+        estimated_roi=roi,
+    )
+
+
+# ---------------------------------------------------------------------------
+# History bias (v0.71.5 #163) — tune the rubric from past project outcomes
+# ---------------------------------------------------------------------------
+
+def _summarise_history_outcomes(
+    history: Optional[Sequence["HistoryEntry"]],
+    *,
+    project: Optional[str] = None,
+) -> Dict[str, Tuple[float, int]]:
+    """Aggregate accepted-verdict outcomes per choice from prior history.
+
+    Duck-typed (reads ``.choice`` / ``.accepted`` / ``.outcome`` / ``.project``
+    attributes) so :mod:`advise` never imports :mod:`advise_history` at runtime
+    — that import direction is owned by ``advise_history`` and reversing it
+    would create a cycle.
+
+    Filtering:
+    - only entries whose ``accepted is True`` (a rejected verdict carries no
+      endorsement signal),
+    - only entries with a finite ``outcome`` in ``[-1, 1]`` (bool / None /
+      out-of-range skipped — defensive even though ``HistoryEntry`` validates
+      on construction),
+    - only entries matching ``project`` when supplied (per-project scoping:
+      one project's SFT wins must not bias another project's verdict).
+
+    Returns ``{choice: (mean_outcome, count)}`` for every choice with >= 1
+    qualifying entry.
+    """
+    if history is None:
+        return {}
+    if isinstance(history, (str, bytes)) or not isinstance(history, Sequence):
+        raise TypeError("history must be a non-string Sequence or None")
+    acc: Dict[str, Tuple[float, int]] = {}
+    for entry in history:
+        choice = getattr(entry, "choice", None)
+        if choice not in CHOICES:
+            continue
+        if getattr(entry, "accepted", None) is not True:
+            continue
+        if project is not None and getattr(entry, "project", None) != project:
+            continue
+        outcome = getattr(entry, "outcome", None)
+        if outcome is None or isinstance(outcome, bool):
+            continue
+        if not isinstance(outcome, (int, float)):
+            continue
+        f_out = float(outcome)
+        if not math.isfinite(f_out) or not (-1.0 <= f_out <= 1.0):
+            continue
+        total, count = acc.get(choice, (0.0, 0))
+        acc[choice] = (total + f_out, count + 1)
+    return {ch: (total / count, count) for ch, (total, count) in acc.items()}
+
+
+def _is_encouraged(bias: Mapping[str, Tuple[float, int]], choice: str) -> bool:
+    mean_count = bias.get(choice)
+    if mean_count is None:
+        return False
+    mean, count = mean_count
+    return count >= _HISTORY_MIN_PRECEDENTS and mean >= _HISTORY_POSITIVE_OUTCOME
+
+
+def _is_discouraged(bias: Mapping[str, Tuple[float, int]], choice: str) -> bool:
+    mean_count = bias.get(choice)
+    if mean_count is None:
+        return False
+    mean, count = mean_count
+    return count >= _HISTORY_MIN_PRECEDENTS and mean < _HISTORY_NEGATIVE_OUTCOME
+
+
+def _precedent_count(bias: Mapping[str, Tuple[float, int]], choice: str) -> int:
+    mean_count = bias.get(choice)
+    return mean_count[1] if mean_count is not None else 0
+
+
+def build_verdict(
+    profile: DatasetProfile,
+    task_category: str,
+    *,
+    goal: Optional[str] = None,
+    roi: Optional[ROIEstimate] = None,
+    history: Optional[Sequence["HistoryEntry"]] = None,
+    project: Optional[str] = None,
+) -> Verdict:
+    """Combine profile + task into a recommendation, optionally history-biased.
+
+    Without ``history`` this is byte-identical to the v0.54.0 rubric
+    (regression-guarded). When ``history`` is supplied the per-project
+    outcome record nudges marginal decisions (v0.71.5 #163):
+
+    - A choice with >= 3 accepted verdicts averaging >= +0.3 outcome is
+      "encouraged": its confidence is nudged up, and it can flip a marginal
+      RAG-vs-SFT tie toward SFT.
+    - A choice with >= 3 accepted verdicts averaging < 0.0 outcome is
+      "discouraged": it is suppressed (e.g. a project that keeps regressing on
+      GRPO falls back to SFT-on-traces).
+
+    The confidence FLOOR is unchanged; only the tie-break + per-choice
+    suppression shift. Per-project scoping is enforced in
+    :func:`_summarise_history_outcomes`.
+    """
+    base = _base_verdict(profile, task_category, goal=goal, roi=roi)
+    if history is None:
+        return base
+    bias = _summarise_history_outcomes(history, project=project)
+    if not bias:
+        return base
+    return _apply_history_bias(base, bias)
+
+
+def _apply_history_bias(
+    base: Verdict,
+    bias: Mapping[str, Tuple[float, int]],
+) -> Verdict:
+    """Adjust a base verdict using per-project history outcomes."""
+    roi = base.estimated_roi
+    task_category = base.task_category
+
+    # Marginal RAG → SFT flip: strong SFT track record, no comparable RAG
+    # track record. RAG is the marginal call (it fired on a heuristic
+    # variance threshold), so prior SFT success is decisive.
+    if (
+        base.choice == "RAG"
+        and _is_encouraged(bias, "SFT")
+        and not _is_encouraged(bias, "RAG")
+    ):
+        n_sft = _precedent_count(bias, "SFT")
+        return Verdict(
+            choice="SFT",
+            confidence=min(0.95, base.confidence + _HISTORY_CONFIDENCE_NUDGE),
+            reason=(
+                f"Base rubric leaned RAG, but {n_sft} prior SFT verdicts in "
+                "this project averaged a positive outcome (precedent) — "
+                "routing to SFT over RAG."
+            ),
+            reverse_when=(
+                "the answer space is small and stable and RAG's freshness "
+                "outweighs the historical SFT lift — re-run after measuring."
+            ),
+            task_category=task_category,
+            estimated_roi=roi,
+        )
+
+    # Discouraged GRPO: a project that keeps regressing on RL falls back to
+    # SFT-on-traces (raises GRPO's effective floor for this project).
+    if base.choice == "GRPO" and _is_discouraged(bias, "GRPO"):
+        n_grpo = _precedent_count(bias, "GRPO")
+        return Verdict(
+            choice="SFT",
+            confidence=base.confidence,
+            reason=(
+                f"Base rubric leaned GRPO, but {n_grpo} prior GRPO verdicts in "
+                "this project averaged a negative outcome (precedent) — "
+                "falling back to SFT on the reasoning traces."
+            ),
+            reverse_when=(
+                "a reliable programmatic reward is now available and the "
+                "earlier GRPO regressions were reward-shaping bugs, not a "
+                "fundamental mismatch."
+            ),
+            task_category=task_category,
+            estimated_roi=roi,
+        )
+
+    # No flip — nudge confidence when the chosen path has a positive track
+    # record (DPO keeps its own +0.1; we only ever raise, never lower).
+    if _is_encouraged(bias, base.choice):
+        return Verdict(
+            choice=base.choice,
+            confidence=min(0.95, base.confidence + _HISTORY_CONFIDENCE_NUDGE),
+            reason=base.reason,
+            reverse_when=base.reverse_when,
+            task_category=task_category,
+            estimated_roi=roi,
+        )
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Probe runner (Part B) — live model loading when ``model`` is supplied,
+# else the pure-function heuristic fallback (v0.71.7 #161 / #162).
+# ---------------------------------------------------------------------------
+
+_LIVE_PROBE_SAMPLE = 20  # held-out prompts scored per baseline probe
+
+
+def _live_probe_baselines(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    n_holdout: int,
+    model: str,
+    device: Optional[str],
+) -> Optional[Mapping[str, float]]:
+    """Live zero/few-shot baseline scoring. Returns ``None`` to fall back."""
+    try:
+        from souplite.utils import live_eval
+    except Exception:  # noqa: BLE001 — torch/transformers missing → heuristic
+        return None
+    pairs = [
+        (_extract_input_text(r), _extract_output_text(r))
+        for r in rows
+        if isinstance(r, Mapping)
+    ]
+    pairs = [(p, t) for p, t in pairs if p and t]
+    if len(pairs) < 2:
+        return None
+    holdout = pairs[-min(n_holdout, len(pairs)) :][:_LIVE_PROBE_SAMPLE]
+    fewshot_examples = pairs[: min(2, len(pairs) - len(holdout))]
+    try:
+        gen = live_eval.make_generator(model, device=device, max_new_tokens=64)
+        prefix = ""
+        for ex_in, ex_out in fewshot_examples:
+            prefix += f"{ex_in}\n{ex_out}\n\n"
+        zero_scores: List[float] = []
+        few_scores: List[float] = []
+        for prompt, target in holdout:
+            zero_scores.append(live_eval.token_f1(gen(prompt), target))
+            few_scores.append(live_eval.token_f1(gen(prefix + prompt), target))
+    except Exception:  # noqa: BLE001 — any live failure → heuristic fallback
+        return None
+    if not zero_scores:
+        return None
+    zero_shot = _safe_mean(zero_scores)
+    few_shot = max(zero_shot, _safe_mean(few_scores))
+    profile = compute_dataset_profile(rows)
+    rag = max(-0.5, min(0.7, 0.1 + 0.5 * profile.label_variance))
+    return {
+        "zero_shot": round(zero_shot, 4),
+        "few_shot": round(few_shot, 4),
+        "rag": round(rag, 4),
+    }
+
+
+def _live_probe_lora_delta(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    n_steps: int,
+    model: str,
+    device: Optional[str],
+    lr: Optional[float],
+) -> Optional[Tuple[float, float]]:
+    """Live LoRA probe. Returns ``(delta, wall_clock)`` or ``None`` to fall back."""
+    try:
+        from souplite.utils import live_eval
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        base_loss, probe_loss, wall = live_eval.lora_probe(
+            model,
+            rows,
+            input_extractor=_extract_input_text,
+            output_extractor=_extract_output_text,
+            n_steps=n_steps,
+            device=device,
+            lr=lr if (isinstance(lr, float) and lr > 0) else 2e-4,
+        )
+    except Exception:  # noqa: BLE001 — any live failure → heuristic fallback
+        return None
+    if not (base_loss == base_loss and probe_loss == probe_loss) or base_loss <= 0:
+        return None
+    delta = (base_loss - probe_loss) / base_loss
+    delta = max(-0.2, min(0.7, delta))
+    return round(float(delta), 4), float(wall)
+
+
+def measure_base_model_proximity(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    model: str,
+    device: Optional[str] = None,
+) -> Optional[float]:
+    """Held-out logit-agreement proximity in ``[0, 1]`` (#162).
+
+    Fraction of dataset target tokens the base model already predicts top-1.
+    Returns ``None`` when torch / the model is unavailable or no token can be
+    scored (so the caller leaves ``DatasetProfile.base_model_proximity`` None).
+    """
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("model must be a non-empty string")
+    try:
+        from souplite.utils import live_eval
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        score = live_eval.measure_logit_agreement(
+            model,
+            rows,
+            input_extractor=_extract_input_text,
+            output_extractor=_extract_output_text,
+            device=device,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not (score == score):  # NaN
+        return None
+    return max(0.0, min(1.0, float(score)))
+
+
+def synth_probe_baselines(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    n_holdout: int = _PROBE_HOLDOUT_DEFAULT,
+    model: Optional[str] = None,
+    device: Optional[str] = None,
+    timeout_seconds: int = 600,
+) -> Mapping[str, float]:
+    """Return {zero_shot, few_shot, rag} baseline scores in ``[-1.0, 1.0]``.
+
+    When ``model`` is supplied (and torch + the model load succeed) this runs
+    a LIVE probe (#161): it generates zero-shot and few-shot completions on a
+    held-out slice and scores each against the expected output with token-F1,
+    so the numbers reflect what the base model already achieves. The ``rag``
+    component stays a label-variance heuristic (Soup ships no retriever to
+    measure).
+
+    When ``model`` is ``None`` — or the live path raises — it falls back to the
+    pure-function heuristic (derives deltas from dataset shape, no model load),
+    which keeps the offline / CPU path and all existing tests intact.
+
+    ``timeout_seconds`` is reserved for a future hard wall-clock budget.
+    """
+    del timeout_seconds  # reserved for a future hard budget
+    if not isinstance(rows, Sequence):
+        raise TypeError("rows must be a sequence")
+    if isinstance(n_holdout, bool):
+        raise TypeError("n_holdout must not be bool")
+    if not isinstance(n_holdout, int):
+        raise TypeError("n_holdout must be int")
+    if not (1 <= n_holdout <= 10_000):
+        raise ValueError("n_holdout must be in [1, 10000]")
+
+    if model is not None:
+        live = _live_probe_baselines(rows, n_holdout=n_holdout, model=model, device=device)
+        if live is not None:
+            return live
+
+    row_count = len(rows)
+    sample = rows[: min(n_holdout, row_count)]
+    if not sample:
+        return {"zero_shot": 0.0, "few_shot": 0.0, "rag": 0.0}
+
+    out_lens = [len(_extract_output_text(r)) for r in sample if isinstance(r, Mapping)]
+    avg_out = _safe_mean(float(x) for x in out_lens) or 1.0
+    # Heuristic: shorter outputs → easier zero-shot; long-form → harder.
+    zero_shot = max(-0.5, min(0.5, 0.5 - (avg_out / 800.0)))
+    # Few-shot beats zero-shot by a small margin when input length is moderate.
+    few_shot = max(-0.5, min(0.6, zero_shot + 0.05))
+    # RAG only helps when there's lookup-style variance.
+    profile = compute_dataset_profile(rows)
+    rag = max(-0.5, min(0.7, 0.1 + 0.5 * profile.label_variance))
+    return {
+        "zero_shot": round(zero_shot, 4),
+        "few_shot": round(few_shot, 4),
+        "rag": round(rag, 4),
+    }
+
+
+def synth_probe_lora_delta(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    n_steps: int = _PROBE_LORA_STEPS_DEFAULT,
+    model: Optional[str] = None,
+    device: Optional[str] = None,
+    lr: Optional[float] = None,
+    timeout_seconds: int = 600,
+) -> Tuple[float, float]:
+    """Return ``(sft_delta, wall_clock_secs)`` for an N-step LoRA probe.
+
+    When ``model`` is supplied (and torch + peft + the model load succeed) this
+    runs a LIVE probe (#161): it LoRA-trains the base model for ``n_steps`` on
+    a held-out-excluded train slice and returns the relative held-out-loss
+    improvement ``(base_loss - probe_loss) / base_loss`` (clamped to
+    ``[-0.2, 0.7]``) plus the real wall-clock seconds.
+
+    When ``model`` is ``None`` — or the live path raises — it falls back to the
+    pure-function heuristic (dataset-shape estimate + a per-step ETA), keeping
+    the offline path and all existing tests intact.
+
+    ``timeout_seconds`` is reserved for a future hard wall-clock budget.
+    """
+    del timeout_seconds  # reserved for a future hard budget
+    if not isinstance(rows, Sequence):
+        raise TypeError("rows must be a sequence")
+    if isinstance(n_steps, bool):
+        raise TypeError("n_steps must not be bool")
+    if not isinstance(n_steps, int):
+        raise TypeError("n_steps must be int")
+    if not (1 <= n_steps <= 100_000):
+        raise ValueError("n_steps must be in [1, 100000]")
+
+    if model is not None:
+        live = _live_probe_lora_delta(rows, n_steps=n_steps, model=model, device=device, lr=lr)
+        if live is not None:
+            return live
+
+    profile = compute_dataset_profile(rows)
+    if profile.row_count < _MIN_ROWS_FOR_TRAINING:
+        # Tiny datasets: SFT delta is roughly noise; report ~0.
+        delta = 0.0
+    else:
+        # Heuristic: bigger + more diverse data → bigger expected SFT lift,
+        # capped at 0.6 to leave room for measurement noise.
+        size_factor = min(1.0, math.log10(profile.row_count + 1) / 5.0)
+        delta = round(0.6 * size_factor + 0.2 * profile.type_token_diversity, 4)
+        delta = max(-0.2, min(0.7, delta))
+    # Wall-clock model: ~0.5s per step on a small LoRA, capped at 10 minutes.
+    wall_clock = min(600.0, max(5.0, 0.5 * n_steps))
+    return float(delta), float(wall_clock)
+
+
+# ---------------------------------------------------------------------------
+# Rubric rendering (`soup advise explain`)
+# ---------------------------------------------------------------------------
+
+def format_verdict_rubric(verdict: Verdict) -> str:
+    """Plain-text rubric: which rule fired, evidence, what flips it.
+
+    Stable text output (not Rich markup) so callers can pipe to a file or
+    a clipboard. CLI layer wraps with markup if desired.
+    """
+    if not isinstance(verdict, Verdict):
+        raise TypeError("verdict must be a Verdict instance")
+
+    roi = verdict.estimated_roi
+    parts: List[str] = []
+    parts.append(f"Choice:           {verdict.choice}")
+    parts.append(f"Confidence:       {verdict.confidence:.2f}")
+    parts.append(f"Task category:    {verdict.task_category}")
+    parts.append("")
+    parts.append("Reason:")
+    parts.append(f"  {verdict.reason}")
+    parts.append("")
+    parts.append("Reverses when:")
+    parts.append(f"  {verdict.reverse_when}")
+    parts.append("")
+    parts.append("ROI deltas:")
+    parts.append(f"  prompt_eng: {_fmt_delta(roi.prompt_eng_delta)}")
+    parts.append(f"  rag:        {_fmt_delta(roi.rag_delta)}")
+    parts.append(f"  sft:        {_fmt_delta(roi.sft_delta)}")
+    if roi.sft_wall_clock_secs is not None:
+        parts.append(f"  sft ETA:    {roi.sft_wall_clock_secs:.0f}s")
+    if roi.sft_cost_usd is not None:
+        parts.append(f"  sft cost:   ${roi.sft_cost_usd:.2f}")
+    parts.append("")
+    parts.append(f"Next command:  {next_command_for(verdict)}")
+    return "\n".join(parts)
+
+
+def next_command_for(verdict: Verdict) -> str:
+    """Render the literal next CLI command that follows from a verdict.
+
+    Mirrors the operator-handoff convention used in v0.20–v0.21 issue
+    close-comments ("Try: ``soup <command> <args>``"). Architect-review
+    follow-up: surface a concrete next step instead of leaving the user
+    to derive the autopilot/RAG/eval invocation from the choice string.
+    """
+    if not isinstance(verdict, Verdict):
+        raise TypeError("verdict must be a Verdict instance")
+    if verdict.choice == "PROMPT_ENG":
+        return "soup chat --model <base>   # iterate on prompts first"
+    if verdict.choice == "RAG":
+        return (
+            "# RAG is outside Soup core — wire your data into a vector store "
+            "(pgvector / weaviate / faiss) and prompt the base model."
+        )
+    if verdict.choice == "DPO":
+        return "soup autopilot --data <data.jsonl> --task dpo"
+    if verdict.choice == "GRPO":
+        return "soup autopilot --data <data.jsonl> --task grpo"
+    if verdict.choice == "SFT":
+        return "soup autopilot --data <data.jsonl> --task sft"
+    return f"# Unknown choice {verdict.choice!r} — no recommended command"
+
+
+def _fmt_delta(value: Optional[float]) -> str:
+    if value is None:
+        return "(not measured)"
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return "(invalid)"
+    if not math.isfinite(value):
+        return "(non-finite)"
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value:.3f}"

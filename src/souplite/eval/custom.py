@@ -1,0 +1,376 @@
+"""Custom eval task runner — load JSONL eval sets, score model outputs."""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+from souplite.utils.safe_regex import check_config_regex
+
+MAX_EVAL_TASKS = 10_000
+MAX_REGEX_PATTERN_LEN = 1_000
+MAX_REGEX_INPUT_LEN = 50_000
+TASK_NAME = "custom"
+
+VALID_SCORING = {
+    "exact", "contains", "regex", "semantic",
+    "tool_call_match", "tool_call_name_match", "tool_call_args_subset",
+}
+
+
+@dataclass
+class EvalTask:
+    """A single evaluation task loaded from JSONL."""
+
+    prompt: str
+    expected: str = ""
+    category: str = "default"
+    scoring: str = "exact"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EvalResult:
+    """Result of evaluating a single task."""
+
+    task: EvalTask
+    output: str
+    score: float
+    matched: bool
+
+
+@dataclass
+class EvalResults:
+    """Aggregated results from a full eval run."""
+
+    results: list[EvalResult]
+    total: int = 0
+    correct: int = 0
+    accuracy: float = 0.0
+    category_scores: dict[str, dict[str, float]] = field(default_factory=dict)
+
+    def compute(self) -> None:
+        """Compute aggregate scores from individual results."""
+        self.total = len(self.results)
+        self.correct = sum(1 for r in self.results if r.matched)
+        self.accuracy = self.correct / self.total if self.total > 0 else 0.0
+
+        # Per-category breakdown
+        cats: dict[str, list[EvalResult]] = {}
+        for result in self.results:
+            cat = result.task.category
+            cats.setdefault(cat, []).append(result)
+
+        self.category_scores = {}
+        for cat, cat_results in sorted(cats.items()):
+            cat_correct = sum(1 for r in cat_results if r.matched)
+            cat_total = len(cat_results)
+            self.category_scores[cat] = {
+                "total": cat_total,
+                "correct": cat_correct,
+                "accuracy": cat_correct / cat_total if cat_total > 0 else 0.0,
+            }
+
+
+def load_eval_tasks(path: "Path | str") -> list[EvalTask]:
+    """Load eval tasks from a JSONL file with schema validation.
+
+    Each line must be a JSON object with at least a 'prompt' field.
+    Optional: 'expected', 'category', 'scoring'.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Eval tasks file not found: {path}")
+
+    if not path.suffix.lower() == ".jsonl":
+        raise ValueError(f"Expected .jsonl file, got: {path.suffix}")
+
+    tasks: list[EvalTask] = []
+    with open(path, encoding="utf-8") as fh:
+        for line_num, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+
+            if len(tasks) >= MAX_EVAL_TASKS:
+                raise ValueError(
+                    f"Eval file exceeds maximum of {MAX_EVAL_TASKS} tasks "
+                    f"(stopped at line {line_num})"
+                )
+
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSON on line {line_num}: {exc}"
+                ) from exc
+
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"Line {line_num}: expected JSON object, got {type(row).__name__}"
+                )
+
+            if "prompt" not in row:
+                raise ValueError(
+                    f"Line {line_num}: missing required field 'prompt'"
+                )
+
+            scoring = row.get("scoring", "exact")
+            if scoring not in VALID_SCORING:
+                raise ValueError(
+                    f"Line {line_num}: invalid scoring '{scoring}', "
+                    f"must be one of: {', '.join(sorted(VALID_SCORING))}"
+                )
+
+            tasks.append(EvalTask(
+                prompt=str(row["prompt"]),
+                expected=str(row.get("expected", "")),
+                category=str(row.get("category", "default")),
+                scoring=scoring,
+                metadata={
+                    k: v for k, v in row.items()
+                    if k not in ("prompt", "expected", "category", "scoring")
+                },
+            ))
+
+    if not tasks:
+        raise ValueError(f"No eval tasks found in {path}")
+
+    return tasks
+
+
+def score_exact(output: str, expected: str) -> bool:
+    """Exact string match (case-insensitive, stripped)."""
+    return output.strip().lower() == expected.strip().lower()
+
+
+def score_contains(output: str, expected: str) -> bool:
+    """Check if expected string is contained in output (case-insensitive)."""
+    return expected.strip().lower() in output.strip().lower()
+
+
+def score_regex(output: str, expected: str) -> bool:
+    """Check if output matches expected regex pattern.
+
+    Guards against ReDoS: caps pattern and input length and rejects
+    structurally unsafe patterns before matching.
+    """
+    if len(expected) > MAX_REGEX_PATTERN_LEN:
+        return False
+    truncated_output = output[:MAX_REGEX_INPUT_LEN]
+    try:
+        check_config_regex(expected, "eval.custom.expected")
+        return bool(re.search(expected, truncated_output, re.IGNORECASE))
+    except re.error:
+        return False
+
+
+def score_semantic(output: str, expected: str) -> float:
+    """Compute similarity via Jaccard token overlap (bag-of-words).
+
+    This is a lexical metric, not embedding-based semantic similarity.
+    Returns a float 0-1. Considered a match if similarity >= 0.5.
+    """
+    out_tokens = set(output.strip().lower().split())
+    exp_tokens = set(expected.strip().lower().split())
+    if not out_tokens or not exp_tokens:
+        return 0.0
+    intersection = out_tokens & exp_tokens
+    union = out_tokens | exp_tokens
+    return len(intersection) / len(union)
+
+
+def _parse_tool_call(text: str) -> Optional[dict]:
+    """Parse a tool-call JSON blob. Returns None on any failure."""
+    if not isinstance(text, str):
+        return None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _extract_function(call: dict) -> Optional[dict]:
+    func = call.get("function")
+    if not isinstance(func, dict):
+        return None
+    return func
+
+
+def _parse_args(func: dict) -> Optional[dict]:
+    args = func.get("arguments")
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def tool_call_match(output: str, expected: str) -> bool:
+    """Exact tool-call match: function name and arguments must match."""
+    out = _parse_tool_call(output)
+    exp = _parse_tool_call(expected)
+    if out is None or exp is None:
+        return False
+    out_func = _extract_function(out)
+    exp_func = _extract_function(exp)
+    if out_func is None or exp_func is None:
+        return False
+    if out_func.get("name") != exp_func.get("name"):
+        return False
+    out_args = _parse_args(out_func)
+    exp_args = _parse_args(exp_func)
+    if out_args is None or exp_args is None:
+        return False
+    return out_args == exp_args
+
+
+def tool_call_name_match(output: str, expected: str) -> bool:
+    """Function-name-only match (ignores arguments)."""
+    out = _parse_tool_call(output)
+    exp = _parse_tool_call(expected)
+    if out is None or exp is None:
+        return False
+    out_func = _extract_function(out)
+    exp_func = _extract_function(exp)
+    if out_func is None or exp_func is None:
+        return False
+    name_out = out_func.get("name")
+    name_exp = exp_func.get("name")
+    return isinstance(name_out, str) and name_out == name_exp
+
+
+def tool_call_args_subset(output: str, expected: str) -> float:
+    """Partial-credit score for tool-call arguments (subset matching).
+
+    Returns 0.0–1.0:
+    - 0.5 weight for function-name match
+    - 0.5 weight for fraction of expected args present (with matching values)
+    """
+    out = _parse_tool_call(output)
+    exp = _parse_tool_call(expected)
+    if out is None or exp is None:
+        return 0.0
+    out_func = _extract_function(out)
+    exp_func = _extract_function(exp)
+    if out_func is None or exp_func is None:
+        return 0.0
+
+    name_score = 0.5 if out_func.get("name") == exp_func.get("name") else 0.0
+
+    out_args = _parse_args(out_func) or {}
+    exp_args = _parse_args(exp_func) or {}
+
+    if not exp_args:
+        # No args expected: full credit only if the model also produced none.
+        # Hallucinated args must NOT score full (the old `0.5 if ... else 0.5`
+        # dead ternary gave them full credit).
+        args_score = 0.5 if not out_args else 0.0
+    else:
+        matched = sum(
+            1 for k, v in exp_args.items() if k in out_args and out_args[k] == v
+        )
+        args_score = 0.5 * (matched / len(exp_args))
+
+    return name_score + args_score
+
+
+SCORING_FUNCTIONS = {
+    "exact": score_exact,
+    "contains": score_contains,
+    "regex": score_regex,
+    "tool_call_match": tool_call_match,
+    "tool_call_name_match": tool_call_name_match,
+}
+
+
+def score_task(task: EvalTask, output: str) -> EvalResult:
+    """Score a single task output against the expected answer."""
+    if task.scoring == "semantic":
+        similarity = score_semantic(output, task.expected)
+        matched = similarity >= 0.5
+        return EvalResult(
+            task=task, output=output, score=similarity, matched=matched,
+        )
+
+    if task.scoring == "tool_call_args_subset":
+        similarity = tool_call_args_subset(output, task.expected)
+        matched = similarity >= 0.5
+        return EvalResult(
+            task=task, output=output, score=similarity, matched=matched,
+        )
+
+    scorer = SCORING_FUNCTIONS.get(task.scoring, score_exact)
+    matched = scorer(output, task.expected)
+    return EvalResult(
+        task=task, output=output, score=1.0 if matched else 0.0, matched=matched,
+    )
+
+
+def run_eval(
+    model_path: str,
+    tasks: list[EvalTask],
+    generate_fn: Optional[object] = None,
+) -> EvalResults:
+    """Run evaluation on a list of tasks using a model.
+
+    Args:
+        model_path: Path to model directory.
+        tasks: List of EvalTask objects.
+        generate_fn: Optional callable(prompt: str) -> str. If None, uses
+            a default pipeline from transformers.
+
+    Returns:
+        EvalResults with per-task scores and aggregates.
+    """
+    if generate_fn is None:
+        generate_fn = _create_default_generator(model_path)
+
+    results: list[EvalResult] = []
+    for task in tasks:
+        output = generate_fn(task.prompt)
+        result = score_task(task, output)
+        results.append(result)
+
+    eval_results = EvalResults(results=results)
+    eval_results.compute()
+    return eval_results
+
+
+def _create_default_generator(model_path: str):
+    """Create a default text generation function using transformers pipeline."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from transformers import pipeline
+
+    console = Console()
+    console.print(Panel(
+        f"[yellow]Loading model from: {model_path}[/]\n"
+        "This will execute model code from the specified path.",
+        title="Model Loading",
+        border_style="yellow",
+    ))
+
+    pipe = pipeline(
+        "text-generation",
+        model=model_path,
+        max_new_tokens=512,
+        do_sample=False,
+    )
+
+    def generate(prompt: str) -> str:
+        out = pipe(prompt, return_full_text=False)
+        return out[0]["generated_text"] if out else ""
+
+    return generate

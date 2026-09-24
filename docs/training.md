@@ -1,0 +1,1791 @@
+# Training Tasks & Methods
+
+[← Back to the Soup README](../README.md)
+
+> SFT, DPO/GRPO/PPO/KTO/ORPO/SimPO/IPO/BCO, tool-calling, PRM, pre-training, distillation, classification, vision/audio/TTS, unlearning, RAFT/RA-DIT, and the loop-hardening detectors.
+
+> **Training a model bigger than your GPU?** `training.stream_layers: true` streams the
+> frozen base from CPU RAM (with NVMe disk overflow) one decoder layer at a time, so peak
+> VRAM is bounded by one layer instead of the whole model. Add `quantization: 4bit` and an
+> 8B base fits a 4 GB card. Works for `sft` and, from v0.72.4, for `dpo` / `orpo` /
+> `simpo` / `kto` — DPO's reference model is the same streamed base with its adapters
+> switched off, so it costs no extra weights — see
+> [Layer Streaming](performance-and-quantization.md#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723-preference-losses-v0724).
+
+**Contents:**
+
+- [Which tasks apply `training.quantization`](#which-tasks-apply-trainingquantization)
+- [Continual-learning rehearsal (`--replay`)](#continual-learning-rehearsal---replay)
+- [Loop Hardening](#loop-hardening)
+- [Unlearning (`task='unlearn'`, NPO / SimNPO / RMU)](#unlearning-taskunlearn-npo--simnpo--rmu)
+- [Continued Pre-training](#continued-pre-training)
+- [Knowledge Distillation](#knowledge-distillation)
+- [Sequence Classification](#sequence-classification)
+- [Reasoning Effort + EOT Control](#reasoning-effort--eot-control)
+- [EBFT / GDPO Loss Variants](#ebft--gdpo-loss-variants)
+- [GRPO Objective Variants](#grpo-objective-variants)
+- [Process Reward Model (PRM)](#process-reward-model-prm)
+- [PRM-guided GRPO (process-supervised RL)](#prm-guided-grpo-process-supervised-rl)
+- [Weighted Multi-Objective Preference Loss](#weighted-multi-objective-preference-loss)
+- [MoE Model Support](#moe-model-support)
+- [Vision / Multimodal Fine-tuning](#vision--multimodal-fine-tuning)
+- [Audio / Speech Fine-tuning](#audio--speech-fine-tuning)
+- [GRPO Plus — Objective Variants, Long-Context RL, Multi-Turn Agents](#grpo-plus--objective-variants-long-context-rl-multi-turn-agents)
+- [DPO Training](#dpo-training)
+- [Preference Variety — BCO + Unified Dispatcher + KL Variants](#preference-variety--bco--unified-dispatcher--kl-variants)
+- [GRPO Training (Reasoning)](#grpo-training-reasoning)
+- [Tool-Calling Fine-Tuning](#tool-calling-fine-tuning)
+- [PPO / Full RLHF Pipeline](#ppo--full-rlhf-pipeline)
+- [KTO Training (Unpaired Preferences)](#kto-training-unpaired-preferences)
+- [ORPO Training (No Reference Model)](#orpo-training-no-reference-model)
+- [SimPO Training (Simple Preference)](#simpo-training-simple-preference)
+- [IPO Training (Regularized Preference)](#ipo-training-regularized-preference)
+- [RAFT — Retrieval-Augmented Fine-Tuning](#raft--retrieval-augmented-fine-tuning)
+- [RA-DIT — Retrieval-Augmented Dual Instruction Tuning](#ra-dit--retrieval-augmented-dual-instruction-tuning)
+- [Curriculum-Aware Training (BETA)](#curriculum-aware-training-beta)
+- [TTS Fine-Tuning (BETA, v0.52.0)](#tts-fine-tuning-beta-v0520)
+- [Classifier / Reranker / Cross-Encoder Training (BETA, v0.52.0)](#classifier--reranker--cross-encoder-training-beta-v0520)
+- [Knowledge Distillation (BETA, v0.52.0)](#knowledge-distillation-beta-v0520)
+- [EBFT + GDPO (BETA, v0.52.0)](#ebft--gdpo-beta-v0520)
+- [gpt-oss `reasoning_effort` + `train_on_eot` (v0.52.0)](#gpt-oss-reasoning_effort--train_on_eot-v0520)
+- [Seeds & reproducibility (`training.seed`)](#seeds--reproducibility-trainingseed)
+- [Rewind — which row spiked the loss (`soup rewind`)](#rewind--which-row-spiked-the-loss-soup-rewind)
+- [Full fine-tuning (`lora.r: 0`)](#full-fine-tuning-lorar-0)
+
+---
+
+## Seeds & reproducibility (`training.seed`)
+
+Two knobs, both unset by default:
+
+```yaml
+training:
+  seed: 1234        # weight init of new params, data order, dropout
+  data_seed: 99     # optional — data order ONLY, so init stays fixed
+```
+
+`seed` reaches `TrainingArguments.seed` (which `Trainer.__init__` hands to
+`transformers.set_seed`, covering `random`, `numpy` and `torch`) and the
+multipack FFD sampler. `data_seed` reaches `TrainingArguments.data_seed`; set it
+alongside `seed` to vary only the order rows are seen in while holding
+initialisation fixed.
+
+**Why you want this.** Without a seed knob every run of a config took the same
+default, so "run it again with a different seed" was impossible: replicates of
+one arm differed only by row permutation and GPU nondeterminism. That understates
+run-to-run spread, and spread is the yardstick a real between-arm difference has
+to beat. Three replicates at three seeds is the cheapest honest error bar you can
+put on a training change. Create one config per replicate so the seed and its
+output directory stay together in the recorded recipe:
+
+```yaml
+# soup-seed-1.yaml (repeat for seeds 2 and 3)
+training:
+  seed: 1
+output: runs/seed-1
+```
+
+```bash
+for s in 1 2 3; do
+  soup train --config "soup-seed-$s.yaml" && echo "seed $s done"
+done
+```
+
+**"Unset" does not mean the same thing for both fields.** An unset `seed`
+resolves to 42, HuggingFace's own `TrainingArguments` default. An unset
+`data_seed` stays `None`, which HF reads as "follow `seed`" rather than as a
+seed of its own, so leaving it out is not the same kind of default as leaving
+`seed` out. The multipack sampler still gets `0`, the value it has had since
+v0.37.0. The fields are `Optional[int]` rather than defaulting to 42 precisely
+so the trainer can tell "unset" from "explicitly 42" and keep those different
+historical defaults intact.
+
+**What changes for a run that sets neither field.** The values it trains at are
+the same as before: seed 42, `data_seed` at `None`. What is new is *when* the
+seed arrives. Before #353 nothing called `set_seed` ahead of `get_peft_model`,
+so `lora_A` and any freshly initialised classification head were drawn from
+torch's default generator, which is seeded from entropy once per process. An
+unseeded run's initialisation therefore varied from one process to the next, and
+it is now deterministic at 42. If you were getting replicate spread out of runs
+that set no seed, that is where it was coming from: those runs are identical to
+each other now, and varying a replicate means setting `training.seed` on
+purpose.
+
+Bounds: `[0, 2**32 - 1]` (`set_seed` feeds `numpy.random.seed`, which rejects
+anything outside that range), `0` is a legitimate seed, and a YAML `true` is
+rejected rather than silently becoming seed 1. `data_seed` is forwarded to
+Accelerate's dataloader configuration and needs `accelerate >= 1.1.0`;
+below that, transformers warns and ignores it (`seed` is unaffected).
+
+**Scope.** Every task wrapper threads both fields into the `TrainingArguments`
+subclass it builds, and applies `seed` before it loads the model, so the LoRA
+adapter and any freshly initialised head are drawn at the configured seed rather
+than at whatever the process happened to be sitting on (#353). `unlearn` builds
+no `Trainer` at all, and its RMU control vector follows `training.seed` too,
+staying at 0 when the seed is unset. The `pretrain` and layer-streaming paths
+pick `seed` up for their samplers as well.
+
+Through v0.73.0 this reached the **SFT** trainer only, so `training.seed: 7` on
+a DPO or GRPO run was accepted and silently trained at 42.
+
+The one path that still ignores both fields is the **MLX backend**
+(`backend: mlx`), whose trainers seed nothing at all — MLX has its own RNG
+(`mx.random`). Setting either field there now prints a warning naming it
+(`MLX backend ignores: training.seed ...`) rather than accepting it in silence,
+so an MLX run cannot look seeded while it is not.
+
+**Not a determinism guarantee.** A fixed seed makes the *software* RNG
+reproducible. It does not make CUDA kernels bit-reproducible — non-deterministic
+atomics, autotuned algorithms and a different GPU or library version can still
+move the last digits. For bit-exact reruns you also need
+`torch.use_deterministic_algorithms(True)`, which Soup does not set for you.
+
+---
+
+## Rewind — which row spiked the loss (`soup rewind`)
+
+While an SFT run trains, Soup writes `<output>/rewind.jsonl`: one line per micro-batch
+with the dataset rows in it, each row's mean supervised-token loss, and its
+supervised-token count. When the loss jumps, `soup rewind` reads that file and names
+the rows that carried the step. It needs no model or GPU, and runs in seconds.
+
+```yaml
+training:
+  rewind_log: true   # default; set false to write nothing
+```
+
+```bash
+soup rewind                      # most recent run: list spikes, detail the worst
+soup rewind <run_id> --step 340  # rank the rows of one step
+soup rewind <run_id> --top 25    # how many rows to list (default 10)
+soup rewind <run_id> --json r.json --no-preview
+```
+
+A spike is a step whose loss is non-finite, or more than 2x the median of the previous
+20 measured steps. Rows are ranked by their share of the step's summed token loss, so
+one long, badly-formed row stands out even when its per-token mean is ordinary. Example
+output (illustrative numbers):
+
+```text
+                Step 340 rows
+ Row    Loss   Tokens   Share  Preview
+  91  6.8120    3,900   94.1%  iVBORw0KGgoAAAANSUhEUgAAAyAAAAJYCAYAAAC…
+  12  1.1034      212    0.8%  Sure — here is a summary of the article…
+row 91: 94% of step 340's loss, 3,900 tokens
+Inspect or drop this row, then retrain.
+```
+
+Scope: task `sft` on the transformers and MLX backends, single process, on the plain
+text path. The recorder turns itself off, with one warning naming the reason, for
+resumed runs, `packing` / `padding_free`, multipack, vision, audio, a pre-tokenised
+dataset, and anything else it cannot attribute row by row. Previews are shown only when
+the dataset on disk still matches the one the run trained on.
+
+**What it costs.** Writing one line per micro-batch measured under 0.1 ms per
+micro-batch, which is negligible against any real step, and a run's peak memory was
+unchanged with the recorder on and off. The file grows without a cap: roughly 14 MB per
+50,000 micro-batches at batch 8, or about 100 MB for a million rows over three epochs.
+Delete it, or set `rewind_log: false`, if that matters to you.
+
+**What it contains.** Integer row indices, one loss and one token count per row — never
+any text from your dataset. Previews in `soup rewind` are rebuilt at read time from your
+own data file, and only while its fingerprint still matches. The indices and token counts
+are still weak metadata about a private dataset, so treat the file as you would the
+`output` directory it sits in.
+
+---
+
+## Full fine-tuning (`lora.r: 0`)
+
+Train every parameter, no adapter:
+
+```yaml
+base: HuggingFaceTB/SmolLM2-135M
+task: sft
+training:
+  quantization: none    # full-FT trains float weights
+  lora:
+    r: 0                # <- no adapter; the base itself trains
+```
+
+`lora.r: 0` is the supported spelling for plain full fine-tuning. It is the one
+`soup`'s classifier trainer has read as "no adapter" since v0.71.12, and the one
+`soup card` already resolves to a dense model rather than an adapter — so the
+model card, the registry entry and the trainer all agree without extra flags. On
+a rank of 0 the SFT trainer skips `get_peft_model` entirely: `soup train` prints
+`Full fine-tuning: N parameter tensor(s) trainable (lora.r=0, no adapter)`
+instead of `LoRA applied`, and the output directory holds a complete model, not
+an adapter to merge.
+
+Requirements, each rejected at config load with the reason named:
+`task: sft`, `backend: transformers`, `modality: text`, and
+`quantization: none` (quantized weights cannot be trained directly — use LoRA
+on top of them, i.e. QLoRA). It is mutually exclusive with every LoRA feature
+(`use_dora` / `use_vera` / `use_olora` / `use_rslora` / `rank_pattern` /
+`alpha_pattern` / `init_strategy` / `moe_lora` / `use_longlora` /
+`relora_steps` / `loraplus_lr_ratio`) — a LoRA knob next to `r: 0` is a
+contradiction rather than something to silently ignore — and with the other two
+"LoRA off" modes, [Spectrum](#spectrum--targeted-training-on-layer-snr-soup-spectrum-scan-v07123)
+(`unfrozen_parameters`) and LISA (`lisa_enabled`), since each independently
+decides what trains. It cannot be combined with layer streaming: streaming keeps
+the decoder on the meta device and trains only the adapter, so there would be
+nothing to full fine-tune.
+
+`freeze_layers` / `freeze_ratio` **do** stay legal with `r: 0` — "train
+everything above layer N" is a real technique — and the trainer respects
+whatever they froze instead of silently unfreezing it. If they leave nothing
+trainable the run is refused rather than burning GPU-hours on a no-op.
+
+Pick between the three "LoRA off" modes by how much you want to train:
+
+| Spelling | Trains | Use when |
+| --- | --- | --- |
+| `lora.r: 0` | everything | you have the VRAM and want the strongest baseline |
+| `unfrozen_parameters` ([Spectrum](#spectrum--targeted-training-on-layer-snr-soup-spectrum-scan-v07123)) | a hand-picked / SNR-ranked set | you want full-FT quality on the layers that matter |
+| `lisa_enabled` (LISA) | a rotating random subset | you want full-FT quality at LoRA-like memory |
+
+> Full fine-tuning needs far more memory than LoRA: optimizer state alone is
+> ~8 bytes per parameter for AdamW. `batch_size: "auto"` estimates memory from
+> a LoRA-shaped model, so on a full-FT run it errs optimistic — set
+> `batch_size` explicitly, or start low and raise it. (This is not new to
+> `r: 0`; the same is true of the Spectrum and LISA full-FT paths.)
+
+**Load dtype** (#339, #471, #492): a frozen base — LoRA, or QLoRA — loads at
+the checkpoint's own dtype (`torch_dtype="auto"`) instead of always upcasting to fp32,
+since the base never receives an optimizer step. Measured on an H100,
+Llama-3.1-8B, LoRA: 48,241 MiB peak -> 18,658 MiB, a 28.9 GB / 2.59x saving.
+On a pre-Ampere CUDA card (T4 / P100 / V100 / GTX 16xx / RTX 20xx), `"auto"`
+would give bf16 storage while training compute correctly stays fp16 — the
+same card question `_resolve_mixed_precision` already asks — so the frozen
+base explicitly loads `torch.float16` there instead. All three "LoRA off"
+modes above (`lora.r: 0`, `unfrozen_parameters`, `lisa_enabled`) are the
+trainable-base case and explicitly load `torch.float32` master weights
+instead — a deliberate precision choice for the parameters an optimizer
+actually steps, not an accidental upcast, and unaffected by the card check
+above.
+
+---
+
+## Which tasks apply `training.quantization`
+
+`quantization` defaults to `4bit`, but not every trainer reads it. These eight load the base
+(and, for `distill`, the teacher) at checkpoint precision whatever the field says:
+
+| task | quantization | notes |
+|---|---|---|
+| `distill` | `none` only | student and frozen teacher both load unquantised |
+| `classifier`, `reranker`, `cross_encoder` | `none` only | full fine-tune unless `classifier_lora: true` |
+| `prm` | `none` only | always a full fine-tune; a `lora` block is refused (`lora.r: 0` is allowed) |
+| `moe_lora_routing` | `none` only | base frozen, only the router trains |
+| `unlearn` | `none` only | policy and reference copy both load unquantised |
+| `asr` | `none` only | full fine-tune unless `asr_lora: true` |
+
+For these tasks an unset `quantization` resolves to `none`, so the stored config and the VRAM
+pre-flight describe the run that actually happens (#795).
+
+An explicit `4bit` or `8bit` (or `load_in_8bit: true`) **loads with a warning and resolves to
+`none`**, because every config Soup dumped while `4bit` was the default carries it literally.
+The warning names the task and the release that will refuse it; set `quantization: none` to
+silence it. A Quant Menu value (`gptq`, `awq`, ...) or a 4-bit-only setting such as
+`bnb_4bit_quant_storage` is refused at config load, naming the task. Every other task applies
+the field as documented in [Performance & Quantization](performance-and-quantization.md).
+
+---
+
+## Continual-learning rehearsal (`--replay`)
+
+Fine-tuning on a new task can erase the old one. Rehearsal is the standard
+defence: mix a slice of the old data back in.
+
+```bash
+soup train --config new_task.yaml --replay old_task.jsonl --replay-ratio 0.1
+```
+
+or in `soup.yaml`:
+
+```yaml
+data:
+  train: new_task.jsonl
+  replay: old_task.jsonl
+  replay_ratio: 0.1      # fraction of the FINAL mixed set
+  replay_seed: 0
+```
+
+**The ratio is a share of the final set**, not of the new data:
+`n_replay = round(r/(1-r) · n_new)`. At `0.1` over 1000 new rows that is 111
+replay rows → 1111 total → exactly 10%. The console reports what it did:
+
+```
+Replay: +26 old rows interleaved (30.2% of 86)
+```
+
+Three guarantees worth knowing:
+
+- **Interleaved, never appended.** A trailing block of old rows would mean the
+  model sees them all in the final steps — a second mini-finetune, which is the
+  failure rehearsal exists to prevent.
+- **`train` only; validation stays pure new-task**, so your eval still measures
+  the task you are learning. Measure old-task retention separately with
+  `soup eval custom` / `soup ship`.
+- **An undersized pool reports a shortfall rather than repeating rows** — a row
+  seen twice per epoch is a different experiment.
+
+The replay file gets its own format detection, so the old set may be alpaca while
+the new one is sharegpt.
+
+**Scope (v1):** `sft` and `pretrain` only, and incompatible with
+`packing`/`multipack` — those concatenate rows into fixed blocks, so the ratio
+stops being meaningful at block boundaries. Both are rejected with a clear error
+rather than silently mis-mixing.
+
+**Honest result.** Validated at proof-of-mechanism scale (SmolLM2-135M + LoRA):
+training task B from a model that knew task A, replay retained A **7% better than
+a no-replay control** (loss 0.565 → 0.526) at a ~5% cost to task B — the expected
+trade. But forgetting without replay was only **+4%**, i.e. mild: LoRA on a 135M
+model barely drifts. The direction and the mechanism are proven; the effect size
+at full fine-tuning or 7B+ is unproven on a 4 GB box.
+
+## Loop Hardening
+
+Six surfaces protect the training loop from the failure modes that cost a real GPU-hour. The schema + math kernels shipped in v0.70.0; the live trainer-callback wiring shipped in **v0.71.11**, validated end-to-end on SmolLM2-135M.
+
+```bash
+# Reward-hacking detector — auto-halt when the policy starts gaming the RM
+# (InfoRM cluster-separation index, Wang et al. 2024 arXiv:2402.09345)
+soup train --config soup.yaml \
+    --reward-hack-detector info_rm --reward-hack-halt   # halt on HACK verdict
+
+# Closed-loop reward-hacking MITIGATION (v0.71.26) — detect AND self-correct
+soup train --config grpo.yaml --reward-hack-mitigation kl_control   # raise KL, recover
+soup train --config grpo.yaml --reward-hack-mitigation log_only     # observe only, no action
+
+# Wasserstein-distance distillation between two models that SHARE a
+# tokenizer, e.g. two sizes in the same family (#681: wasserstein / topk_align
+# forward the student's token ids to the teacher unchanged, so the pair must
+# tokenize identically; for a genuinely different tokenizer see
+# wasserstein_aligned below).
+# (Universal Logit Distillation, Boizard et al. 2024 arXiv:2402.12030)
+#   training:
+#     uld_strategy: wasserstein
+soup train --config soup.yaml
+
+# Cross-tokenizer distillation for DIFFERENT tokenizers, e.g. Llama -> Mistral,
+# no shared vocab needed (v0.71.18). Aligns student/teacher token sequences
+# over decoded character spans, so you can distill a GPT-2 BPE student from a
+# Llama SentencePiece teacher.
+#   training:
+#     uld_strategy: wasserstein_aligned
+
+# MiniLLM reverse-KL distillation (Gu et al. 2024 arXiv:2306.08543).
+# Config-only: there is no --minillm-* flag beyond --minillm-on-policy below
+# (#979). Offline blend: mix ratio is the teacher weight in the reverse-KL
+# target and must be > 0 (ratio 0 is KL(student || stopgrad(student)) and is
+# rejected). On-policy: mix 0 is legal — student-only sampling, loss still
+# KL(student || teacher).
+#   training:
+#     minillm_enabled: true
+#     minillm_teacher_mix_ratio: 0.3
+#     minillm_pretrain_anchor_weight: 0.1
+#     minillm_pretrain_anchor_path: ./pretrain.jsonl
+soup train --config soup.yaml
+
+# MiniLLM TRUE on-policy rollout (v0.71.18, Gu et al. §3.1) — sample a fresh
+# autoregressive rollout from the per-token teacher/student mixture each step,
+# then length-normalised reverse-KL. training.minillm_rollout_length tunes the
+# rollout (auto min(max_length, 32)). Mix 0 here means student-only sampling.
+# --minillm-on-policy is the one real flag here; minillm_enabled: true still
+# has to be set in the config (#979).
+soup train --config soup.yaml --minillm-on-policy
+
+# Mid-epoch checkpoint for PPO/GRPO — TorchTune punts this; Soup ships it
+#   training:
+#     rl_checkpoint_save_every_steps: 500
+#     rl_checkpoint_keep_last: 3
+#     rl_checkpoint_include_optimizer: true
+soup train --config grpo.yaml
+
+# Iterative DPO loop driver — sample -> RM-score -> re-pair -> retrain
+# (drop --plan-only to run the loop; --plan-only just renders the per-round plan)
+soup iterative-dpo \
+    --base-model meta-llama/Llama-3.1-8B \
+    --reward-model ./output_rm \
+    --prompts ./prompts.jsonl \
+    --output-dir ./iterative_dpo_out \
+    --rounds 5 \
+    --pairs-per-round 1000
+
+# RAGEN echo-trap detector — auto-halt when trajectories collapse to self-repetition
+# (Zhu et al. 2025 arXiv:2504.14437)
+#   training:
+#     echo_trap_enabled: true
+#     echo_trap_threshold: 0.6
+#     echo_trap_halt: true
+#     echo_trap_tokenizer_aware: true
+soup train --config grpo.yaml
+```
+
+`training.echo_trap_tokenizer_aware` (also available as the real
+`--echo-trap-tokenizer-aware` option) switches echo-trap n-grams from
+whitespace tokens to the active tokenizer's integer ids. This catches subword
+repetition that punctuation-heavy decoded text can hide, but the score becomes
+tokenizer-specific rather than vocabulary-agnostic.
+
+### Closed-loop reward-hacking auto-mitigation (v0.71.26)
+
+The detectors above *halt*; `training.reward_hack_mitigation` (or the `--reward-hack-mitigation` flag) makes the trainer *self-correct* mid-run. It requires `reward_hack_detector` on a `grpo`/`ppo` transformers run, and has four modes:
+
+- **`log_only`** — observe only. Appends a per-step `mitigation_log.jsonl` under the run's output dir (the InfoRM/ensemble drop, the OK/WARN/HACK verdict, reward mean/std, completion-length trend, repetition) and provably never mutates β. Run this first to *see* hacking before you let a controller act on it.
+- **`kl_control`** — a reversible **bang-bang + hysteresis** controller. When a multi-signal vote (`reward_hack_signals`: the detector drop + `length_trend` + `repetition`) stays above `reward_hack_trip_band` for `reward_hack_dwell_steps`, it multiplies β by `reward_hack_kl_gain` (clamped to `[reward_hack_beta_floor > 0, reward_hack_beta_ceil]`, never crossing 0); after `reward_hack_release_patience` below-band steps it relaxes β back toward the floor. Dwell + release-patience stop it flapping. β is written to **both** `trainer.beta` and `trainer.args.beta` so it takes effect on stock GRPO *and* Soup's GRPO variants (and `trainer.args.kl_coef` on PPO).
+- **`pid_lagrangian`** — a **PID-Lagrangian** controller (Stooke et al. 2020) that holds the hacking signal at `reward_hack_signal_target` (Kp/Ki/Kd with integral anti-windup via `reward_hack_integral_clamp`), plus an **escalation ladder**: raise β → after `reward_hack_rollback_patience` persistent-HACK steps roll back to the last-good RL checkpoint (needs `rl_checkpoint_save_every_steps`) → after `reward_hack_max_recovery_attempts` rollbacks, early-stop with a plain-English give-up explanation.
+- **Anti-gaming hardening** (any control mode): `reward_hack_signal_smoothing` (`ema`/`median` over `reward_hack_smoothing_window`), `reward_hack_conservative_on_disagreement` (when detectors disagree, keep KL high + guard against a bimodal reward-distribution collapse), and `reward_hack_reward_shaping` (subtract a bounded `reward_hack_shaping_strength` penalty on the gamed proxy — `length`/`repetition`/`sentinel` — over the reward-fn seam).
+
+**Scope:** proof-of-mechanism only. Validated on SmolLM2-135M + a synthetic length-hacking task on a single RTX 3050 (all four modes live, including a real mid-run rollback). PPO ships **BETA** — the buffer + `kl_coef` mutation are wired and unit-tested, but the on-GPU proof is GRPO-only. Whether the loop suppresses hacking without collapsing true reward on 7B+ with a real reward model is an open, community-validatable question. `reward_hack_mitigation ∈ {kl_control, pid_lagrangian}` is mutually exclusive with `ref_model_ema_alpha` (both drive the KL/ref dynamics).
+
+Every detector composes with v0.34 `soup why` (anomaly explainer), v0.32 spike recovery, and the v0.53.11 #127 `GRPOStabilityCallback` so a single GRPO run can have InfoRM + echo-trap + spike-recovery + in-place ref-model EMA all active simultaneously without duplicating trajectory / state collection. The reward-hack and echo-trap callbacks read the per-step rewards through a shared, thread-safe capture buffer (Soup wraps your reward functions so it never has to monkeypatch TRL); `rm_ensemble` needs ≥2 reward functions to compute a divergence. The MiniLLM teacher-mix is an offline distribution-blend analog of the paper's on-policy teacher-mixed *sampling*, and ULD compares the distributions after clamping teacher ids to the teacher vocab (correct for same-family / extended-vocab pairs; a genuinely different tokenization needs a sequence-alignment step). The reference-model EMA (`--ref-model-ema-alpha`) updates in place — no full `state_dict` round-trip — so it is cheap at 70B+ scale.
+
+
+## Unlearning (`task='unlearn'`, NPO / SimNPO / RMU)
+
+GDPR right-to-be-forgotten + CSAM/PII leak response, productized. Three method backends:
+
+- **NPO** — Negative Preference Optimization (DPO-shaped negative-only loss; needs a reference model).
+- **SimNPO** — length-normalised NPO without a ref model (faster, more stable on long sequences).
+- **RMU** — Representation Misdirection Unlearning (residual-stream noise on forget inputs).
+
+```yaml
+# unlearn.yaml
+base: HuggingFaceTB/SmolLM2-135M
+task: unlearn
+data:
+  train: traces.jsonl
+  forget_set: gdpr_deletion_set.jsonl   # rows to unlearn (messages / prompt+completion / text)
+  retain_set: capability_anchors.jsonl  # optional — anchors general capability
+training:
+  unlearn_method: npo           # or simnpo / rmu
+  unlearn_alpha: 0.5            # retain-set weighting [0.0, 10.0]
+```
+
+```bash
+# Run the unlearn loop (validated on SmolLM2-135M — NPO/SimNPO drive forget loss down).
+soup train --config unlearn.yaml --yes
+
+# Score the run on TOFU / MUSE / WMDP (OK / MINOR / MAJOR verdict).
+soup eval unlearning <run-id> --benchmark tofu --evidence evidence.json --output report.json
+```
+
+`task: unlearn` is live (v0.71.9): it loads a LoRA-wrapped policy, a frozen reference copy (NPO / RMU), and the forget / retain JSONL sets, then optimises the per-method loss — NPO's `(2/β)·mean(-logσ(-β·(π_logp − ref_logp)))` drives the policy's forget-set log-prob below the reference (= forgetting), while the retain set anchors capability. Run NPO/SimNPO **with** a `retain_set` — without one the policy has no utility anchor and Soup warns loudly.
+
+Three orthogonal axes: **Forget Quality** (pre/post forget-loss delta), **Model Utility** (retain-accuracy preserved), **PrivLeak** (membership-inference AUC distance from 0.5). Bundled mini-fixtures for all three benchmarks ship in the box (v0.71.1 added MUSE + WMDP alongside the existing TOFU set), so `--benchmark muse|wmdp` runs without supplying evidence. The WMDP forget-set probes ship **redacted** (placeholder prompts + `REFUSED` responses) — Soup never bundles verbatim hazardous-knowledge content.
+
+
+## Continued Pre-training
+
+Continue training a model on raw text for domain adaptation:
+
+```yaml
+base: meta-llama/Llama-3.1-8B
+task: pretrain
+
+data:
+  train: ./data/corpus.jsonl   # {"text": "..."} or plain .txt files
+  format: plaintext
+  max_length: 4096
+
+training:
+  epochs: 1
+  lr: 1e-5
+  quantization: 4bit
+```
+
+```bash
+soup init --template pretrain
+soup train
+```
+
+
+## Knowledge Distillation
+
+Train a small student model to match a larger teacher's output distribution.
+
+```yaml
+base: HuggingFaceTB/SmolLM2-135M
+task: distill
+modality: text
+backend: transformers
+
+data:
+  train: ./data/chat.jsonl
+  max_length: 2048
+  chat_template: chatml
+
+training:
+  teacher_model: meta-llama/Llama-3.1-8B
+  distill_divergence: forward_kl   # kl | forward_kl | reverse_kl | js
+  distill_temperature: 2.0
+  distill_chunk_size: 256          # token chunk size for divergence evaluation
+  distill_checkpoint: true         # non-reentrant activation checkpointing
+  epochs: 3
+  lr: 5e-5
+```
+
+Loss = student CE + (T**2) × KL(teacher_logits / T  ||  student_logits / T).
+Teacher is loaded once, frozen via `requires_grad_(False)` + `.eval()`, and its
+inputs / logits are auto-bridged across CPU / CUDA devices.
+Gradient accumulation uses the number of shifted, non-masked training targets across the complete
+optimizer window. Splitting the same rows into unequal-length microbatches therefore preserves the
+full-batch token mean instead of weighting every microbatch equally.
+
+The token-divergence kernel evaluates all three divergences in FP32 and deliberately
+returns an FP32 scalar, including for FP16/BF16 logits. Forward-KL values can therefore
+also differ slightly from the previous low-precision calculation. The log-space
+reverse-KL and Jensen-Shannon formulas prevent finite losses with non-finite
+gradients; the upcast also preserves small losses that would underflow to zero.
+Non-finite logits propagate into the loss/gradients, allowing AMP's GradScaler to
+skip overflowed steps rather than aborting training with a validation exception.
+
+FP32 intermediates cost time and memory. The [maintainer's PR #736 measurement](https://github.com/MuhtarJaksilikov/Soup/pull/736)
+on an RTX 5070 (BF16, B=1/S=512/V=32000, forward plus backward) found the originally
+submitted kernel took 1.71 times as long and 1.24 times the peak memory of main.
+That measurement included finite-value guards removed here: without them it took
+9.40 ms versus 6.39 ms, with the same 376.5 MiB versus 303.6 MiB peak. These are
+hardware-specific measurements, not a benchmark of this revised implementation,
+which also avoids unused probability tensors. Two FP32 logits copies alone occupy
+about 7.8 GiB at B=4/S=2048/V=128256; budget for additional intermediates as well.
+
+### Chunking and Activation Checkpointing
+
+Distillation with large vocabularies (e.g. 150k for Qwen 2.5) and long sequences
+can exhaust GPU memory due to massive intermediate logit and probability tensors.
+Soup provides two controls to bound activation memory:
+
+- `distill_chunk_size`: Evaluates divergence in chunks of active response tokens
+  (`labels != -100`). Pre-filtering immediately sheds unmasked prompt and padding
+  tokens from retained autograd memory, while chunking bounds transient peak
+  activation tensors during divergence evaluation. Moderate chunk sizes (e.g. 64
+  to 256 tokens) balance peak memory reduction with kernel launch overhead.
+- `distill_checkpoint`: Wraps chunk evaluation in non-reentrant activation
+  checkpointing (`torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`).
+  Discards intermediate `log_softmax` and probability tensors during the forward
+  pass and recomputes them during backward, substantially reducing retained autograd
+  tensor bytes at the cost of recomputation time in the backward pass. Note that
+  enabling `distill_checkpoint: true` without setting `distill_chunk_size` processes
+  all active tokens in a single chunk, which reduces retained bytes via checkpointing
+  but leaves transient peak activations unbounded.
+
+
+Set `distill_mode: sequence` (default `token`) to train on the teacher's **generated
+continuations** instead of per-token logit matching — a hard-label, cross-tokenizer-friendly
+KD that works when student and teacher do not share a vocabulary. `sequence` mode is mutually
+exclusive with the cross-tokenizer `uld_strategy` logit path (they are different objectives over
+the same task; the trainer rejects the combination at setup). (v0.71.12)
+
+
+## Sequence Classification
+
+Train a classifier head on top of any base model — supports single-label,
+multi-label, and cross-encoder reranking.
+
+```yaml
+base: BAAI/bge-base-en-v1.5
+task: classifier              # or `reranker`, `cross_encoder`
+modality: text
+backend: transformers
+
+data:
+  train: ./data/labelled.jsonl   # rows: {"text": "...", "label": "spam"} or {"text": "...", "label": [0, 1, 0]}
+  max_length: 256
+
+training:
+  num_labels: 3
+  classifier_kind: single_label   # or `multi_label`
+  label_names: [ham, spam, promo] # required when labels are strings
+  epochs: 5
+  lr: 2e-5
+  batch_size: 32
+```
+
+Routes `classifier` / `reranker` / `cross_encoder` through
+`AutoModelForSequenceClassification`. Multi-label heads cap at 1024 entries per
+row, dedup via set conversion, and reject null bytes in label strings.
+
+Add a `lora:` section to train a **frozen encoder + LoRA adapter** classifier instead of the
+full model — the small adapter plus the (freshly-initialised) classification head train, the
+encoder backbone stays frozen:
+
+```yaml
+training:
+  num_labels: 3
+  lora:
+    r: 16
+    alpha: 32
+```
+
+(v0.71.12)
+
+
+## Reasoning Effort + EOT Control
+
+gpt-oss-style reasoning-effort control for instruction tuning.
+
+```yaml
+training:
+  reasoning_effort: high      # low | medium | high
+  train_on_eot: true          # do NOT mask the EOT/EOS token in the loss
+```
+
+`reasoning_effort` injects `<|reasoning_effort|>high<|/reasoning_effort|>` into
+the system turn (creating one if absent). `train_on_eot=True` makes the model
+learn when to stop generating by training on the trailing EOS token instead of
+masking it out. Both are gated to the SFT-family of tasks.
+
+
+## EBFT / GDPO Loss Variants
+
+Entropy-regularised SFT (`ebft_variant: structured | strided`) and generalised
+DPO (`gdpo_variant: standard | length_normalized | margin`) — both attach
+idempotently via `compute_loss` wrappers and auto-fire when the corresponding
+variant field is set on `TrainingConfig`.
+
+```yaml
+# SFT with EBFT structured
+training:
+  ebft_variant: structured
+  ebft_temperature: 1.0
+
+# DPO with GDPO length_normalized
+task: dpo
+training:
+  gdpo_variant: length_normalized
+  dpo_beta: 0.1
+```
+
+
+## GRPO Objective Variants
+
+Soup ships live math kernels for 6 GRPO objective variants in addition to the
+default. Set `grpo_variant` in `training` and the trainer automatically
+subclasses `trl.GRPOTrainer` to route `compute_loss` through the matching
+kernel:
+
+```yaml
+task: grpo
+training:
+  reward_fn: accuracy
+  num_generations: 4
+  grpo_variant: gspo         # sequence-level length-normalized ratio
+  # or: dapo / dr_grpo / bnpo / rft / two_sided
+  # grpo_delta: 0.2          # required when grpo_variant=two_sided; optional for gspo
+```
+
+Variants:
+
+- **standard** — DeepSeek-R1-style baseline (delegates to TRL's `compute_loss`).
+- **gspo** — Group Sequence Policy Optimization (sequence-level length-normalized ratio with clipping).
+- **dapo** — decoupled asymmetric clipping (`eps_lo=0.2, eps_hi=0.28`).
+- **dr_grpo** — token-sum without per-sample length normalisation.
+- **bnpo** — length-normalised PPO surrogate.
+- **two_sided** — symmetric clipping with operator-supplied `grpo_delta`.
+- **rft** — rejection-sampling fine-tuning (only positive-advantage tokens contribute).
+
+The stability callback (EMA ref-model update, replay buffer, TIS alert counter)
+attaches automatically when any of `ref_model_ema_alpha` / `replay_buffer_size`
+/ `tis_threshold` / etc. is set.
+
+
+## Process Reward Model (PRM)
+
+Train a scalar reward head over stepwise-supervised reasoning chains. Data
+format is the v0.42.0 `prm` shape — one row per `{prompt, completions: [step1,
+step2, ...], labels: [r1, r2, ...]}`:
+
+```yaml
+task: prm
+data:
+  format: prm
+  train: ./prm_train.jsonl
+  max_length: 2048
+training:
+  epochs: 1
+  lr: 1.0e-5
+```
+
+The trainer loads `AutoModelForCausalLM`, attaches an `nn.Linear(hidden, 1)`
+reward head, and computes MSE between predicted scalars at step-boundary tokens
+and the per-step labels. The reward head is saved inside the model checkpoint
+(`reward_head.*` in `model.safetensors`) and the tokenizer is saved alongside it,
+so the resulting directory is loadable standalone.
+
+
+## PRM-guided GRPO (process-supervised RL)
+
+Use a trained PRM as the **per-step reward** inside GRPO — the o1-era
+process-supervision signal. Set `training.prm_reward` to a PRM directory (a
+`task=prm` checkpoint) or HF id; the PRM splits each generated completion into
+reasoning steps (newline heuristic), scores every step with its reward head, and
+folds the per-step scores into one scalar reward that GRPO optimises. It
+**replaces** `reward_fn` and rides the existing reward-shaping +
+reward-hack-mitigation seam, so the v0.71.26 controller still observes it (TRL
+logs it as `rewards/prm_reward`).
+
+```yaml
+task: grpo
+backend: transformers        # required (the PRM reward runs a transformers forward)
+modality: text               # required
+data:
+  format: chatml
+  train: ./grpo_prompts.jsonl
+training:
+  prm_reward: ./my-prm       # a `soup train task=prm` checkpoint dir (or HF id)
+  prm_aggregate: min         # weakest-link (default) | prod | last
+  num_generations: 4
+  grpo_beta: 0.04
+```
+
+`prm_aggregate='min'` (weakest-link, the standard PRM aggregation) is the safe
+default; `prod` assumes calibrated `[0,1]` step scores (Soup's PRM head is
+trained with unconstrained MSE, so `prod` can blow up on uncalibrated labels).
+
+**Bundled rollout environments.** Three deterministic pure-Python toy
+environments seed the openenv rollout path out-of-the-box — pair any of them
+with `rollout_backend=openenv`:
+
+```yaml
+training:
+  rollout_backend: openenv
+  rollout_func: souplite.envs.calculator:rollout   # or retrieval_qa / guess_number
+  reward_fn: verifiable
+  verifiable_domain: math
+```
+
+Ready-made recipes: `grpo-env-calculator`, `grpo-env-retrieval-qa`,
+`grpo-env-guess-number`. The environments are deterministic single-shot
+prompt/answer *seeders* (the live openenv contract passes only the seed prompts,
+not the model) — not interactive multi-turn episodes.
+
+**Scope:** proof-of-mechanism only — validated on SmolLM2-135M with a tiny
+synthetic PRM (the PRM reward scores good completions above bad and drives GRPO's
+advantages). Not a production reward-model claim; scale validation is help-wanted
+(#286).
+
+
+## Online DPO (`task='online_dpo'`) — judge in the loop (v0.71.31)
+
+Unlike offline DPO (static `prompt/chosen/rejected` rows), **Online DPO** generates
+two completions per prompt **on-policy** each step and asks a *judge* — or a
+*reward model* — which is better; the winner becomes `chosen`, the loser
+`rejected`. The judge closes the loop. Wraps TRL `OnlineDPOTrainer`; data is
+prompt-only (like GRPO). Transformers + text only.
+
+```yaml
+base: HuggingFaceTB/SmolLM2-135M-Instruct
+task: online_dpo
+data:
+  train: ./data/prompts.jsonl      # prompt-only (or any format — prompts are extracted)
+training:
+  online_dpo_judge: "ollama://llama3.1"   # a pairwise judge (ollama://|https://|http://localhost)
+  # OR: reward_model: ./my-reward-model   # exactly one of judge / reward_model
+  online_dpo_loss_type: sigmoid           # sigmoid | ipo
+  online_dpo_max_new_tokens: 64
+  dpo_beta: 0.1
+  lora: { r: 8, alpha: 16, target_modules: auto }
+```
+
+The judge is Soup's own OpenAI-compatible `JudgeEvaluator` adapted to TRL's
+`BasePairwiseJudge` (swap-debiased: a winner is only recorded when both A,B and
+B,A orders agree). Recipe: `online-dpo-smollm2-135m`. Proof-of-mechanism was
+validated on SmolLM2-135M with a synthetic judge (not a production RLHF claim; #286).
+An `https://` judge URL uses `OPENAI_API_KEY` only when its host is `api.openai.com`; other
+hosts are called as an OpenAI-compatible server without that key.
+
+
+## Weighted Multi-Objective Preference Loss
+
+Mix DPO / SimPO / ORPO / IPO terms in one training run by setting
+`preference_loss_weights` (must sum to 1.0):
+
+```yaml
+task: preference
+training:
+  preference_loss_weights:
+    dpo: 0.6
+    simpo: 0.4
+```
+
+The combine wrapper reads policy + reference summed log-probs from the inner
+TRL trainer's per-batch inputs and computes a true weighted sum via the
+in-tree `compute_dpo_term` / `compute_simpo_term` / `compute_orpo_term` /
+`compute_ipo_term` kernels. BCO cannot be mixed with paired losses (data
+format incompatible — rejected at config load).
+
+
+## MoE Model Support
+
+Fine-tune Mixture of Experts models (Mixtral, Qwen3-30B-A3B, DeepSeek V3) with ScatterMoE LoRA — applies LoRA to both attention layers and expert FFN layers:
+
+```yaml
+base: Qwen/Qwen3-30B-A3B
+task: sft
+
+training:
+  moe_lora: true              # target expert + attention layers
+  moe_aux_loss_coeff: 0.01    # router load-balancing loss
+  quantization: 4bit
+```
+
+Soup auto-detects MoE architectures. Works with all training tasks.
+
+```bash
+soup init --template moe
+soup train
+```
+
+
+## Vision / Multimodal Fine-tuning
+
+Fine-tune vision-language models (LLaMA-3.2-Vision, Qwen2-VL, Pixtral) on image+text data:
+
+```bash
+# Install vision support
+pip install "souplite[vision]"
+
+# Create a vision config
+soup init --template vision
+
+# Train
+soup train --config soup.yaml
+```
+
+```yaml
+base: meta-llama/Llama-3.2-11B-Vision-Instruct
+task: sft
+modality: vision
+
+data:
+  train: ./data/vision_train.jsonl
+  format: llava
+  image_dir: ./data/images
+  val_split: 0.1
+
+training:
+  epochs: 3
+  lr: 1e-5
+  quantization: 4bit
+  lora:
+    r: 64
+    alpha: 16
+```
+
+**Supported vision data formats:**
+
+**LLaVA:**
+```json
+{"image": "photo.jpg", "conversations": [{"from": "human", "value": "<image>\nDescribe this image."}, {"from": "gpt", "value": "A cat on a mat."}]}
+```
+
+**ShareGPT4V:**
+```json
+{"image": "chart.png", "conversations": [{"from": "human", "value": "<image>\nWhat does this show?"}, {"from": "gpt", "value": "Quarterly revenue."}]}
+```
+
+`soup data inspect` automatically shows image statistics (count, formats, missing files) for vision datasets.
+
+
+## Audio / Speech Fine-tuning
+
+Fine-tune audio-language models (Qwen2-Audio, Whisper) on audio+text data:
+
+```bash
+# Install audio support
+pip install "souplite[audio]"
+
+# Create an audio config
+soup init --template audio
+
+# Train
+soup train --config soup.yaml
+```
+
+```yaml
+base: Qwen/Qwen2-Audio-7B-Instruct
+task: sft
+modality: audio
+
+data:
+  train: ./data/audio_train.jsonl
+  format: audio
+  audio_dir: ./data/audio
+  val_split: 0.1
+
+training:
+  epochs: 3
+  lr: 1e-5
+  quantization: 4bit
+  lora:
+    r: 64
+    alpha: 16
+```
+
+**Audio data format:**
+```json
+{"audio": "recording.wav", "messages": [{"role": "user", "content": "Transcribe this audio."}, {"role": "assistant", "content": "Hello world."}]}
+```
+
+### ASR fine-tuning (`task='asr'`, Whisper) — v0.71.32
+
+Fine-tune Whisper on your accent or domain. whisper-tiny (39M) and base (74M)
+train on a 4 GB GPU. Rows are `{"audio": <path>, "text": <transcript>}` under
+`data.format='asr'`; audio decodes to 16 kHz mono through the hardened loader.
+
+```yaml
+base: openai/whisper-tiny
+task: asr
+data:
+  train: ./data/train.jsonl
+  format: asr                 # rows: {"audio": "clip.wav", "text": "hello world"}
+  audio_dir: ./data/audio     # audio paths resolve here (containment-checked)
+training:
+  epochs: 3
+  lr: 1e-4
+  batch_size: 2
+  asr_language: en            # optional; sets + persists the decoder prefix
+  asr_task: transcribe        # transcribe | translate
+  asr_lora: true              # optional LoRA on q/v; default = full fine-tune
+  quantization: none
+output: ./out
+```
+
+```json
+{"audio": "clip0.wav", "text": "hello world"}
+```
+
+Transcribe + score after training:
+
+```bash
+soup infer --task asr --model ./out --input eval.jsonl --output preds.jsonl --audio-dir ./data/audio
+# -> preds carry {"transcription", "wer", "cer"} per row + a corpus WER summary
+```
+
+Notes: `task='asr'` requires `backend='transformers'` and a Whisper base (a
+non-Whisper base is rejected before download). `asr_language`/`asr_task` persist
+to an `asr_generation.json` sidecar so `soup infer --task asr` restores them
+(override with `--asr-language`/`--asr-task`). WER/CER use a light normalizer —
+good for before/after deltas, not leaderboard-comparable absolutes.
+`whisper-large-v3-asr` ships parse-only (needs a larger GPU).
+
+
+## GRPO Plus — Objective Variants, Long-Context RL, Multi-Turn Agents
+
+Soup ships seven GRPO objective variants, between-rollouts vLLM standby, four agent-rollout backends, seven stability/efficiency knobs, plus Process Reward Models and Vision-RL.
+
+```yaml
+# soup.yaml — DAPO with replay buffer and TIS truncation masking
+base: meta-llama/Llama-3.1-8B-Instruct
+task: grpo
+data:
+  train: ./prompts.jsonl
+  format: chatml
+training:
+  reward_fn: accuracy
+  num_generations: 8
+  # New: GRPO objective variants
+  grpo_variant: dapo                  # one of: gspo / dapo / dr_grpo / bnpo / two_sided / rft / standard
+  # grpo_delta: 0.2                   # required when grpo_variant: two_sided (optional for gspo)
+  grpo_fp16: true                     # FP16 RL (unsloth parity)
+  # Long-context + memory-efficient RL
+  long_context_grpo: true             # wires Tiled MLP when available
+  vllm_sleep_mode: true               # between-rollouts vLLM standby — LIVE (vLLM >= 0.7)
+  # Multi-turn agent rollout — openenv is LIVE: your function's rows replace the prompt dataset
+  rollout_backend: openenv            # one of: art / ruler / nemo_gym / openenv
+  rollout_func: my_module:my_rollout  # module:function resolver (openenv; trusted operator code)
+  # Stability / efficiency knobs
+  ref_model_ema_alpha: 0.99           # EMA sync policy → reference
+  replay_buffer_size: 2048
+  async_grpo_prefetch: true           # overlap rollout + train
+  tis_threshold: 2.0                  # truncated importance sampling
+  mask_truncated_completions: true    # paired with tis_threshold
+  defer_rerolling: true
+  skip_zero_advantage: true
+  off_policy_mask_threshold: 0.5
+```
+
+Process Reward Models (stepwise-supervised):
+
+```yaml
+# soup.yaml
+base: meta-llama/Llama-3.1-8B
+task: prm                              # New: Process Reward Model
+data:
+  train: ./prm_dataset.jsonl
+  format: prm                          # stepwise-supervised data shape
+training:
+  epochs: 3
+  lr: 1e-5
+```
+
+Vision RL on Qwen2-VL / Pixtral / InternVL:
+
+```yaml
+# soup.yaml
+base: Qwen/Qwen2-VL-7B-Instruct
+task: grpo
+modality: vision
+data:
+  train: ./vlm_prompts.jsonl
+  format: llava
+training:
+  reward_fn: accuracy
+  vision_grpo: true                    # VLM-RL opt-in
+```
+
+All flags ship as schema gates in v0.50.0; live loss kernels, vLLM sleep-mode plumbing, ART/RULER/NeMo Gym/OpenEnv launchers, and the PRM trainer wrapper land in v0.50.1 — schema accepts the values now so configs are stable.
+
+
+## DPO Training
+
+Train with preference data using Direct Preference Optimization:
+
+```yaml
+base: meta-llama/Llama-3.1-8B-Instruct
+task: dpo
+
+data:
+  train: ./data/preferences.jsonl
+  format: dpo
+
+training:
+  epochs: 3
+  dpo_beta: 0.1
+  lora:
+    r: 64
+    alpha: 16
+  quantization: 4bit
+```
+
+
+## Preference Variety — BCO + Unified Dispatcher + KL Variants
+
+Five preference losses live behind one config knob. Pick a loss without
+renaming your task, anneal β over training, and periodically refresh the
+frozen reference.
+
+### BCO (Binary Classifier Optimization)
+
+Same input format as DPO; rows are split internally to TRL's BCO
+unpaired schema (`{prompt, completion, label}`).
+
+```yaml
+task: bco
+data:
+  train: ./data/preferences.jsonl
+  format: dpo
+training:
+  bco_beta: 0.1
+```
+
+### Unified preference dispatcher
+
+Use `task: preference` + `training.preference_loss` to swap losses
+without touching `task`. Hyperparameter sweeps over the loss type
+itself become trivial.
+
+```yaml
+task: preference
+data:
+  train: ./data/preferences.jsonl
+  format: dpo
+training:
+  preference_loss: dpo   # or simpo, orpo, ipo, bco
+```
+
+Legacy `task: dpo` / `task: simpo` / etc. remain first-class — the
+unified surface is additive.
+
+### KL-controlled DPO variants
+
+Anneal β over training, periodically refresh the reference model:
+
+```yaml
+task: dpo   # or task: preference + preference_loss: dpo, or task: ipo
+training:
+  dpo_beta: 0.1
+  dpo_beta_schedule: linear   # linear | cosine | exponential
+  dpo_beta_end: 0.01
+  dpo_ref_regen_epochs: 2     # copy student → ref model every 2 epochs
+```
+
+Both controls are gated to DPO-family tasks (`dpo`, `ipo`, or
+`preference` with `preference_loss in {dpo, ipo}`); transformers
+backend only.
+
+### Multi-objective preference loss (schema-only in v0.40.0)
+
+```yaml
+task: preference
+training:
+  preference_loss_weights: {dpo: 0.7, bco: 0.3}
+```
+
+Schema validates 2–5 entries summing to 1. Live runtime weighted-loss
+combination is wired in v0.40.1; v0.40.0 fails fast with an actionable
+`NotImplementedError` if you actually try to train (same stub-then-live
+pattern as v0.27.0 MII / v0.37.0 multipack / v0.38.0 quant menu /
+v0.39.0 ReLoRA).
+
+
+## GRPO Training (Reasoning)
+
+Train reasoning models with Group Relative Policy Optimization (DeepSeek-R1 style):
+
+```yaml
+base: meta-llama/Llama-3.1-8B-Instruct
+task: grpo
+
+data:
+  train: ./data/reasoning_train.jsonl
+  format: sharegpt
+  max_length: 4096
+
+training:
+  epochs: 3
+  lr: 1e-5
+  grpo_beta: 0.1
+  num_generations: 4
+  reward_fn: accuracy   # or 'format', or path to custom .py
+  lora:
+    r: 64
+    alpha: 16
+  quantization: 4bit
+```
+
+```bash
+# Create a reasoning config
+soup init --template reasoning
+
+# Train
+soup train --config soup.yaml
+```
+
+**Built-in reward functions:**
+- `accuracy` — checks if the final answer matches expected (supports `####` and `\boxed{}` formats)
+- `format` — checks for structured `<think>...</think>` reasoning blocks
+
+For GRPO, Soup preserves source dataset columns and TRL passes them to reward functions as
+keyword arguments. An Alpaca `output` or the final assistant turn in ShareGPT/ChatML is also
+exposed as `answer`; an explicit `answer` column takes precedence. Gold-dependent built-ins
+validate their inputs before generation:
+
+| Reward | Required source metadata |
+|---|---|
+| `accuracy` or verifiable `math` | `answer`, or an assistant reference response |
+| verifiable `code` | `expected` or `answer` |
+| verifiable `json_schema` | `schema` |
+
+**Custom reward functions** — point to a Python file:
+```python
+# my_reward.py
+def reward_fn(completions, **kwargs):
+    """Score each completion. Return list of floats."""
+    return [1.0 if "correct" in c[-1]["content"] else 0.0 for c in completions]
+```
+```yaml
+training:
+  reward_fn: ./my_reward.py
+```
+
+Custom rewards can read any preserved source column through `kwargs`. They must return exactly
+one finite numeric score per completion; Soup checks this contract and reports the reward name
+and count before TRL attempts to build a reward tensor.
+
+**Reward ensembles** — list several rewards, comma-separated, and they combine (GRPO only).
+This also unlocks the `rm_ensemble` reward-hack detector, which needs ≥ 2 rewards:
+```yaml
+training:
+  reward_fn: "accuracy,format"   # both are scored every step
+```
+
+### Synthesize a verifier from your data (`soup reward synth`)
+
+Don't hand-write a verifier — generate one from reference (gold) outputs. Soup infers a
+*deterministic* verifier (numeric / JSON-schema / regex / tool-call), writes a readable, editable
+`.py`, and **refuses to emit** one that can't tell your references from auto-generated bad answers
+(the mandatory calibration report). The emitted file is a normal `reward_fn: reward.py`.
+
+```bash
+# infer + calibrate + emit (exit 0 kept, 2 refused, 1 error)
+soup reward synth references.jsonl -o reward.py --output-report calib.json
+
+# preview the induced spec without writing anything
+soup reward synth references.jsonl --plan-only
+
+# force a family instead of auto-detecting
+soup reward synth answers.jsonl -o reward.py --kind numeric --tolerance 1e-6
+```
+
+References are a JSONL where each row's gold answer is in an `answer` field (override with
+`--field`) or the last assistant turn of a `messages` list. `--min-discrimination` sets how
+strongly the verifier must separate references from perturbed negatives before it's emitted.
+v1 is deterministic families only — a `\boxed{}`/`####` marker helps the numeric verifier, and
+completions are prompted to mark their answer (standard RLVR practice).
+
+### Stress-test a verifier for gameability (`soup reward stress`)
+
+A verifier that passes calibration still might pay out for junk. `soup reward stress` feeds the
+verifier deterministic degenerate completions — empty, length-padded, repeated, and
+sentinel-spam — scored against your real gold answers, and flags any it **accepts**. It's the
+adversarial counterpart to `synth`: calibration proves the verifier tells references from
+*friendly* bad answers; `stress` asks whether a reward-hacking model could game it.
+
+```bash
+# probe a synthesized verifier (or any reward .py) — exit 0 robust, 2 gameable, 1 error
+soup reward stress reward.py --references golds.jsonl --output-report stress.json
+
+# probe a builtin verifier instead of a .py file
+soup reward stress verifiable --verifiable-domain math --references golds.jsonl
+
+# JSON-schema references may be stored as objects in a `schema` field
+soup reward stress verifiable --verifiable-domain json_schema \
+    --references schemas.jsonl --field schema
+
+# tune the attack set / accept threshold / gameability tolerance
+soup reward stress reward.py --references golds.jsonl \
+    --attacks empty,length,repetition,sentinel,wrapped_junk,answer_spray \
+    --sentinel GOLD --threshold 0.5 --max-gameable 0.0
+```
+
+The report shows a per-attack accept-rate and an overall verdict. A gold-requiring verifier probed
+with **no** `--references` is a hard error (it can't be measured), never a false "robust". Because
+each attack family evaluates multiple distinct variants across sampled references (up to 23 batched
+verifier invocations, or 4,600 scored completions at the 200-gold cap), slow or model-based verifiers
+will take proportionally longer than simple string checks. Probing a `.py` executes its module code,
+like any custom reward — only stress files you trust.
+For the builtin `json_schema` domain, references are forwarded as `schema=` metadata; JSON objects
+selected by `--field` are decoded before the verifier scores them.
+
+Current limitation: the built-in attack families emit plain text that is not valid JSON, so
+`json_schema` rejects them during parsing before schema-specific constraints are evaluated. The
+result therefore does not yet distinguish a strict schema from a permissive one. Its `reference_accept`
+value is also not a meaningful self-acceptance control for this domain because it scores the schema
+document as though it were an instance of itself (and is normally `0%`).
+
+### Verifiable Rewards (RLVR)
+
+Use `reward_fn: verifiable` with a `verifiable_domain` for deterministic, math-checkable rewards — no judge model, no heuristics. Great for GRPO on math, code, or structured-output tasks.
+
+```yaml
+training:
+  reward_fn: verifiable
+  verifiable_domain: math          # or: code, json_schema
+  num_generations: 4
+```
+
+Three built-in domains:
+
+| Domain | What it checks |
+|---|---|
+| `math` | Extracts the final numeric answer (supports `####`, `\boxed{}`) and compares via `float()` equality — no `eval()` on user output |
+| `code` | Executes generated Python with a 5s timeout, 512 MB RLIMIT on POSIX, `python -I -S`, socket patch, ephemeral cwd. Output capped at 10KB. Warning panel on first use |
+| `json_schema` | Validates output against a JSON Schema provided per-example in the dataset |
+
+> **Note:** `code` domain runs untrusted generations. Soup sandboxes aggressively but never trust it for production-grade isolation — run in a VM or container for public data.
+
+
+## Tool-Calling Fine-Tuning
+
+Train models to emit structured function calls (OpenAI-style `tool_calls` with JSON arguments).
+
+```yaml
+base: meta-llama/Llama-3.1-8B-Instruct
+task: sft
+
+data:
+  train: ./data/tool_calls.jsonl
+  format: tool-calling
+
+training:
+  epochs: 3
+  lr: 2e-5
+  quantization: 4bit
+```
+
+**Tool-calling data format:**
+```json
+{"messages": [
+  {"role": "user", "content": "What's the weather in Paris?"},
+  {"role": "assistant", "tool_calls": [
+    {"id": "c1", "type": "function",
+     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}
+  ]}
+]}
+```
+
+Arguments are parsed as JSON only — never `eval()`. `soup eval custom` can score tool-call accuracy (function name + argument JSON equality).
+
+```bash
+soup init --template tool-calling
+```
+
+
+## PPO / Full RLHF Pipeline
+
+Train models with the full RLHF pipeline: SFT warmup → Reward Model → PPO alignment.
+
+```bash
+# Create an RLHF config
+soup init --template rlhf
+```
+
+**Step 1: SFT warmup** — fine-tune a base model on your data:
+```yaml
+base: meta-llama/Llama-3.1-8B-Instruct
+task: sft
+data:
+  train: ./data/train.jsonl
+  format: alpaca
+output: ./output_sft
+```
+
+**Step 2: Train reward model** — learn preferences from human feedback:
+```yaml
+base: meta-llama/Llama-3.1-8B-Instruct
+task: reward_model
+data:
+  train: ./data/preferences.jsonl
+  format: dpo
+output: ./output_rm
+```
+
+**Step 3: PPO alignment** — optimize the policy using the reward model:
+```yaml
+base: meta-llama/Llama-3.1-8B-Instruct
+task: ppo
+data:
+  train: ./data/prompts.jsonl
+  format: chatml
+training:
+  reward_model: ./output_rm
+  epochs: 1
+  ppo_epochs: 4
+  ppo_clip_ratio: 0.2
+  ppo_kl_penalty: 0.05
+  lora:
+    r: 64
+    alpha: 16
+  quantization: 4bit
+output: ./output_ppo
+```
+
+`epochs` controls complete passes over the training dataset. `ppo_epochs`
+controls optimization passes within each PPO update. Soup forwards both values,
+plus `ppo_kl_penalty`, to the active TRL `PPOConfig` names and prints the
+effective schedule during setup.
+
+PPO supports two reward sources:
+- **Reward model** (`reward_model`): pre-trained reward model (from step 2)
+- **Reward function** (`reward_fn`): callable function (same as GRPO — `accuracy`, `format`, or custom `.py`)
+
+
+## KTO Training (Unpaired Preferences)
+
+Train with unpaired preference data — no need for chosen+rejected pairs:
+
+```yaml
+base: meta-llama/Llama-3.1-8B-Instruct
+task: kto
+
+data:
+  train: ./data/kto_train.jsonl
+  format: kto
+
+training:
+  epochs: 3
+  kto_beta: 0.1
+  lora:
+    r: 64
+    alpha: 16
+  quantization: 4bit
+```
+
+**KTO data format:**
+```json
+{"prompt": "What is 2+2?", "completion": "4", "label": true}
+{"prompt": "What is 2+2?", "completion": "Fish", "label": false}
+```
+
+
+## ORPO Training (No Reference Model)
+
+ORPO combines SFT and alignment in one step — no reference model needed:
+
+```yaml
+base: meta-llama/Llama-3.1-8B-Instruct
+task: orpo
+
+data:
+  train: ./data/preferences.jsonl
+  format: dpo
+
+training:
+  epochs: 3
+  orpo_beta: 0.1
+  lora:
+    r: 64
+    alpha: 16
+  quantization: 4bit
+```
+
+
+## SimPO Training (Simple Preference)
+
+SimPO uses length-normalized log probabilities as implicit rewards — reference-free:
+
+```yaml
+base: meta-llama/Llama-3.1-8B-Instruct
+task: simpo
+
+data:
+  train: ./data/preferences.jsonl
+  format: dpo
+
+training:
+  epochs: 3
+  simpo_gamma: 0.5
+  cpo_alpha: 1.0
+  lora:
+    r: 64
+    alpha: 16
+  quantization: 4bit
+```
+
+
+## IPO Training (Regularized Preference)
+
+IPO is a theoretically grounded DPO variant with stronger regularization:
+
+```yaml
+base: meta-llama/Llama-3.1-8B-Instruct
+task: ipo
+
+data:
+  train: ./data/preferences.jsonl
+  format: dpo
+
+training:
+  epochs: 3
+  ipo_tau: 0.1
+  lora:
+    r: 64
+    alpha: 16
+  quantization: 4bit
+```
+
+
+## RAFT — Retrieval-Augmented Fine-Tuning
+
+When you need a model to *cite* the document it's reading instead of hallucinating, RAFT (Stanford 2024) is the canonical recipe. Each training row carries a query, a golden document, a list of distractor documents, and the answer — the model learns to attend to the relevant doc while ignoring the noise.
+
+```yaml
+# soup.yaml
+data:
+  train: ./data/raft.jsonl
+  format: raft
+
+training:
+  citation_faithful: true        # enable citation precision/recall scoring
+  citation_style: bracket        # cite as [doc-1] inline
+  citation_recall_threshold: 0.8 # gate final save on recall >= 80%
+```
+
+```jsonl
+# RAFT JSONL row shape
+{"query": "When was Python released?", "golden_doc": "Python was released in 1991 by Guido van Rossum.", "distractor_docs": ["Ruby was released in 1995.", "Java was released in 1995."], "answer": "1991 [doc-1]"}
+```
+
+```bash
+# Ready-made 8B Llama recipe
+soup recipes show raft-llama3-8b
+soup recipes use raft-llama3-8b
+```
+
+Citation scoring is exposed as a pure kernel for the eval gate:
+
+```python
+from souplite.utils.citation_faithful import score_citations
+
+score = score_citations(
+    predicted="The answer is 1991 [doc-1].",
+    expected_ids=("doc-1",),
+)
+# CitationScore(precision=1.0, recall=1.0, f1=1.0, predicted_count=1, expected_count=1)
+```
+
+Citation-faithful FT is gated to `task in {sft, pretrain}` + `data.format='raft'` — misconfigured runs fail at config load with a named-field message.
+
+Under the hood, a `format: raft` run trains **answer-only**: each row is composed into a prompt (golden + distractor docs, shuffled deterministically by `data.raft_shuffle_seed`, each labelled `[doc-N]`) followed by the answer; the prompt span is masked out of the loss and — when `citation_faithful: true` — the bracketed `[doc-id]` spans in the answer get a boosted per-token loss weight. Rows whose prompt fills `max_length` (answer fully truncated) are dropped with a warning rather than silently shrinking the dataset.
+
+By default the document order is fixed for the whole run. Set `data.raft_epoch_shuffle: true` to **re-permute** the golden + distractor documents *each epoch* (a per-epoch salt folded into the shuffle seed) so the model can't latch onto a fixed citation slot — useful for multi-epoch runs. `epoch=0` reproduces the legacy single-permutation order exactly, so enabling it never changes the first epoch. (v0.71.17)
+
+Score a trained model's citations from the CLI:
+
+```bash
+# {predicted, expected_ids} rows, OR RAFT rows scored against their own golden [doc-N]
+soup eval citation preds.jsonl --style bracket
+# RAFT rows: pass the train-time shuffle seed so the golden id lines up
+soup eval citation raft.jsonl --shuffle-seed 0 --output citation.json
+```
+
+`soup diagnose` also gains a `citation` failure mode that flags a model that stopped citing the supporting document.
+
+
+## RA-DIT — Retrieval-Augmented Dual Instruction Tuning
+
+RA-DIT (Meta 2023) is the two-stage version of RAFT: first train a sentence-transformer retriever (contrastive), then fine-tune the generator on the RAFT-style rows. Two recipes ship paired:
+
+```bash
+# Stage 1 — train the retriever (uses Soup's v0.16 embedding trainer)
+soup recipes use ra-dit-retriever
+soup train
+
+# Stage 2 — train the generator on RAFT data, pointing at the retriever
+soup recipes use ra-dit-llama3-8b
+soup train
+```
+
+The schema enforces stage-task pairing — `ra_dit_stage: retriever` requires `task: embedding`; `ra_dit_stage: generator` requires `task: sft`. A misconfigured recipe fails at config load with a named-field message.
+
+Run both stages in one command with `soup ra-dit`:
+
+```bash
+soup ra-dit --retriever-config retriever.yaml --generator-config generator.yaml
+# preview the plan + the resolved retriever link without training:
+soup ra-dit -r retriever.yaml -g generator.yaml --plan-only
+```
+
+It trains the retriever, then **records** that trained retriever as the generator's paired retriever (writing its output dir into the generator's `training.ra_dit_retriever_model`) and trains the generator RAFT-style. The recorded retriever is the one used at deploy/serve time — stage-2 does not fuse the retriever weights. A plain `soup train` of a generator-stage config with no retriever model set **auto-links** the most-recent RA-DIT retriever run from the Registry; pass `--retriever-model <m>` to override.
+
+
+## Curriculum-Aware Training (BETA)
+
+Layer dynamic re-weighting on top of the static `curriculum` bucketer. Every N steps the trainer aggregates per-sample loss + grad-norm into a per-bucket uncertainty signal, runs it through a softmax (temperature-controlled) with floor (water-filling so no bucket drops below `curriculum_dynamic_floor`), and re-weights the sampler. Empty buckets fall back to the median of populated buckets; degenerate inputs return uniform.
+
+```yaml
+training:
+  curriculum: true                          # static bucketer (v0.23.0)
+  curriculum_buckets: 4
+  curriculum_metric: perplexity             # length (default) | loss | perplexity
+  curriculum_dynamic: true                  # NEW — dynamic re-weighting
+  curriculum_dynamic_recompute_steps: 50    # refresh every 50 global steps
+  curriculum_dynamic_floor: 0.05            # min weight per bucket
+  curriculum_dynamic_temperature: 1.0       # softmax temp on uncertainty
+```
+
+**Bucketing by difficulty percentile (v0.71.5).** When `curriculum_metric` is `loss` or `perplexity`, the dynamic callback assigns each step's sample to a bucket by its *rank* within a rolling 512-step window of the difficulty signal (perplexity = `exp(min(loss, 50))`), instead of the round-robin fallback used for `length`. This keeps the buckets calibrated to the live loss distribution rather than a static length sort. `length` (the default) keeps the round-robin assignment.
+
+Visualise the recorded bucket-weight evolution with `soup runs curriculum-curve <run_id>`.
+
+DDP / grad-accum safety: multi-rank launches must wire an `all_reduce` hook on per-bucket stats (a cross-validator rejects un-coordinated multi-rank runs upfront). Multi-trainer expansion beyond `sft` / `pretrain` is tracked for v0.48.1.
+
+
+## TTS Fine-Tuning (`task='tts'`, BETA, live in v0.71.20)
+
+Live as of v0.71.20 (lifted from the v0.52.0 schema stub). The five families
+(`orpheus`, `sesame_csm`, `llasa`, `spark`, `oute`) are all decoder language
+models, so a TTS fine-tune is **next-token cross-entropy over interleaved
+`[text][audio-codec-token]` chat sequences** — the same objective the SFT
+trainer already runs. `TTSTrainerWrapper` reuses the SFT model/tokenizer/LoRA/CE
+machinery and adds two TTS-specific pieces: per-family emotion-control
+templating and registration of operator-supplied codec special tokens.
+
+There are two workflows:
+
+**Pre-encoded chat (live, validated).** Run the family's audio codec **offline**
+so the assistant turn already contains the discrete codec-token string, then
+train with `data.format: chat`. This is plain cross-entropy and runs on any GPU
+(validated end-to-end on SmolLM2-135M-Instruct).
+
+```yaml
+base: HuggingFaceTB/SmolLM2-135M-Instruct   # or canopylabs/orpheus-3b-0.1-ft
+task: tts
+modality: audio_out
+data:
+  train: ./data/tts_pre_encoded.jsonl   # assistant turns carry codec tokens
+  format: chat
+  new_special_tokens: ["<|codec_0|>", "<|codec_1|>"]   # your codec vocab
+training:
+  tts_family: orpheus
+  tts_emotion: neutral   # Orpheus + Oute only
+  lora: true
+```
+
+Operator-supplied `data.new_special_tokens` are registered (deduplicated, only
+tokens not already in the vocab) and the embedding matrix is resized through the
+(possibly PEFT-wrapped) model so the codec-token ids have rows. Orpheus + Oute
+support emotion conditioning via `training.tts_emotion` from a per-family
+allowlist (Orpheus: neutral / happy / sad / angry / excited / calm / whisper /
+laugh; Oute: neutral / happy / sad / angry / calm / excited) — the wrapper
+prepends the family's emotion control string to the first user turn.
+
+**Live-codec (hardware/dependency-gated).** Setting `data.format: audio` asks
+the trainer to encode raw audio into codec tokens **at train time**, which needs
+the family's heavyweight codec package (`snac` for Orpheus, `moshi` for
+Sesame-CSM, `xcodec2` for Llasa, `sparktts` for Spark, `outetts` for Oute). The
+**Orpheus** path is live — install `pip install snac` and a 24 kHz mono wav is
+encoded to SNAC codec tokens end-to-end (audio is duration- and byte-capped and
+read through an `O_NOFOLLOW` fd). The other four families still surface a
+friendly per-family `RuntimeError` naming the required `pip install` and are not
+yet validated on the maintainer's box — use the pre-encoded workflow above for a
+runnable fine-tune with those.
+
+Five ready-made recipes ship: `orpheus-tts-sft`, `sesame-csm-tts`, `llasa-tts`,
+`spark-tts`, `oute-tts` — copy with `soup recipes use <name>`. Cross-validators
+reject the `mlx` backend, `modality != audio_out`, and emotion tags outside the
+per-family allowlist.
+
+
+## Classifier / Reranker / Cross-Encoder Training (BETA, v0.52.0)
+
+Three new task types build on the existing embedding trainer: `task: classifier` (single-label or multi-label sequence classification), `task: reranker` (pointwise retrieval scoring), `task: cross_encoder` (paired-input scoring). Schema-only; live trainer wrapper in v0.52.1.
+
+```yaml
+base: BAAI/bge-base-en-v1.5
+task: classifier
+data:
+  train: ./data/classification.jsonl
+training:
+  num_labels: 3
+  classifier_kind: single_label
+  label_names: [negative, neutral, positive]
+```
+
+`num_labels` is bounded `[1, 1024]` with explicit bool-before-int rejection; `label_names` (optional) must be unique, ≤128 chars each, and match `num_labels` in length when set.
+
+
+## Knowledge Distillation (BETA, v0.52.0)
+
+New `task: distill` with `training.teacher_model` (HF id or local path), `training.distill_divergence` (`kl` / `forward_kl` / `reverse_kl` / `js` — `kl` canonicalises to `forward_kl`), and `training.distill_temperature` (bounded `[0.05, 100.0]`, finite-only). Schema-only; live loop in v0.52.1.
+
+```yaml
+base: meta-llama/Llama-3.2-1B
+task: distill
+data:
+  train: ./data/distill.jsonl
+training:
+  teacher_model: meta-llama/Llama-3.1-8B
+  distill_divergence: forward_kl
+  distill_temperature: 2.0
+```
+
+The cross-validator rejects `task='distill'` without `teacher_model`, and rejects `teacher_model` / `distill_*` fields when `task` is anything other than `distill`.
+
+
+## EBFT + GDPO (BETA, v0.52.0)
+
+Energy-Based Fine-Tuning (axolotl) lands as `training.ebft_variant ∈ {structured, strided}` + `training.ebft_temperature` (bounded `[1e-4, 100.0]`). Gated to `task: sft`. Generalized DPO lands as `training.gdpo_variant ∈ {standard, length_normalized, margin}` — gated to `task ∈ {dpo, preference}`. Live loss kernels in v0.52.1.
+
+
+## gpt-oss `reasoning_effort` + `train_on_eot` (v0.52.0)
+
+`training.reasoning_effort: low | medium | high` injects a system-prefix token at training time for gpt-oss models; `training.train_on_eot: true` includes explicit EOT/EOS control tokens in the SFT loss (axolotl `train_on_eot`). Both are gated to the SFT-family task set (`sft` / `pretrain` / `distill` / `classifier` / `reranker` / `cross_encoder`) — setting them on DPO / GRPO / PPO / etc. fails at config load. Live formatter wiring in v0.52.1.
+
+
+## MoLE — Per-Token Adapter Routing (`task='moe_lora_routing'`)
+
+Train a small **gating network** that routes each token to a weighted blend of N frozen task
+LoRAs (Mixture of LoRA Experts, Wu et al. 2024). The base model and every task adapter stay
+frozen — only the router learns which adapter(s) each token should use.
+
+```yaml
+base: HuggingFaceTB/SmolLM2-135M
+task: moe_lora_routing
+modality: text
+backend: transformers
+
+data:
+  train: ./data/chat.jsonl
+  max_length: 512
+
+training:
+  mole_task_adapters:        # 2-64 LoRA adapter paths (HF ids or local dirs)
+    - ./adapters/math
+    - ./adapters/code
+    - ./adapters/chat
+  mole_top_k: 2              # 1 <= top_k <= len(mole_task_adapters)
+  mole_temperature: 1.0      # [1e-6, 100.0]
+  epochs: 1
+```
+
+The gate is the only trainable parameter; it is saved as `mole_gate.pt` alongside the run.
+`compute_loss` runs N+1 forwards per step (base + each adapter under `torch.no_grad()`, blended
+by the per-token gate weights) so step time scales with the number of task adapters. Training
+only — there is no serve-time MoLE path yet. (v0.71.12)
+
+
+## Architecture Knobs — Mixture-of-Depths, LLaMA Pro, LongLoRA
+
+Three architecture transforms that were schema-only are now live for SFT / Pretrain on
+Llama / Qwen / Mistral (LongLoRA also covers Phi). All apply at trainer setup:
+
+```yaml
+training:
+  # Mixture-of-Depths (arXiv 2404.02258): route only the top-k tokens through each
+  # block. capacity_factor is the fraction of tokens that get the residual update.
+  use_mod: true
+  mod_capacity_factor: 0.125
+
+  # LLaMA Pro: append zero-initialised identity decoder blocks and train only the new
+  # ones (freeze_trainable_layers freezes the originals).
+  expand_layers: 4
+  freeze_trainable_layers: 4
+
+  # LongLoRA S²: shifted-sparse attention on the Q/K projections for long-context tuning.
+  use_longlora: true
+```
+
+`use_mod` / `expand_layers` attach AFTER `get_peft_model` so the new routers / blocks are
+trainable. Unsupported architectures warn + skip (MoD, block expansion); `use_longlora` is
+rejected at the schema gate for non-supported arches and for `use_ring_attention` / FlashAttention-3.
+Pick one of MoD / LLaMA Pro / LongLoRA per run. (v0.71.12)
+
+
+## Spectrum — Targeted Training on Layer SNR (`soup spectrum scan`, v0.71.23)
+
+Spectrum (arXiv:2406.06623) fine-tunes only the layers with the most signal. `soup spectrum scan`
+streams a model's `.safetensors` shards **one tensor at a time** — there is no model load, so it
+runs on a CPU box even for very large models — and computes a singular-value signal-to-noise ratio
+per weight matrix with a Marchenko-Pastur noise threshold. It ranks the layers within each
+module-type group and prints the top `--top-percent` as a ready-to-paste config block:
+
+```bash
+soup spectrum scan --model HuggingFaceTB/SmolLM2-135M --top-percent 25 --modules mlp,attn -o patch.yaml
+```
+
+```yaml
+# patch.yaml — paste into your soup.yaml
+training:
+  unfrozen_parameters:
+  - model.layers.0.mlp.down_proj
+  - model.layers.29.self_attn.v_proj
+  # ...
+```
+
+Then train with the patch — the SFT trainer freezes **every** parameter and unfreezes only the
+matched set (full fine-tuning, LoRA off):
+
+```yaml
+base: HuggingFaceTB/SmolLM2-135M
+task: sft
+training:
+  quantization: none        # Spectrum trains float weights — quantization off
+  unfrozen_parameters:
+  - model.layers.0.mlp.down_proj
+  - model.layers.29.self_attn.v_proj
+```
+
+`unfrozen_parameters` entries are regex patterns matched against parameter names. It requires
+`task: sft`, `backend: transformers`, `modality: text`, and `quantization: none`, and is mutually
+exclusive with LoRA features (`use_dora` / `use_vera` / `moe_lora` / `relora_steps` / …) and the
+other freezing knobs (`freeze_layers` / `freeze_ratio` / `train_router_only` / `expand_layers`) —
+a conflicting combo is rejected loudly at config load. Scans cache under `~/.soup/spectrum/`
+(override with `SOUP_SPECTRUM_CACHE_DIR`); `--no-cache` skips it. `--modules mlp,attn` (vs the
+`all` default) is recommended for very large models — it skips the giant embedding/lm_head matrices.
+The SNR kernel is pure-numpy and transpose-invariant, so GPT-2 `Conv1D` weights score the same as
+Linear weights. (v0.71.23)

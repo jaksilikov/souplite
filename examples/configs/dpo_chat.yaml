@@ -1,0 +1,43 @@
+# DPO Chat Example
+# Train a chat model with Direct Preference Optimization.
+# Uses Llama-2-7B-chat and preference data (prompt / chosen / rejected).
+#
+# The bundled dataset is a 5-row FORMAT sample, not a training set.
+# Point `data.train` at your own preference pairs for a real run.
+# See examples/data/README.md.
+#
+# Usage:
+#   soup train --config examples/configs/dpo_chat.yaml
+
+base: meta-llama/Llama-2-7b-chat-hf
+task: dpo
+backend: transformers
+
+data:
+  train: examples/data/chat_preferences.jsonl
+  format: dpo
+  max_length: 2048
+
+training:
+  epochs: 2
+  lr: 5e-4
+  dpo_beta: 0.1
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  quantization: 8bit
+  scheduler: cosine
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  logging_steps: 10
+  save_steps: 100
+  lora:
+    r: 64
+    alpha: 128
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj
+      - k_proj
+      - o_proj
+
+output: ./output_dpo_chat/

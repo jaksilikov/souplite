@@ -1,0 +1,9 @@
+SoupLite (Low-RAM Optimization Engine)
+Author & Developer: Muhtar Jaksilikov
+
+SoupLite is an independent low-RAM optimization framework developed by Muhtar Jaksilikov to enable LLM fine-tuning, post-training, dataset processing, and Web UI operations on low-resource machines with up to 2 GB RAM.
+
+Inspiration & Acknowledgment:
+The project architecture and concept were inspired by "Soup" (originally by Makazhan Alpamys). While original Soup requires a minimum of 4 GB+ RAM, SoupLite was completely re-architected and tuned by Muhtar Jaksilikov for strict sub-2 GB RAM execution limits.
+
+Licensed under the Apache License 2.0.

@@ -1,0 +1,26 @@
+{
+  "templates": {
+    "audio": "audio.yaml",
+    "bco": "bco.yaml",
+    "chat": "chat.yaml",
+    "code": "code.yaml",
+    "embedding": "embedding.yaml",
+    "eu-ai-act": "eu-ai-act.yaml",
+    "hipaa": "hipaa.yaml",
+    "ipo": "ipo.yaml",
+    "kto": "kto.yaml",
+    "longcontext": "longcontext.yaml",
+    "medical": "medical.yaml",
+    "moe": "moe.yaml",
+    "orpo": "orpo.yaml",
+    "pretrain": "pretrain.yaml",
+    "reasoning": "reasoning.yaml",
+    "rlhf": "rlhf.yaml",
+    "simpo": "simpo.yaml",
+    "soc2": "soc2.yaml",
+    "sr-11-7": "sr-11-7.yaml",
+    "tool-calling": "tool-calling.yaml",
+    "vision": "vision.yaml"
+  },
+  "version": 1
+}

@@ -1,0 +1,96 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "souplite"
+version = "0.75.0"
+description = "Ultra-lightweight LLM fine-tuning & post-training tool optimized for low RAM (<=2GB). Created by Muhtar Jaksilikov."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10,<3.14"
+authors = [
+    { name = "Muhtar Jaksilikov", email = "muhtar.jaksilikov@example.com" },
+]
+keywords = ["llm", "fine-tuning", "lora", "qlora", "machine-learning", "low-ram", "2gb-ram"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+    "huggingface-hub>=0.16.0",
+    "plotext>=5.2.0",
+    "packaging>=21.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.6.0",
+    "transformers>=5.16.1,<6.0.0",
+    "peft>=0.20.0,<1.0.0",
+    "trl>=0.29.0,<1.0.0",
+    "datasets>=2.14.0",
+    "bitsandbytes>=0.41.0",
+    "accelerate>=0.27.0",
+]
+all = ["souplite[train,serve,ui,data,mcp]"]
+eval = ["lm-eval>=0.4.0"]
+aider = ["aider-chat>=0.86.2,<0.87"]
+data = ["datasketch>=1.6.0", "scikit-learn>=1.0.0"]
+wandb = ["wandb>=0.15.0,<0.18.0"]
+dev = ["souplite[train,mcp,data]", "cryptography>=41.0.0", "reportlab>=4.0.0", "pytest>=7.0", "ruff>=0.1.0", "pytest-cov>=4.0", "httpx>=0.24.0", "mypy>=1.8.0", "pre-commit>=3.5.0", "fastapi>=0.104.0"]
+ui = ["fastapi>=0.104.0", "uvicorn>=0.24.0"]
+serve = ["fastapi>=0.104.0", "uvicorn>=0.24.0"]
+serve-fast = ["vllm>=0.4.3", "fastapi>=0.104.0", "uvicorn>=0.24.0"]
+generate = ["httpx>=0.24.0"]
+deepspeed = ["deepspeed>=0.12.0"]
+fast = ["unsloth>=2024.8"]
+vision = ["Pillow>=9.0.0"]
+qat = ["torchao>=0.18.0"]
+liger = ["liger-kernel>=0.3.0"]
+ring-attn = ["ring-flash-attn>=0.1.0"]
+onnx = ["optimum[onnxruntime]>=1.16.0"]
+tensorrt = ["tensorrt_llm>=0.9.0"]
+audio = ["librosa>=0.10.0", "soundfile>=0.12.0"]
+awq = ["autoawq>=0.2.0"]
+gptq = ["auto-gptq>=0.7.0"]
+sglang = ["sglang>=0.2.0", "fastapi>=0.104.0", "uvicorn>=0.24.0", "httpx>=0.24.0"]
+mlx = [
+    "mlx>=0.20.0",
+    "mlx-lm>=0.31.3",
+    "transformers>=5.16.1,<6.0.0",
+]
+cce = ["cut-cross-entropy>=24.10.0"]
+tui = ["textual>=0.50.0"]
+trackers = ["mlflow>=2.0.0", "swanlab>=0.3.0", "trackio>=0.0.1"]
+remote = ["fsspec>=2024.1.0", "s3fs>=2024.1.0", "gcsfs>=2024.1.0", "adlfs>=2024.1.0"]
+mix = ["scikit-optimize>=0.9.0"]
+data-pro = ["langdetect>=1.0.9", "presidio-analyzer>=2.2.0"]
+sign = ["cryptography>=41.0.0"]
+pdf = ["reportlab>=4.0.0"]
+carbon = ["codecarbon>=2.0.0"]
+compile = ["dspy-ai>=2.5.0", "textgrad>=0.1.0", "gepa>=0.0.1"]
+modal = ["modal>=0.60.0"]
+mcp = ["mcp>=1.10.0,<3"]
+
+[project.scripts]
+souplite = "souplite.cli:run"
+soup = "souplite.cli:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/souplite"]
+artifacts = [
+  "src/souplite/data/_fixtures/*.jsonl",
+  "src/souplite/data/_fixtures/unlearning/*.jsonl",
+  "src/souplite/data/_fixtures/behavior/*.jsonl",
+  "src/souplite/data/_fixtures/gate/*.jsonl",
+]

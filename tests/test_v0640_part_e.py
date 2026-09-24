@@ -1,0 +1,374 @@
+"""v0.64.0 Part E — Shell completions with config introspection."""
+
+from __future__ import annotations
+
+import pytest
+from typer.testing import CliRunner
+
+runner = CliRunner()
+
+
+def test_module_imports():
+    from souplite.utils import completions
+
+    assert hasattr(completions, "SUPPORTED_SHELLS")
+    assert hasattr(completions, "validate_shell")
+    assert hasattr(completions, "render_bash_script")
+    assert hasattr(completions, "render_zsh_script")
+    assert hasattr(completions, "render_fish_script")
+    assert hasattr(completions, "render_completion_script")
+    assert hasattr(completions, "complete_recipe_name")
+    assert hasattr(completions, "complete_target_modules")
+
+
+# ---------------------------------------------------------------------------
+# SUPPORTED_SHELLS
+# ---------------------------------------------------------------------------
+
+
+def test_supported_shells():
+    from souplite.utils.completions import SUPPORTED_SHELLS
+
+    assert "bash" in SUPPORTED_SHELLS
+    assert "zsh" in SUPPORTED_SHELLS
+    assert "fish" in SUPPORTED_SHELLS
+
+
+def test_supported_shells_is_frozenset():
+    from souplite.utils.completions import SUPPORTED_SHELLS
+
+    assert isinstance(SUPPORTED_SHELLS, frozenset)
+
+
+# ---------------------------------------------------------------------------
+# validate_shell
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("v", ["bash", "zsh", "fish"])
+def test_validate_shell_happy(v):
+    from souplite.utils.completions import validate_shell
+
+    assert validate_shell(v) == v
+
+
+def test_validate_shell_case_insensitive():
+    from souplite.utils.completions import validate_shell
+
+    assert validate_shell("BASH") == "bash"
+    assert validate_shell("Fish") == "fish"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [True, False, None, "", "tcsh", "powershell", "ksh", "csh", "x" * 33],
+)
+def test_validate_shell_rejects(bad):
+    from souplite.utils.completions import validate_shell
+
+    with pytest.raises((TypeError, ValueError)):
+        validate_shell(bad)
+
+
+def test_validate_shell_rejects_null_byte():
+    from souplite.utils.completions import validate_shell
+
+    with pytest.raises(ValueError, match="null"):
+        validate_shell("ba\x00sh")
+
+
+# ---------------------------------------------------------------------------
+# render_*_script
+# ---------------------------------------------------------------------------
+
+
+def test_render_bash_script_basic():
+    from souplite.utils.completions import render_bash_script
+
+    text = render_bash_script()
+    assert "_soup_complete" in text or "complete -F" in text
+    assert "soup" in text
+
+
+def test_render_zsh_script_basic():
+    from souplite.utils.completions import render_zsh_script
+
+    text = render_zsh_script()
+    assert "#compdef soup" in text or "_soup" in text
+
+
+def test_render_fish_script_basic():
+    from souplite.utils.completions import render_fish_script
+
+    text = render_fish_script()
+    assert "complete -c soup" in text or "complete --command soup" in text
+
+
+def test_render_completion_script_dispatch():
+    from souplite.utils.completions import render_completion_script
+
+    bash = render_completion_script("bash")
+    assert "soup" in bash
+    zsh = render_completion_script("zsh")
+    assert "soup" in zsh
+    fish = render_completion_script("fish")
+    assert "soup" in fish
+
+
+def test_render_completion_script_rejects_unknown():
+    from souplite.utils.completions import render_completion_script
+
+    with pytest.raises(ValueError):
+        render_completion_script("tcsh")
+
+
+# ---------------------------------------------------------------------------
+# complete_recipe_name
+# ---------------------------------------------------------------------------
+
+
+def test_complete_recipe_name_returns_list():
+    from souplite.utils.completions import complete_recipe_name
+
+    suggestions = complete_recipe_name("")
+    assert isinstance(suggestions, list)
+    assert len(suggestions) > 0
+
+
+def test_complete_recipe_name_filters_prefix():
+    from souplite.utils.completions import complete_recipe_name
+
+    suggestions = complete_recipe_name("llama")
+    # Every result must start with the prefix (case-insensitive)
+    for s in suggestions:
+        assert s.lower().startswith("llama")
+
+
+def test_complete_recipe_name_empty_for_nonsense():
+    from souplite.utils.completions import complete_recipe_name
+
+    suggestions = complete_recipe_name("definitely-not-a-recipe-zzzzzz")
+    assert suggestions == []
+
+
+def test_complete_recipe_name_rejects_bool():
+    from souplite.utils.completions import complete_recipe_name
+
+    with pytest.raises(TypeError):
+        complete_recipe_name(True)  # type: ignore[arg-type]
+
+
+def test_complete_recipe_name_null_byte_returns_empty():
+    from souplite.utils.completions import complete_recipe_name
+
+    # Defensive: null byte returns empty rather than raising.
+    assert complete_recipe_name("foo\x00bar") == []
+
+
+# ---------------------------------------------------------------------------
+# complete_target_modules
+# ---------------------------------------------------------------------------
+
+
+def test_complete_target_modules_default():
+    from souplite.utils.completions import complete_target_modules
+
+    # With no base, returns canonical Llama-shape modules
+    suggestions = complete_target_modules("", base=None)
+    assert "q_proj" in suggestions
+    assert "k_proj" in suggestions
+
+
+def test_complete_target_modules_filters_prefix():
+    from souplite.utils.completions import complete_target_modules
+
+    suggestions = complete_target_modules("q_", base=None)
+    for s in suggestions:
+        assert s.startswith("q_")
+
+
+def test_complete_target_modules_rejects_bool():
+    from souplite.utils.completions import complete_target_modules
+
+    with pytest.raises(TypeError):
+        complete_target_modules(True, base=None)  # type: ignore[arg-type]
+
+
+def test_complete_target_modules_handles_unknown_base():
+    """When base is set but we can't probe it, fall back to default modules."""
+    from souplite.utils.completions import complete_target_modules
+
+    suggestions = complete_target_modules("", base="some/nonexistent-model")
+    # Should still return non-empty default
+    assert len(suggestions) > 0
+
+
+# --- v0.71.1 #210 — HF-config introspection per base ---
+
+
+def test_complete_target_modules_introspects_gpt2_config():
+    """A cached gpt2-family config yields its real linear-layer names."""
+    import types
+    from unittest.mock import patch
+
+    from souplite.utils.completions import complete_target_modules
+
+    fake_cfg = types.SimpleNamespace(model_type="gpt2", architectures=["GPT2LMHeadModel"])
+    with patch("transformers.AutoConfig.from_pretrained", return_value=fake_cfg) as m:
+        out = complete_target_modules("", base="gpt2")
+    # gpt2 uses c_attn / c_proj / c_fc, NOT the Llama q_proj shape.
+    assert "c_attn" in out
+    assert "q_proj" not in out
+    # local-only probe — never a network download from a completer.
+    _, kwargs = m.call_args
+    assert kwargs.get("local_files_only") is True
+
+
+def test_complete_target_modules_introspects_llama_config():
+    import types
+    from unittest.mock import patch
+
+    from souplite.utils.completions import complete_target_modules
+
+    fake_cfg = types.SimpleNamespace(model_type="llama")
+    with patch("transformers.AutoConfig.from_pretrained", return_value=fake_cfg):
+        out = complete_target_modules("", base="meta-llama/Llama-3.1-8B")
+    assert "gate_proj" in out
+    assert "q_proj" in out
+
+
+def test_complete_target_modules_unknown_arch_falls_back():
+    import types
+    from unittest.mock import patch
+
+    from souplite.utils.completions import complete_target_modules
+
+    fake_cfg = types.SimpleNamespace(model_type="totally_unknown_arch_xyz")
+    with patch("transformers.AutoConfig.from_pretrained", return_value=fake_cfg):
+        out = complete_target_modules("", base="weird/model")
+    # Unknown arch → canonical default shape.
+    assert "q_proj" in out
+
+
+def test_complete_target_modules_no_model_type_falls_back():
+    import types
+    from unittest.mock import patch
+
+    from souplite.utils.completions import complete_target_modules
+
+    # A config object with no ``model_type`` attribute at all → default shape.
+    fake_cfg = types.SimpleNamespace()
+    with patch("transformers.AutoConfig.from_pretrained", return_value=fake_cfg):
+        out = complete_target_modules("", base="weird/no-model-type")
+    assert "q_proj" in out
+
+
+def test_complete_target_modules_non_string_model_type_falls_back():
+    import types
+    from unittest.mock import patch
+
+    from souplite.utils.completions import complete_target_modules
+
+    # A non-string ``model_type`` (e.g. an int) is rejected → default shape.
+    fake_cfg = types.SimpleNamespace(model_type=123)
+    with patch("transformers.AutoConfig.from_pretrained", return_value=fake_cfg):
+        out = complete_target_modules("", base="weird/non-string-model-type")
+    assert "q_proj" in out
+
+
+def test_complete_target_modules_introspection_error_falls_back():
+    from unittest.mock import patch
+
+    from souplite.utils.completions import complete_target_modules
+
+    with patch(
+        "transformers.AutoConfig.from_pretrained", side_effect=OSError("not cached")
+    ):
+        out = complete_target_modules("", base="not/cached")
+    assert "q_proj" in out
+
+
+def test_complete_target_modules_introspection_respects_prefix():
+    import types
+    from unittest.mock import patch
+
+    from souplite.utils.completions import complete_target_modules
+
+    fake_cfg = types.SimpleNamespace(model_type="gpt2")
+    with patch("transformers.AutoConfig.from_pretrained", return_value=fake_cfg):
+        out = complete_target_modules("c_a", base="gpt2")
+    assert out == ["c_attn"]
+
+
+def test_complete_target_modules_transformers_missing_falls_back(monkeypatch):
+    """When transformers is not installed, the completer never raises."""
+    import builtins
+
+    from souplite.utils.completions import complete_target_modules
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "transformers" or name.startswith("transformers."):
+            raise ImportError("transformers not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    out = complete_target_modules("", base="meta-llama/Llama-3.1-8B")
+    assert "q_proj" in out
+
+
+# ---------------------------------------------------------------------------
+# CLI smoke
+# ---------------------------------------------------------------------------
+
+
+def test_cli_completions_help():
+    from souplite.cli import app
+
+    result = runner.invoke(app, ["completions", "--help"])
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+
+
+def test_cli_completions_bash():
+    from souplite.cli import app
+
+    result = runner.invoke(app, ["completions", "bash"])
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    assert "soup" in result.stdout
+
+
+def test_cli_completions_zsh():
+    from souplite.cli import app
+
+    result = runner.invoke(app, ["completions", "zsh"])
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+
+
+def test_cli_completions_fish():
+    from souplite.cli import app
+
+    result = runner.invoke(app, ["completions", "fish"])
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+
+
+def test_cli_completions_unknown_shell():
+    from souplite.cli import app
+
+    result = runner.invoke(app, ["completions", "tcsh"])
+    assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# Source-wiring regression
+# ---------------------------------------------------------------------------
+
+
+def test_no_heavy_top_level_imports():
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "src" / "souplite" / "utils" / "completions.py"
+    text = src.read_text(encoding="utf-8")
+    import re
+    for bad in ["^import torch", "^from torch", "^import transformers", "^from transformers"]:
+        assert not re.search(bad, text, re.MULTILINE)

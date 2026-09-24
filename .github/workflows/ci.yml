@@ -1,0 +1,505 @@
+name: CI
+
+on:
+  push:
+    # `release/**` is here so a release branch gets the matrix on the exact
+    # tree that will be tagged. A pull request builds the MERGE of head and
+    # main, which for a release cut from an older tag is not the tree that
+    # ships, so a PR run cannot stand in for this one.
+    branches: [main, 'release/**']
+  pull_request:
+    branches: [main]
+
+# Supersede, do not queue.
+#
+# Measured 2026-09-14: 49 of 83 queued runs were already obsolete -- a newer run
+# existed on the same branch -- because no workflow declared a concurrency group,
+# so every push left its predecessor queued forever. Arrival was 8.3 runs/hour
+# against a service rate of 4.6, i.e. the queue diverged rather than backed up.
+#
+# Cancellation is deliberately PULL-REQUEST ONLY, and the GROUP KEY is what
+# enforces that -- not `cancel-in-progress`. Measured 2026-09-14, after the
+# first version of this block shipped: `cancel-in-progress: false` protects a
+# run that is already RUNNING and does nothing for one still PENDING on the
+# group. Four consecutive pushes to `main` lost their runs that way, each
+# cancelled within two seconds of the next one starting (b0a63382 cancelled at
+# 14:17:33, 52641e99 started 14:17:31), which is the exact opposite of what the
+# comment here used to claim. So a push keys the group on the COMMIT and is
+# therefore alone in it; a pull request keys on the ref and supersedes itself.
+# The release checklist requires a green matrix on the exact commit being
+# tagged, and that now survives a later push instead of depending on a freeze.
+#
+# What this costs: per-commit CI history WITHIN a pull request. Three pushes in
+# a row now leave results for the third only. That is a signal the review rule
+# already discards -- merge requires green on the CURRENT head -- which is why
+# it is the right thing to trade.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Bound every job explicitly.
+#
+# Until now only `pytorch-smoke` declared a `timeout-minutes`, so every other
+# job inherited GitHub's 360-minute default -- six hours per cell, across a 3x3
+# matrix, before the platform intervenes at all.
+#
+# The prompt for this was #763, where `test (windows-latest, 3.11)` sat
+# `pending` at 0 seconds for ~22 hours. It could not be cleared by hand:
+# `gh run rerun --job` refuses a job that has never started, so the only exit
+# was GitHub's own eviction of a never-scheduled job at the 24-hour mark.
+#
+# READ THIS BEFORE EXPECTING THE VALUES BELOW TO PREVENT THAT -- they do not.
+# `timeout-minutes` starts counting when a job ACQUIRES a runner, not when it
+# is created, so queued time is not charged against it and a job that never
+# starts is not covered by any number here. That half needs the auto-retrigger
+# tracked in #1017. What these bound is the other half of the same incident: a
+# job that does start and then hangs, which today burns 360 minutes before it
+# shows up as anything a reviewer can act on.
+#
+# Values are ~2x the slowest SUCCESSFUL duration observed over 15 recent
+# completed runs on `main` and on pull requests -- execution time only
+# (created_at -> started_at was 4-5s in that sample, so queueing is not folded
+# into these figures):
+#
+#   job                        median   max   ->  limit
+#   test (windows-latest, *)     41.5  44.6       90
+#   test (ubuntu/macos, *)       ~25   31.8       90   (one value for the matrix)
+#   pytorch-smoke                 2.6  11.1       20   (unchanged)
+#   transformers-floor            2.5   2.8       20
+#   mlx-smoke                     0.8   0.9       20
+#   type-check                    0.3   0.4       15
+#   lint                          0.2   0.2       15
+#
+# The short jobs are deliberately NOT set to 2x their measured time. Each of
+# them installs over the network -- pip, and for `lint` a release tarball from
+# the GitHub CDN with `--retry 3 --retry-all-errors` behind it -- so their
+# realistic worst case is a slow mirror, not slow compute, and a 15-20 minute
+# floor is what absorbs that. A timeout that fires on a legitimately slow run
+# is worse than no timeout, because it teaches people to re-run a red cell
+# instead of reading it.
+#
+# `test` takes a single value rather than a per-OS expression: 90 is slack for
+# ubuntu/macos, but the alternative is arithmetic in a matrix expression to
+# save runner-minutes that are only ever spent when a job is already hung.
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      # benchmarks/harness/ carries real parsing logic — mlx_sft_smoke.py
+      # derives the published throughput figure from mlx-lm's stdout — but was
+      # outside this line until now, so a lint error there could not turn CI red.
+      - run: ruff check src/souplite/ scripts/ tests/ benchmarks/
+      - name: Lint the workflows themselves
+        # `check-yaml` and a YAML parser both accept a workflow GitHub will
+        # reject: 195d60b used the `runner` context in a job-level `env:` block,
+        # which is valid YAML and invalid Actions, and the whole matrix died
+        # before any job produced a log. actionlint checks context availability,
+        # expression syntax, action inputs, and shellchecks `run:` blocks.
+        #
+        # Installed as the pinned upstream release binary with its published
+        # SHA-256 checked, NOT via `go install`. That is a stronger supply-chain
+        # position than building from source -- the bytes that run are verified
+        # against a hash committed here -- and it removes the failure that took
+        # this job down on 2026-08-31: actionlint v1.7.12 declares
+        # `go >= 1.25.0`, ubuntu-latest ships go 1.24.13, so `go install`
+        # silently switched toolchains and died fetching one:
+        #
+        #   go: switching to go >= 1.25.0: module golang.org/toolchain:
+        #   read ".../@v/list": stream error: INTERNAL_ERROR; received from peer
+        #
+        # A transient network fault in a job that is now a REQUIRED check blocks
+        # every merge in the repository, so this step must not depend on an
+        # implicit toolchain download. `--retry-all-errors` covers the rest.
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --retry-all-errors             --output "${RUNNER_TEMP}/actionlint.tar.gz" "$url"
+          echo "${ACTIONLINT_SHA256}  ${RUNNER_TEMP}/actionlint.tar.gz"             | sha256sum --check --strict -
+          tar -xzf "${RUNNER_TEMP}/actionlint.tar.gz" -C "${RUNNER_TEMP}" actionlint
+          "${RUNNER_TEMP}/actionlint" -color
+
+  type-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Non-blocking type-check baseline. The codebase adopts annotations
+    # incrementally, so mypy findings are surfaced as a warning annotation (and
+    # in the step log) but do NOT fail the job — the check stays green until
+    # types are tightened enough to promote it to a required gate. Reads
+    # [tool.mypy] from pyproject.toml (files = ["src/souplite"],
+    # ignore_missing_imports = true).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install mypy
+      - name: mypy (non-blocking)
+        run: |
+          mypy || echo "::warning title=mypy::Type issues reported (non-blocking baseline — see the log above)"
+
+  mlx-smoke:
+    # #394: prove the documented standalone install on an Apple Silicon runner.
+    # Keep this separate from the main matrix because `.[dev]` deliberately
+    # installs the PyTorch/TRL stack and would hide an accidental MLX dependency.
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install only the MLX runtime and smoke-test dependency
+        run: pip install -e ".[mlx]" pytest
+      - name: Verify MLX imports and the PyTorch training stack is absent
+        run: |
+          python -c "import mlx.core, mlx_lm; print(mlx.core.__version__, mlx_lm.__version__)"
+          python -c "import importlib.util; names=('torch','trl','datasets','peft','accelerate','bitsandbytes'); present=[name for name in names if importlib.util.find_spec(name)]; assert not present, f'unexpected training dependencies: {present}'"
+      - name: Run one-step MLX SFT through the real CLI
+        run: pytest -o addopts= -m smoke -k mlx_sft_smoke -q tests/test_smoke_train.py
+      - name: Run the MLX flight-recorder tests
+        # These importorskip on `mlx.core` / `mlx_lm`, which the 3x3 matrix does
+        # not install (`mlx` is not in [dev]), so this is the only job that can
+        # execute them. Without this step, replacing the whole MLX per-row loss
+        # with a constant 0.0 left the suite green (#1018 review).
+        run: pytest -o addopts= -q tests/test_rewind_mlx.py
+  torchao-contract:
+    # #826: every torchao class Soup names is resolved against the REAL package
+    # here. The 3x3 matrix cannot do it -- `torchao` is not in `[dev]`, so those
+    # cells skip these tests, which is how three names torchao never exported
+    # (NVFP4Config, Int8DynActInt4Config, Float8DynActFloat8Config) survived
+    # behind a stub and a MagicMock.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install the QAT extra (torchao) beside the dev stack
+        # One spec with both extras: `-e ".[dev]" ".[qat]"` asks pip for
+        # souplite twice, once editable and once not, and resolution fails.
+        run: pip install -e ".[dev,qat]" "torch>=2.6.0"
+      - name: Prove torchao is actually importable, so the tests do not skip
+        run: python -c "import torchao; print(torchao.__version__)"
+      - name: Resolve every torchao class Soup asks for
+        # test_v07121.py runs here too, and not only in the matrix: it is the
+        # suite that fakes torchao, so with the real package installed it is
+        # the one that catches a resolver which answers from a cached
+        # `torchao.*` submodule after the root import has been made to fail.
+        # That exact regression shipped in this PR's first push and was found
+        # by hand; running both files in one job is what makes it a CI failure
+        # next time.
+        run: |
+          pytest -o addopts= -q \
+            tests/test_issue826_torchao_class_names.py \
+            tests/test_v07121.py
+  pytorch-smoke:
+    # #596: exercise the real PyTorch SFT + DPO training pipeline on every PR.
+    # Keep this separate from the 3x3 matrix so the expensive model-backed
+    # smoke tests run once, not nine times.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set HF cache location
+        run: echo "HF_HOME=$RUNNER_TEMP/hf-cache" >> "$GITHUB_ENV"
+
+      - name: Restore PyTorch smoke HF cache
+        id: hf-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/hf-cache
+          key: hf-pytorch-smoke-${{ runner.os }}-${{ hashFiles('tests/test_smoke_train.py', 'pyproject.toml') }}
+          restore-keys: |
+            hf-pytorch-smoke-${{ runner.os }}-
+
+      - name: Install training dependencies
+        # torch>=2.6 is load-bearing, not belt-and-braces: sshleifer/tiny-gpt2
+        # ships only pytorch_model.bin, and transformers refuses torch.load
+        # below 2.6.0 under CVE-2025-32434. Removing this pin because "[dev]
+        # already pulls torch" breaks the job with a message naming the CVE
+        # rather than the cause.
+        run: pip install -e ".[dev]" "torch>=2.6.0"
+
+      - name: Warm tiny GPT-2 cache
+        shell: python
+        run: |
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              "sshleifer/tiny-gpt2",
+              allow_patterns=["*.json", "*.txt", "*.bin"],
+          )
+
+      - name: Run PyTorch smoke tests
+        run: python -m pytest -o addopts= -m smoke -q tests/
+      - name: Save PyTorch smoke HF cache
+        if: success() && steps.hf-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/hf-cache
+          key: hf-pytorch-smoke-${{ runner.os }}-${{ hashFiles('tests/test_smoke_train.py', 'pyproject.toml') }}
+
+  # #502/#503/#522/#571/#651: install the exact Torch 2.6.0 / Transformers 5.16.1 /
+  # trl 0.29 / PEFT 0.20 support stack and Plotext 6.0.0 so pip cannot silently
+  # upgrade the cell, then assert every pinned compatibility boundary.
+  transformers-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install with Transformers floor constraints
+        run: pip install -e ".[dev]" -c .github/constraints/transformers-floor.txt
+      - name: Verify constrained dependency graph
+        run: python -m pip check
+      - name: Assert installed versions match floor constraints
+        run: |
+          python - <<'PY'
+          import importlib.metadata as md
+          import re
+          from pathlib import Path
+
+          constraints = Path(".github/constraints/transformers-floor.txt").read_text(
+              encoding="utf-8"
+          )
+          pairs = re.findall(
+              r"^([A-Za-z0-9_-]+)==([^\s#]+)\s*$",
+              constraints,
+              re.MULTILINE,
+          )
+          expected = dict(pairs)
+          assert len(expected) == len(pairs), "duplicate package pin in floor constraints"
+          for name in ("torch", "transformers", "trl", "peft", "plotext"):
+              assert name in expected, f"floor constraints missing exact {name} pin"
+              want = expected[name]
+              got = md.version(name)
+              assert got == want, (
+                  f"floor job expected {name}=={want} from "
+                  f".github/constraints/transformers-floor.txt, got {got} — "
+                  f"pip silently upgraded, ignored -c, or constraints drifted"
+              )
+              print(f"{name}={got} (matches constraints)")
+          PY
+      - name: Prove the pinned torch actually supports trl's FSDP2 path
+        run: |
+          python - <<'PY'
+          import torch
+          import torch.distributed.fsdp as fsdp
+
+          assert hasattr(fsdp, "FSDPModule"), (
+              "torch.distributed.fsdp.FSDPModule is absent — this is the #651 "
+              "root cause; the declared torch floor does not support trl 0.29"
+          )
+          import trl
+          from trl import DPOTrainer, KTOTrainer
+
+          print(
+              "trl",
+              trl.__version__,
+              "imports on torch",
+              torch.__version__,
+          )
+          PY
+      - name: Run Transformers floor compatibility guard
+        run: >
+          pytest -o addopts= --no-cov -q
+          tests/test_transformers_floor_compat.py
+          tests/test_issue571_qwen4_exp.py
+          tests/test_plotext_compat.py
+          tests/test_bugfixes.py::TestDiffModelLoading
+          tests/test_issue636_torch_floor.py
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      # Force UTF-8 mode on all platforms. Without this, Windows defaults to
+      # cp1252 ('charmap'), which fails when importing upstream packages that
+      # read their own source / data files without an explicit encoding
+      # (seen with trl.trainer.grpo_trainer on windows-latest / py3.11).
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # The Web UI escaping tests run `safe_html.js` under node, and skip when
+      # node is absent. Runner images happen to ship one, so the skip would be
+      # silent: pin it, or the only tests that execute the real escaping logic
+      # can disappear without anything turning red.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Pin the HF cache to a deterministic path
+        # Set here and not in the job-level `env:` block: the `runner` context
+        # is not available there (only github / needs / strategy / matrix /
+        # vars / secrets / inputs are), and referencing it makes GitHub reject
+        # the whole workflow file before any job starts.
+        #
+        # Why a fixed path at all: the default ~/.cache/huggingface sits under
+        # a different user on each runner OS, so actions/cache cannot restore
+        # it by one key. Kept OUTSIDE the checkout because it lands ~0.5 GB,
+        # which the tests that walk cwd for containment would otherwise scan.
+        shell: bash
+        run: echo "HF_HOME=$RUNNER_TEMP/hf-cache" >> "$GITHUB_ENV"
+      - name: Restore HF Hub cache
+        id: hf-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/hf-cache
+          # Keyed on this file, so editing the model list below re-warms.
+          key: hf-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: hf-${{ runner.os }}-
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Warm HF Hub cache (models the tests load)
+        # Pre-download the models the unit tests load, with retries, so a
+        # transient HF Hub 429 (Too Many Requests) on a single matrix cell does
+        # not red the whole run. Never fails the job: if warming can't complete
+        # it emits a ::warning:: and lets the test step run as before.
+        #
+        # The list is EMPIRICAL — it is what a full local run actually leaves in
+        # ~/.cache/huggingface, not what greps for repo-shaped strings in
+        # tests/ suggest (most of those are config fixtures that never
+        # download). The list grew because run 30942028585 reddened
+        # windows/3.10 on a 429 for SmolLM2-135M-Instruct/config.json — a repo
+        # this step did not warm, so the retry loop above never protected it.
+        #
+        # "gpt2" is deliberately unqualified: tests ask for the bare id, which
+        # caches as models--gpt2. Warming "openai-community/gpt2" instead would
+        # fill a different directory and every test would still miss.
+        id: warm
+        shell: python
+        run: |
+          import os
+          import time
+          from huggingface_hub import snapshot_download
+
+          # Per-repo file sets, also empirical: these are the files a populated
+          # local cache actually holds after running the suite. Downloading
+          # whole snapshots instead costs 1.6 GB per cell — mostly the TF /
+          # Flax copies and the pytorch_model.bin twin of a safetensors file
+          # that transformers never opens when safetensors is present.
+          TEXT_ONLY = ["*.json", "*.txt", "*.model"]      # config + tokenizer
+          SAFETENSORS = TEXT_ONLY + ["*.safetensors"]
+          # Two of the fixture repos predate safetensors and ship weights ONLY
+          # as pytorch_model.bin. Both are a few MB, so pulling the .bin costs
+          # nothing here — but excluding it left the ASR test unable to build a
+          # model offline, which a full offline run of the suite caught.
+          LEGACY_BIN = TEXT_ONLY + ["*.bin"]
+
+          models = [
+              ("sshleifer/tiny-gpt2", LEGACY_BIN),
+              ("hf-internal-testing/tiny-random-gpt2", SAFETENSORS),
+              ("hf-internal-testing/tiny-random-LlamaForCausalLM", SAFETENSORS),
+              ("hf-internal-testing/tiny-random-WhisperForConditionalGeneration", LEGACY_BIN),
+              # Weights are never loaded for these two — only the config the
+              # 429 above was raised on.
+              ("HuggingFaceTB/SmolLM2-135M", TEXT_ONLY),
+              ("HuggingFaceTB/SmolLM2-135M-Instruct", TEXT_ONLY),
+              ("gpt2", SAFETENSORS),
+          ]
+
+          # One budget for the whole list, not per repo. Run 30947949103
+          # showed why: on windows/3.11 ALL SIX repos failed EVERY attempt,
+          # including the tiny fixtures every other cell fetched in under a
+          # second. The Hub had cut that runner off for the duration — so
+          # burning a fresh retry ladder on repo #2 the moment repo #1 gave up
+          # just spends the budget faster without ever waiting out the block.
+          deadline = time.monotonic() + 360
+          pending = list(models)
+          delay = 10
+
+          while pending and time.monotonic() < deadline:
+              still_pending = []
+              for repo, allow in pending:
+                  try:
+                      snapshot_download(repo, allow_patterns=allow)
+                      print(f"warmed {repo}")
+                  except Exception as exc:  # noqa: BLE001 — best effort, never fail the job
+                      print(f"{repo}: {type(exc).__name__}: {exc}")
+                      still_pending.append((repo, allow))
+              pending = still_pending
+              if pending:
+                  print(f"{len(pending)} repo(s) left; retrying in {delay}s")
+                  time.sleep(delay)
+                  delay = min(delay * 2, 60)
+
+          for repo, _ in pending:
+              print(f"::warning title=HF cache::could not warm {repo} within the retry budget")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"warmed={'partial' if pending else 'all'}\n")
+      - name: Save HF Hub cache
+        # Only a COMPLETE warm is saved. A partial one would freeze the very
+        # gap this step exists to close: the key is content-addressed, so a
+        # cache written while a model was 429-ing is never replaced, and every
+        # later run would restore the same hole.
+        #
+        # ANY cell may save, deliberately. Restricting this to 3.11 to avoid
+        # redundant uploads is what left Windows with no cache at all in run
+        # 30947949103: 3.11 was the one cell the Hub cut off, so the two
+        # healthy Windows cells were not allowed to save what they had. The
+        # losers of the resulting race log "unable to reserve cache" and move
+        # on, which is far cheaper than an OS that never gets a cache.
+        if: always() && steps.warm.outputs.warmed == 'all' && steps.hf-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/hf-cache
+          key: hf-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+      - name: Run unit tests with coverage
+        run: pytest tests/ -v --tb=short --junitxml=report.xml --cov=souplite --cov-report=xml:coverage.xml --cov-report=term-missing:skip-covered
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+      - name: Update test count badge
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          TESTS=$(python -c "
+          import xml.etree.ElementTree as ET
+          root = ET.parse('report.xml').getroot()
+          ts = root.find('testsuite')
+          print(ts.attrib.get('tests', '0') if ts is not None else root.attrib.get('tests', '0'))
+          ")
+          echo "Test count: $TESTS"
+          # --fail-with-body: surface non-2xx (e.g. 401 expired token) as a
+          # CI failure with the response body printed, instead of silently
+          # discarding to /dev/null and leaving the badge stale.
+          curl --fail-with-body -sS \
+            -X PATCH \
+            -H "Authorization: token ${{ secrets.GIST_TOKEN }}" \
+            -d "{\"files\":{\"soup_tests.json\":{\"content\":\"{\\\"schemaVersion\\\":1,\\\"label\\\":\\\"tests\\\",\\\"message\\\":\\\"$TESTS passed\\\",\\\"color\\\":\\\"brightgreen\\\"}\"}}}" \
+            "https://api.github.com/gists/65fdc943f85f3b2c46ecddb415c2b779"

@@ -1,0 +1,681 @@
+"""`soup env` — hermetic env lockfile + ABI-mismatch detection (v0.64.0 Part C).
+
+The "CUDA hell" problem: a fine-tune that worked on Friday breaks on
+Monday because PyPI silently upgraded ``transformers`` past the trainer's
+compat band, or because the box rebuilt with a different CUDA. v0.34
+``soup doctor`` surfaces some of this; v0.64 makes it lockable.
+
+``snapshot_env`` reads Python + CUDA + key package versions from the
+current interpreter via ``importlib.metadata`` (no network, no shell-out
+to pip beyond what stdlib already does). ``write_lock`` persists the
+snapshot as ``soup-env.lock``. ``check_abi_compat`` compares two locks
+and produces an ``AbiCheck`` report listing ABI-sensitive drifts.
+
+Live full uv/nix-backed install + recreate lands in v0.64.1; v0.64.0
+ships the schema, snapshotter, comparator, and CLI surface so an
+operator can capture an environment + detect drift today.
+
+Public surface:
+- ``EnvEntry`` frozen dataclass (name / version / source).
+- ``EnvLock`` frozen dataclass (soup version / python / platform / cuda
+  / entries tuple / timestamp).
+- ``AbiCheck`` frozen dataclass (ok / drift_count / changes tuple).
+- ``TRACKED_PACKAGES`` tuple of names whose drift is ABI-relevant.
+- ``snapshot_env()`` -> EnvLock.
+- ``write_lock(lock, path)`` / ``read_lock(path)`` -> atomic JSON.
+- ``check_abi_compat(a, b)`` -> AbiCheck.
+- ``DEFAULT_LOCK_FILE = "soup-env.lock"``.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import hashlib
+import json
+import logging
+import os
+import platform as _platform
+import sys
+from dataclasses import dataclass
+from typing import Iterable, Mapping, Optional, Tuple
+
+from souplite.utils.paths import atomic_write_text, is_under_cwd
+
+_LOG = logging.getLogger(__name__)
+
+# Emitted when the declared-bounds audit cannot run at all. It still degrades to
+# a clean report so `env check` keeps working, but a checker that reports clean
+# without having checked must say so (#368 review).
+_PACKAGING_MISSING_WARNING = (
+    "packaging is not importable, so the declared-bounds audit was skipped; "
+    "`soup env check` cannot confirm installed versions against Soup's own "
+    "declared bounds. Reinstall souplite to restore it."
+)
+
+DEFAULT_LOCK_FILE = "soup-env.lock"
+_MAX_NAME_LEN = 256
+_MAX_VERSION_LEN = 128
+_MAX_PLATFORM_LEN = 256
+_MAX_PY_VERSION_LEN = 64
+_MAX_CUDA_VERSION_LEN = 64
+_MAX_ENTRIES = 4096
+
+# Source allowlist — defends against schema drift on read.
+_VALID_SOURCES = frozenset({"pip", "conda", "system", "wheel", "unknown"})
+
+# Extras that make up a Soup TRAINING install — the environment #368 is about
+# (a training venv later contaminated by `pip install "souplite[serve-fast]"`).
+# `[all]` and `[dev]` both re-declare `souplite[train,...]`, which pip flattens,
+# so metadata restates the training bounds under each of these three. `[mlx]`
+# shares the same Transformers 5 range after #502, so its ABI bound is safe to
+# enforce too (including for a standalone MLX install).
+_TRAINING_INSTALL_EXTRAS: Tuple[str, ...] = ("train", "all", "dev", "mlx")
+
+# ABI-sensitive packages — drift here is most likely to break training.
+TRACKED_PACKAGES: Tuple[str, ...] = (
+    "torch",
+    "transformers",
+    "peft",
+    "trl",
+    "accelerate",
+    "datasets",
+    "bitsandbytes",
+    "huggingface-hub",
+    "flash-attn",
+    "xformers",
+    "deepspeed",
+    "unsloth",
+    "vllm",
+    "sentencepiece",
+    "tokenizers",
+)
+
+
+def _check_non_empty_str(value: object, fld: str, *, max_len: int) -> None:
+    if isinstance(value, bool):
+        raise TypeError(f"{fld} must be str, not bool")
+    if not isinstance(value, str):
+        raise TypeError(f"{fld} must be str, got {type(value).__name__}")
+    if not value:
+        raise ValueError(f"{fld} must be non-empty")
+    if "\x00" in value:
+        raise ValueError(f"{fld} must not contain null bytes")
+    if len(value) > max_len:
+        raise ValueError(f"{fld} too long (> {max_len} chars)")
+
+
+@dataclass(frozen=True)
+class EnvEntry:
+    """One package -> version row in the lockfile."""
+
+    name: str
+    version: str
+    source: str
+
+    def __post_init__(self) -> None:
+        _check_non_empty_str(self.name, "name", max_len=_MAX_NAME_LEN)
+        _check_non_empty_str(self.version, "version", max_len=_MAX_VERSION_LEN)
+        _check_non_empty_str(self.source, "source", max_len=32)
+        if self.source not in _VALID_SOURCES:
+            allowed = ", ".join(sorted(_VALID_SOURCES))
+            raise ValueError(
+                f"source must be one of {{{allowed}}}, got {self.source!r}"
+            )
+
+
+@dataclass(frozen=True)
+class EnvLock:
+    """Captured snapshot of the running environment."""
+
+    soup_version: str
+    python_version: str
+    platform: str
+    cuda_version: Optional[str]
+    entries: Tuple[EnvEntry, ...]
+    created_at: str
+
+    def __post_init__(self) -> None:
+        _check_non_empty_str(self.soup_version, "soup_version", max_len=64)
+        _check_non_empty_str(
+            self.python_version, "python_version", max_len=_MAX_PY_VERSION_LEN
+        )
+        _check_non_empty_str(self.platform, "platform", max_len=_MAX_PLATFORM_LEN)
+        if self.cuda_version is not None:
+            _check_non_empty_str(
+                self.cuda_version, "cuda_version", max_len=_MAX_CUDA_VERSION_LEN
+            )
+        if not isinstance(self.entries, tuple):
+            raise TypeError("entries must be a tuple of EnvEntry")
+        if len(self.entries) > _MAX_ENTRIES:
+            raise ValueError(
+                f"too many entries ({len(self.entries)} > {_MAX_ENTRIES})"
+            )
+        for entry in self.entries:
+            if not isinstance(entry, EnvEntry):
+                raise TypeError("every entry must be EnvEntry")
+        _check_non_empty_str(self.created_at, "created_at", max_len=64)
+
+
+@dataclass(frozen=True)
+class AbiCheck:
+    """Outcome of an ABI-compat comparison between two ``EnvLock``s."""
+
+    ok: bool
+    drift_count: int
+    changes: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be bool")
+        if isinstance(self.drift_count, bool) or not isinstance(self.drift_count, int):
+            raise TypeError("drift_count must be int")
+        if self.drift_count < 0:
+            raise ValueError("drift_count must be >= 0")
+        if not isinstance(self.changes, tuple):
+            raise TypeError("changes must be a tuple of str")
+        for entry in self.changes:
+            if not isinstance(entry, str):
+                raise TypeError("changes entries must be str")
+
+
+# Distribution whose declared bounds `check_declared_bounds` audits — Soup's own.
+_SELF_DIST = "souplite"
+
+
+@dataclass(frozen=True)
+class BoundViolation:
+    """One installed package that violates Soup's own declared version bound."""
+
+    name: str
+    installed: str
+    specifier: str
+    extra: Optional[str]
+
+    def __post_init__(self) -> None:
+        _check_non_empty_str(self.name, "name", max_len=_MAX_NAME_LEN)
+        _check_non_empty_str(self.installed, "installed", max_len=_MAX_VERSION_LEN)
+        _check_non_empty_str(self.specifier, "specifier", max_len=_MAX_VERSION_LEN)
+        if self.extra is not None:
+            _check_non_empty_str(self.extra, "extra", max_len=_MAX_NAME_LEN)
+
+
+@dataclass(frozen=True)
+class BoundsCheck:
+    """Outcome of auditing installed packages against Soup's declared bounds."""
+
+    ok: bool
+    violation_count: int
+    violations: Tuple[BoundViolation, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be bool")
+        if isinstance(self.violation_count, bool) or not isinstance(
+            self.violation_count, int
+        ):
+            raise TypeError("violation_count must be int")
+        if self.violation_count < 0:
+            raise ValueError("violation_count must be >= 0")
+        if not isinstance(self.violations, tuple):
+            raise TypeError("violations must be a tuple of BoundViolation")
+        for entry in self.violations:
+            if not isinstance(entry, BoundViolation):
+                raise TypeError("every violation must be BoundViolation")
+
+
+def check_declared_bounds(
+    requirements: Iterable[str],
+    installed: Mapping[str, str],
+) -> BoundsCheck:
+    """Flag any *installed* package whose version violates Soup's declared bound.
+
+    ``requirements`` are raw PEP 508 strings exactly as
+    ``importlib.metadata.requires`` returns them, so the bound is read from
+    package metadata and never a hardcoded second copy — that second copy is
+    the drift this is meant to catch (#368). ``installed`` maps package name to
+    the installed version.
+
+    A requirement whose package is *not* installed is skipped: an optional
+    ``[train]`` dependency you never installed is not drift. An unparseable
+    requirement or version is skipped rather than crashing the diagnostic.
+    """
+    # ``packaging`` is a declared core dependency (#368 review), so it is present
+    # wherever Soup runs. If it somehow is not, the audit still degrades to
+    # "clean" rather than breaking `env check` — but it says so first: a checker
+    # that silently reports clean when it could not run is the wrong failure
+    # direction (#368 review).
+    try:
+        from packaging.markers import UndefinedEnvironmentName
+        from packaging.requirements import InvalidRequirement, Requirement
+        from packaging.utils import canonicalize_name
+        from packaging.version import InvalidVersion
+    except ImportError:  # pragma: no cover — packaging is a declared dependency
+        _LOG.warning(_PACKAGING_MISSING_WARNING)
+        return BoundsCheck(ok=True, violation_count=0, violations=())
+
+    installed_by_key = {canonicalize_name(k): v for k, v in installed.items()}
+    tracked_keys = {canonicalize_name(name) for name in TRACKED_PACKAGES}
+
+    violations: list[BoundViolation] = []
+    seen: set[str] = set()
+    for raw in requirements:
+        try:
+            req = Requirement(raw)
+        except InvalidRequirement:
+            continue
+        if not req.specifier:
+            continue
+        # #368 review — EVALUATE the marker, don't just name it. A requirement
+        # gated behind `extra == "X"` is only Soup's declared bound when the user
+        # opted into `souplite[X]`; evaluating in the base environment (no extra
+        # active) deselects it, so a package installed for other reasons (e.g.
+        # wandb) is not a false-positive violation.
+        #
+        # ...except for the ABI-relevant set under a TRAINING extra. Since the
+        # v0.71.0 deps-split, `transformers`, `torch` and `trl` live in metadata
+        # ONLY under `extra == "train"/"all"/"dev"`, so deselecting every gated
+        # requirement also deselected the bounded `transformers` case #368 was
+        # filed about — leaving `typer` as the single bound this could ever fire
+        # on.
+        #
+        # The extra scope is load-bearing, not decoration: a tracked NAME alone
+        # is not enough because unrelated extras may legitimately carry their
+        # own bounds. Only the supported training/MLX environments are selected.
+        def selects(marker, extra: str) -> bool:
+            try:
+                return bool(marker.evaluate({"extra": extra}))
+            except UndefinedEnvironmentName:
+                return False
+
+        key = canonicalize_name(req.name)
+        if req.marker is not None:
+            selected = selects(req.marker, "")
+            if not selected and key in tracked_keys:
+                selected = any(
+                    selects(req.marker, extra) for extra in _TRAINING_INSTALL_EXTRAS
+                )
+            if not selected:
+                continue
+        have = installed_by_key.get(key)
+        if have is None:
+            continue
+        try:
+            satisfied = req.specifier.contains(have, prereleases=True)
+        except InvalidVersion:
+            continue
+        if satisfied:
+            continue
+        # Canonical-name dedup: count each violating package once even though a
+        # tracked bound is restated under every extra that pulls it in — metadata
+        # lists `transformers` under `train`, `all` AND `dev` (#368 review).
+        if key in seen:
+            continue
+        seen.add(key)
+        violations.append(
+            BoundViolation(
+                name=req.name,
+                installed=have,
+                specifier=str(req.specifier),
+                extra=None,
+            )
+        )
+
+    return BoundsCheck(
+        ok=not violations,
+        violation_count=len(violations),
+        violations=tuple(violations),
+    )
+
+
+def current_declared_bounds_check(dist_name: str = _SELF_DIST) -> BoundsCheck:
+    """Audit the *running* environment against ``dist_name``'s declared bounds.
+
+    Reads the requirement strings from installed metadata and the installed
+    versions via ``importlib.metadata``. An absent distribution (e.g. running
+    from source without an install) yields a clean report — there is no
+    declared metadata to audit against.
+
+    The bounds come from the *installed* metadata, which on an editable checkout
+    can lag the working tree (a `pip install -e .` snapshot). A cap you just
+    tightened in ``pyproject.toml`` is only enforced here after a reinstall —
+    #368 review.
+    """
+    # `requires-python = ">=3.10"`, so `importlib.metadata` is always importable
+    # here; guarding it would be an unreachable branch that silently reports
+    # clean (#368 review).
+    from importlib.metadata import PackageNotFoundError, requires
+
+    try:
+        reqs = requires(dist_name)
+    except PackageNotFoundError:
+        return BoundsCheck(ok=True, violation_count=0, violations=())
+    if not reqs:
+        return BoundsCheck(ok=True, violation_count=0, violations=())
+
+    try:
+        from packaging.requirements import InvalidRequirement, Requirement
+    except ImportError:  # pragma: no cover — packaging is a declared dependency
+        _LOG.warning(_PACKAGING_MISSING_WARNING)
+        return BoundsCheck(ok=True, violation_count=0, violations=())
+
+    installed: dict[str, str] = {}
+    for raw in reqs:
+        try:
+            name = Requirement(raw).name
+        except InvalidRequirement:
+            continue
+        if name in installed:
+            continue
+        ver = _detect_package_version(name)
+        if ver is not None:
+            installed[name] = ver
+
+    return check_declared_bounds(reqs, installed)
+
+
+def _detect_cuda_version() -> Optional[str]:
+    """Best-effort CUDA version probe via env / nvidia-smi / torch.
+
+    Returns ``None`` if no CUDA found. Lazy-imports torch only if it's
+    already in ``sys.modules`` so we never pay the import on a CPU box.
+
+    Path-parse handles POSIX (``/usr/local/cuda-12.1``) AND Windows
+    (``C:\\Program Files\\...\\CUDA\\v12.1``) — splits on every common
+    separator and strips a leading ``v`` when present.
+    """
+    cuda_env = os.environ.get("CUDA_VERSION") or os.environ.get("CUDA_HOME")
+    if cuda_env:
+        # Split on both POSIX and Windows separators so e.g.
+        # `C:\Program Files\...\CUDA\v12.1` produces `v12.1` as the last
+        # token instead of one giant path.
+        tokens = cuda_env.replace("\\", "/").split("/")
+        for tok in reversed(tokens):
+            cleaned = tok.lstrip("v")  # strip Windows `v` prefix
+            if cleaned and cleaned[0].isdigit():
+                return cleaned
+            if "-" in tok:
+                tail = tok.rsplit("-", 1)[-1].lstrip("v")
+                if tail and tail[0].isdigit():
+                    return tail
+    # If torch is already imported, ask it.
+    torch_mod = sys.modules.get("torch")
+    if torch_mod is not None:
+        ver = getattr(getattr(torch_mod, "version", None), "cuda", None)
+        if isinstance(ver, str) and ver:
+            return ver
+    return None
+
+
+def _detect_package_version(name: str) -> Optional[str]:
+    """Read installed-package version via ``importlib.metadata``.
+
+    Returns ``None`` for either "not installed" (``PackageNotFoundError``)
+    or "metadata parse failed" (``OSError`` / ``ValueError``). All other
+    exceptions propagate to surface real bugs (matches v0.33.0 #47 /
+    v0.40.3 #33 narrow-except policy).
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except ImportError:  # pragma: no cover — py < 3.8
+        return None
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
+    except (OSError, ValueError):  # pragma: no cover — corrupt metadata
+        return None
+
+
+def snapshot_env() -> EnvLock:
+    """Capture the current Python/CUDA/package versions as an ``EnvLock``."""
+    import souplite
+
+    py_v = ".".join(str(x) for x in sys.version_info[:3])
+    plat = f"{_platform.system().lower()}-{_platform.machine().lower()}"
+    cuda_v = _detect_cuda_version()
+
+    entries: list[EnvEntry] = []
+    for name in TRACKED_PACKAGES:
+        ver = _detect_package_version(name)
+        if ver is None:
+            continue
+        try:
+            entries.append(EnvEntry(name=name, version=ver, source="pip"))
+        except (TypeError, ValueError):
+            # Skip malformed version strings.
+            continue
+
+    return EnvLock(
+        soup_version=souplite.__version__,
+        python_version=py_v,
+        platform=plat,
+        cuda_version=cuda_v,
+        entries=tuple(entries),
+        created_at=_dt.datetime.now(_dt.timezone.utc).isoformat(),
+    )
+
+
+def _entry_to_dict(e: EnvEntry) -> dict:
+    return {"name": e.name, "version": e.version, "source": e.source}
+
+
+def _entry_from_dict(d: dict) -> EnvEntry:
+    if not isinstance(d, dict):
+        raise ValueError("entry must be a dict")
+    return EnvEntry(
+        name=str(d.get("name", "")),
+        version=str(d.get("version", "")),
+        source=str(d.get("source", "unknown")),
+    )
+
+
+def write_lock(lock: EnvLock, path: str) -> None:
+    """Atomically write an ``EnvLock`` to JSON under cwd containment."""
+    if not isinstance(lock, EnvLock):
+        raise TypeError(f"lock must be EnvLock, got {type(lock).__name__}")
+    payload = {
+        "schema_version": "1",
+        "soup_version": lock.soup_version,
+        "python_version": lock.python_version,
+        "platform": lock.platform,
+        "cuda_version": lock.cuda_version,
+        "entries": [_entry_to_dict(e) for e in lock.entries],
+        "created_at": lock.created_at,
+    }
+    text = json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False)
+    atomic_write_text(text, path, prefix=".envlock.", field="env lock")
+
+
+def read_lock(path: str) -> EnvLock:
+    """Read a previously-written ``EnvLock`` JSON.
+
+    Containment + symlink rejection BEFORE existence probe so a crafted
+    path cannot distinguish "outside cwd" from "missing" (matches v0.55.0
+    / v0.62.0 ordering policy).
+    """
+    import stat as _stat
+
+    if not isinstance(path, str):
+        raise TypeError(f"path must be str, got {type(path).__name__}")
+    if "\x00" in path:
+        raise ValueError("lock path must not contain null bytes")
+    if not is_under_cwd(path):
+        raise ValueError(f"lock {path!r} is outside cwd")
+    if os.path.lexists(path):
+        st = os.lstat(path)
+        if _stat.S_ISLNK(st.st_mode):
+            raise ValueError("lock path must not be a symlink")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    with open(path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    if not isinstance(payload, dict):
+        raise ValueError("lock root must be a dict")
+    entries_raw = payload.get("entries", [])
+    if not isinstance(entries_raw, list):
+        raise ValueError("entries must be a list")
+    entries = tuple(_entry_from_dict(e) for e in entries_raw)
+    return EnvLock(
+        soup_version=str(payload.get("soup_version", "")),
+        python_version=str(payload.get("python_version", "")),
+        platform=str(payload.get("platform", "unknown")),
+        cuda_version=payload.get("cuda_version"),
+        entries=entries,
+        created_at=str(payload.get("created_at", "")),
+    )
+
+
+def compute_env_hash(lock: EnvLock) -> str:
+    """Deterministic 64-hex SHA-256 over a lock's *content* (v0.71.1 #224).
+
+    Excludes ``created_at`` (and the on-disk ``schema_version``) so that
+    re-snapshotting the same environment yields the same hash — which lets
+    ``soup lock write`` auto-derive ``--env-hash`` from a ``soup-env.lock``
+    without the timestamp churning the closure on every run. Entries are
+    sorted so package ordering does not affect the digest. The output is
+    lowercase 64-hex so it is accepted by
+    :func:`souplite.utils.soup_lock.compute_lock_closure`.
+    """
+    if not isinstance(lock, EnvLock):
+        raise TypeError(f"lock must be EnvLock, got {type(lock).__name__}")
+    payload = {
+        "soup_version": lock.soup_version,
+        "python_version": lock.python_version,
+        "platform": lock.platform,
+        "cuda_version": lock.cuda_version,
+        "entries": sorted(
+            (_entry_to_dict(e) for e in lock.entries),
+            key=lambda d: (d["name"], d["version"], d["source"]),
+        ),
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_INSTALL_PLAN_FORMATS = frozenset({"uv-pip", "requirements"})
+
+
+def render_install_plan(lock: EnvLock, fmt: str = "uv-pip") -> str:
+    """Render a reproducible install plan from a lock (v0.71.1 #209).
+
+    Two formats:
+
+    - ``"uv-pip"`` — a commented header (python / platform / CUDA) followed
+      by one ``uv pip install --python <minor> '<name>==<version>'`` line per
+      ``pip`` entry. Non-pip entries (conda / system / wheel) are surfaced as
+      ``# <source>: <name>==<version>`` comment lines so they are visible but
+      not silently installed via pip.
+    - ``"requirements"`` — a bare ``requirements.txt`` body (``name==version``
+      per pip entry; non-pip entries as comments).
+
+    Deliberately *print-only*: it never shells out to a package manager —
+    recreating a venv is environment-dependent (venv path, interpreter
+    location, index config), so the operator (or CI) copy/pastes or pipes
+    the rendered commands. No ``--apply`` / subprocess in v0.71.1.
+
+    Note: the ``name==version`` pins assume the PEP 440 version strings that
+    ``importlib.metadata`` reported when the lock was snapshotted. The plan is
+    a *human-inspectable* artifact — review it before piping into a shell;
+    editable / VCS / local-wheel installs surface only as their resolved
+    version and may need manual adjustment.
+    """
+    if not isinstance(lock, EnvLock):
+        raise TypeError(f"lock must be EnvLock, got {type(lock).__name__}")
+    if fmt not in _INSTALL_PLAN_FORMATS:
+        allowed = ", ".join(sorted(_INSTALL_PLAN_FORMATS))
+        raise ValueError(f"format must be one of {{{allowed}}}, got {fmt!r}")
+
+    py_minor = ".".join(lock.python_version.split(".")[:2])
+    lines: list[str] = []
+    if fmt == "uv-pip":
+        lines.append(f"# soup env fix — install plan from {DEFAULT_LOCK_FILE}")
+        lines.append(f"# python {lock.python_version} | platform {lock.platform}")
+        lines.append(f"# CUDA: {lock.cuda_version or 'none'}")
+        for e in lock.entries:
+            if e.source == "pip":
+                lines.append(
+                    f"uv pip install --python {py_minor} '{e.name}=={e.version}'"
+                )
+            else:
+                lines.append(f"# {e.source}: {e.name}=={e.version}")
+    else:  # requirements
+        for e in lock.entries:
+            if e.source == "pip":
+                lines.append(f"{e.name}=={e.version}")
+            else:
+                lines.append(f"# {e.source}: {e.name}=={e.version}")
+    return "\n".join(lines) + "\n"
+
+
+def write_requirements_txt(lock: EnvLock, path: str) -> None:
+    """Atomically write a ``requirements.txt`` body from a lock (v0.71.1 #209)."""
+    if not isinstance(lock, EnvLock):
+        raise TypeError(f"lock must be EnvLock, got {type(lock).__name__}")
+    text = render_install_plan(lock, fmt="requirements")
+    atomic_write_text(text, path, prefix=".requirements.", field="requirements")
+
+
+def check_abi_compat(a: EnvLock, b: EnvLock) -> AbiCheck:
+    """Compare two EnvLocks; flag ABI-sensitive drifts.
+
+    Drift sources (in order of impact):
+    1. Python minor version change.
+    2. Platform string change.
+    3. CUDA version change.
+    4. Any TRACKED_PACKAGES version change.
+
+    Returns ``AbiCheck(ok=True)`` iff *zero* drift sources fire.
+    """
+    if not isinstance(a, EnvLock):
+        raise TypeError(f"a must be EnvLock, got {type(a).__name__}")
+    if not isinstance(b, EnvLock):
+        raise TypeError(f"b must be EnvLock, got {type(b).__name__}")
+
+    changes: list[str] = []
+    # Python minor: 3.10.x vs 3.11.x is ABI-different
+    a_py = ".".join(a.python_version.split(".")[:2])
+    b_py = ".".join(b.python_version.split(".")[:2])
+    if a_py != b_py:
+        changes.append(f"python: {a.python_version} -> {b.python_version}")
+
+    if a.platform != b.platform:
+        changes.append(f"platform: {a.platform} -> {b.platform}")
+
+    if (a.cuda_version or None) != (b.cuda_version or None):
+        changes.append(f"cuda: {a.cuda_version} -> {b.cuda_version}")
+
+    by_a = {e.name.lower(): e.version for e in a.entries}
+    by_b = {e.name.lower(): e.version for e in b.entries}
+    for name in sorted(set(by_a) | set(by_b)):
+        va = by_a.get(name)
+        vb = by_b.get(name)
+        if va != vb:
+            changes.append(f"{name}: {va} -> {vb}")
+
+    return AbiCheck(
+        ok=not changes,
+        drift_count=len(changes),
+        changes=tuple(changes),
+    )
+
+
+__all__ = [
+    "AbiCheck",
+    "BoundViolation",
+    "BoundsCheck",
+    "DEFAULT_LOCK_FILE",
+    "EnvEntry",
+    "EnvLock",
+    "TRACKED_PACKAGES",
+    "check_abi_compat",
+    "check_declared_bounds",
+    "compute_env_hash",
+    "current_declared_bounds_check",
+    "read_lock",
+    "render_install_plan",
+    "snapshot_env",
+    "write_lock",
+    "write_requirements_txt",
+]

@@ -1,0 +1,403 @@
+"""Reward Model trainer — wraps trl.RewardTrainer.
+
+Trains a reward model from preference data (prompt + chosen + rejected).
+The resulting model scores text sequences with a scalar reward, used by
+PPO training to align a policy model.
+
+Full RLHF pipeline:  SFT → Reward Model → PPO
+"""
+
+import time
+from pathlib import Path
+from typing import Optional
+
+from rich.console import Console
+
+from souplite.config.schema import SoupConfig
+from souplite.data.chat_templates import apply_chat_template_override
+from souplite.trainer.loss_summary import summarize_training_loss
+from souplite.utils.gpu import (
+    bf16_fp16_flags,
+    estimate_batch_size,
+    model_size_from_name,
+    resolve_device_map,
+    resolve_frozen_base_load_dtype,
+)
+from souplite.utils.mixed_precision import align_trainable_dtype_for_fp16
+from souplite.utils.seeding import apply_training_seed, training_seed_kwargs
+
+console = Console()
+
+
+class RewardModelTrainerWrapper:
+    """High-level wrapper for reward model training from SoupConfig.
+
+    Trains an AutoModelForSequenceClassification on preference data
+    (prompt/chosen/rejected) using TRL's RewardTrainer. The trained model
+    can then be used as the reward signal for PPO training.
+
+    Data format: same as DPO — requires 'prompt', 'chosen', 'rejected' fields.
+    """
+
+    def __init__(
+        self,
+        config: SoupConfig,
+        device: str = "cuda",
+        report_to: str = "none",
+        deepspeed_config: Optional[str] = None,
+        fsdp_config: Optional[dict] = None,
+        trust_remote_code: bool = False,
+    ):
+        self.config = config
+        self.device = device
+        self.report_to = report_to
+        self.deepspeed_config = deepspeed_config
+        self.fsdp_config = fsdp_config
+        self.trust_remote_code = trust_remote_code
+        from souplite.utils.trust_remote import (
+            model_requires_trust_remote_code,
+            resolve_trust_remote_code,
+        )
+
+        requires = model_requires_trust_remote_code(config.base) or False
+        self._trust_remote_code = resolve_trust_remote_code(
+            config.base,
+            requested=trust_remote_code,
+            console=console,
+            requires_remote_code=requires,
+        )
+        self.model = None
+        self.tokenizer = None
+        self.trainer = None
+
+    def setup(self, dataset: dict):
+        """Load model, tokenizer, create RewardTrainer."""
+        from datasets import Dataset
+        from trl import RewardConfig, RewardTrainer
+
+        # Enable Rich progress bar for HuggingFace downloads
+        from souplite.trainer.sft import _enable_hf_transfer_progress
+
+        _enable_hf_transfer_progress()
+
+        cfg = self.config
+        tcfg = cfg.training
+
+        # #353: seed before the model and any adapter are built.
+        apply_training_seed(tcfg)
+
+        self._setup_transformers(cfg, tcfg)
+
+        apply_chat_template_override(
+            self.tokenizer, cfg.data.chat_template, console=console
+        )
+
+        trainable, total = self.model.get_nb_trainable_parameters()
+        pct = 100 * trainable / total
+        console.print(
+            f"[green]LoRA applied:[/] {trainable:,} trainable"
+            f" / {total:,} total ({pct:.2f}%)"
+        )
+
+        # --- Batch size ---
+        batch_size = tcfg.batch_size
+        if batch_size == "auto":
+            from souplite.utils.gpu import get_gpu_info
+
+            gpu_info = get_gpu_info()
+            model_size = model_size_from_name(cfg.base)
+            batch_size = estimate_batch_size(
+                model_params_b=model_size,
+                seq_length=cfg.data.max_length,
+                gpu_memory_bytes=gpu_info["memory_total_bytes"],
+                quantization=tcfg.quantization,
+                lora_r=tcfg.lora.r,
+            )
+            # Reward model processes pairs → 2x memory per sample
+            batch_size = max(1, batch_size // 2)
+            console.print(f"[green]Auto batch size (Reward Model):[/] {batch_size}")
+
+        # --- Dataset ---
+        # RewardTrainer expects: chosen, rejected (text columns)
+        train_data = _prepare_reward_dataset(dataset["train"])
+        train_ds = Dataset.from_list(train_data)
+        eval_ds = None
+        if "val" in dataset and dataset["val"]:
+            eval_data = _prepare_reward_dataset(dataset["val"])
+            eval_ds = Dataset.from_list(eval_data)
+
+        # --- Output dir ---
+        output_dir = Path(cfg.output)
+        if cfg.experiment_name:
+            output_dir = output_dir / cfg.experiment_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Calculate warmup steps from ratio ---
+        import math
+
+        total_steps = (
+            math.ceil(len(train_ds) / batch_size / tcfg.gradient_accumulation_steps)
+            * tcfg.epochs
+        )
+        warmup_steps = int(total_steps * tcfg.warmup_ratio)
+
+        # --- Reward config ---
+        _bf16, _fp16 = bf16_fp16_flags(self.device, allow_mps_bf16=True)
+        reward_config = RewardConfig(
+            output_dir=str(output_dir),
+            num_train_epochs=tcfg.epochs,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=tcfg.gradient_accumulation_steps,
+            learning_rate=tcfg.lr,
+            warmup_steps=warmup_steps,
+            weight_decay=tcfg.weight_decay,
+            max_grad_norm=tcfg.max_grad_norm,
+            optim=tcfg.optimizer,
+            lr_scheduler_type=tcfg.scheduler,
+            logging_steps=tcfg.logging_steps,
+            save_steps=tcfg.save_steps,
+            save_total_limit=3,
+            bf16=_bf16,
+            fp16=_fp16,
+            report_to=self.report_to,
+            remove_unused_columns=False,
+            deepspeed=self.deepspeed_config,
+            **training_seed_kwargs(tcfg),
+            **(self.fsdp_config or {}),
+            max_length=cfg.data.max_length,
+        )
+
+        # --- Trainer ---
+        self.trainer = RewardTrainer(
+            model=self.model,
+            args=reward_config,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            processing_class=self.tokenizer,
+        )
+
+        # #359 - the same exposure #336 fixed in sft.py: with LoRA the
+        # no-decay optimizer group is empty, DeepSpeed drops it, and the LR
+        # scheduler keeps two base_lrs until torch's strict zip raises at the
+        # first step. The guard prunes inside create_optimizer, i.e. before
+        # the scheduler is built. No-op for full fine-tuning, and only under
+        # DeepSpeed so the ordinary path keeps its own optimizer.
+        if self.deepspeed_config:
+            from souplite.utils.deepspeed import attach_empty_param_group_guard
+
+            attach_empty_param_group_guard(self.trainer)
+
+        # v0.40.6 #67 — ReLoRA callback.
+        from souplite.utils.peft_wiring import (
+            attach_curriculum_callback,
+            attach_plugin_callback,
+            attach_relora_callback,
+        )
+        attach_relora_callback(self.trainer, tcfg)
+        # v0.53.5 #114/#115 — dynamic curriculum live callback.
+        attach_curriculum_callback(self.trainer, tcfg, str(output_dir), console)
+        # v0.53.6 #101 — Soup plugin TrainerCallback.
+        attach_plugin_callback(self.trainer, console)
+
+        self._output_dir = str(output_dir)
+        self._batch_size = batch_size
+
+    def _setup_transformers(self, cfg: SoupConfig, tcfg) -> None:
+        """Load model as AutoModelForSequenceClassification + LoRA."""
+        from peft import TaskType, get_peft_model, prepare_model_for_kbit_training
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+        )
+
+        console.print(f"[dim]Loading tokenizer: {cfg.base}[/]")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            cfg.base, trust_remote_code=self._trust_remote_code
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Quantization (v0.38.0 Quant Menu, see souplite.utils.quant_menu).
+        # v0.53.0 gated this behind training.quantize_reward_model (#586,
+        # matching _load_reward_model's PPO-path gate): this task's own
+        # trained model IS "the reward model" the flag names, so the same
+        # opt-in applies here instead of following tcfg.quantization
+        # unconditionally.
+        quant_config_obj = None
+        if tcfg.quantize_reward_model:
+            from souplite.utils.quant_menu import build_quantization_config_for_loader
+
+            quant_config_obj = build_quantization_config_for_loader(
+                tcfg=tcfg, base=cfg.base, console=console,
+            )
+
+        console.print(f"[dim]Loading reward model: {cfg.base}[/]")
+        dev_map = resolve_device_map(self.device)
+        model_kwargs = {
+            "trust_remote_code": self._trust_remote_code,
+            "device_map": dev_map,
+            "num_labels": 1,
+            "torch_dtype": resolve_frozen_base_load_dtype(self.device),
+        }
+        if quant_config_obj is not None:
+            model_kwargs["quantization_config"] = quant_config_obj
+
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            cfg.base, **model_kwargs,
+        )
+
+        if tcfg.quantize_reward_model and tcfg.quantization in ("4bit", "8bit", "mxfp4"):
+            from souplite.utils.layer_stream import should_enable_hf_gradient_checkpointing
+
+            self.model = prepare_model_for_kbit_training(
+                self.model,
+                use_gradient_checkpointing=should_enable_hf_gradient_checkpointing(
+                    tcfg.gradient_checkpointing, stream_layers=tcfg.stream_layers
+                ),
+            )
+
+        from souplite.utils.peft_wiring import (
+            build_lora_config,
+            resolve_lora_target_modules,
+        )
+
+        target_modules = resolve_lora_target_modules(self.model, tcfg.lora.target_modules, console)
+        # #1099: moe_lora picks the expert-FFN targets. Without this the flag
+        # was accepted and ignored here, and on a fused-expert MoE the auto
+        # resolution leaves peft with nothing to attach.
+        from souplite.utils.moe import resolve_moe_lora_targets
+
+        target_modules = resolve_moe_lora_targets(
+            self.model, tcfg, target_modules, console
+        )
+
+        lora_config = build_lora_config(
+            tcfg.lora,
+            target_modules=target_modules,
+            task_type=TaskType.SEQ_CLS,
+        )
+        # v0.40.6 #67 — surgical PEFT patches.
+        from souplite.utils.peft_wiring import (
+            apply_post_lora_patches,
+            apply_pre_lora_patches,
+        )
+        apply_pre_lora_patches(self.model, cfg.base)
+        self.model = get_peft_model(self.model, lora_config)
+        apply_post_lora_patches(self.model)
+
+        # #491 review: get_peft_model's adapter autocast (default
+        # autocast_adapter_dtype=True) upcasts lora_A/lora_B to fp32 but not the
+        # SEQ_CLS head's auto-added modules_to_save wrapper, so the reward head
+        # would otherwise train in the frozen base's load dtype (e.g. bf16, no
+        # fp32 master weights). Already-fp32 adapter params are a no-op here.
+        import torch
+        for param in self.model.parameters():
+            if param.requires_grad and param.dtype != torch.float32:
+                param.data = param.data.to(torch.float32)
+
+        # v0.35.0 #60 — multi-trainer wiring of v0.28.0 speed/memory features.
+        # Reward model is a regression head; cut_ce no-ops gracefully.
+        from souplite.utils.v028_features import apply_v028_speed_memory
+        apply_v028_speed_memory(
+            model=self.model, tcfg=tcfg, base_model=cfg.base,
+            console=console, device=self.device, backend=cfg.backend,
+        )
+
+    def train(
+        self,
+        display: Optional[object] = None,
+        tracker: Optional[object] = None,
+        run_id: str = "",
+        resume_from_checkpoint: Optional[str] = None,
+    ) -> dict:
+        """Run reward model training and return results summary."""
+        start = time.time()
+
+        # Add callback for live display and experiment tracking
+        if display:
+            from souplite.monitoring.callback import (
+                SoupTrainerCallback,
+                soup_callback_kwargs,
+            )
+
+            self.trainer.add_callback(
+                SoupTrainerCallback(
+                    display,
+                    tracker=tracker,
+                    run_id=run_id,
+                    eval_gate_config=self.config.training.eval_gate,
+                    **soup_callback_kwargs(
+                        self.config.training,
+                        batch_size=self._batch_size,
+                        output_dir=self._output_dir,
+                        include_eval_gate=False,
+                    ),
+                )
+            )
+
+        from souplite.utils.v028_features import activation_offloading_context
+
+        with activation_offloading_context(
+            self.config.training, self._output_dir,
+        ):
+            align_trainable_dtype_for_fp16(
+                self.trainer.model,
+                fp16=getattr(self.trainer.args, "fp16", False),
+                bf16=getattr(self.trainer.args, "bf16", False),
+            )
+            self.trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        duration = time.time() - start
+
+        # Save final model
+        self.trainer.save_model(self._output_dir)
+        self.tokenizer.save_pretrained(self._output_dir)
+
+        # Extract metrics
+        logs = self.trainer.state.log_history
+        loss_summary = summarize_training_loss(logs)
+
+        hours = int(duration // 3600)
+        minutes = int((duration % 3600) // 60)
+        duration_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+
+        return {
+            **loss_summary,
+            "duration": duration_str,
+            "duration_secs": duration,
+            "output_dir": self._output_dir,
+            "total_steps": self.trainer.state.global_step,
+        }
+
+
+def _prepare_reward_dataset(data: list[dict]) -> list[dict]:
+    """Convert dataset rows to reward model format.
+
+    RewardTrainer expects each row to have 'chosen' and 'rejected' text fields.
+
+    Input can be:
+      - DPO format: {"prompt": "...", "chosen": "...", "rejected": "..."}
+      - Messages format with preference: {"chosen": [...messages], "rejected": [...messages]}
+
+    Returns list of dicts with 'chosen' and 'rejected' text strings.
+    """
+    prepared = []
+    for row in data:
+        chosen = row.get("chosen", "")
+        rejected = row.get("rejected", "")
+        prompt = row.get("prompt", "")
+
+        # If chosen/rejected are message lists, convert to text
+        if isinstance(chosen, list):
+            chosen = " ".join(msg.get("content", "") for msg in chosen)
+        if isinstance(rejected, list):
+            rejected = " ".join(msg.get("content", "") for msg in rejected)
+
+        # Prepend prompt if present
+        if prompt:
+            if isinstance(prompt, list):
+                prompt = " ".join(msg.get("content", "") for msg in prompt)
+            chosen = f"{prompt} {chosen}"
+            rejected = f"{prompt} {rejected}"
+
+        prepared.append({"chosen": chosen, "rejected": rejected})
+    return prepared

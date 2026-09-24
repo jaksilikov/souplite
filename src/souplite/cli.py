@@ -1,0 +1,1022 @@
+"""Main CLI entry point — all commands registered here."""
+
+import os
+import sys
+
+# UTF-8 stdio bootstrap (v0.40.1 Part A) — must run before any Rich console
+# is constructed. On Windows, reconfigures sys.stdout/stderr to UTF-8 so β /
+# ✓ / box-drawing chars don't crash with UnicodeEncodeError on cp1251/cp1252.
+# POSIX: no-op.
+from souplite.utils.encoding import force_utf8_stdio
+
+force_utf8_stdio()
+_utf8_bootstrap_done = True
+
+import typer  # noqa: E402
+from rich.console import Console  # noqa: E402
+
+from souplite import __version__  # noqa: E402
+from souplite.commands import (  # noqa: E402
+    adapters,
+    autopilot,
+    bench,
+    can,
+    card,
+    chat,
+    ci,
+    cost,
+    data,
+    deploy,
+    diff,
+    eval,
+    export,
+    generate,
+    history,
+    infer,
+    init,
+    merge,
+    migrate,
+    profile,
+    push,
+    recipes,
+    registry,
+    runs,
+    serve,
+    sweep,
+    train,
+    ui,
+)
+
+# v0.44.0 — Live monitoring + standalone CLI wrappers.
+from souplite.commands import (  # noqa: E402
+    delinearize_llama4 as delinearize_llama4_cmd,
+)
+from souplite.commands import doctor as doctor_cmd  # noqa: E402
+from souplite.commands import fetch as fetch_cmd  # noqa: E402
+from souplite.commands import llama as llama_cmd  # noqa: E402
+from souplite.commands import (  # noqa: E402
+    merge_sharded_fsdp_weights as merge_sharded_fsdp_weights_cmd,
+)
+from souplite.commands import monitor as monitor_cmd  # noqa: E402
+from souplite.commands import quantize as quantize_cmd  # noqa: E402
+from souplite.commands import quickstart as quickstart_cmd  # noqa: E402
+from souplite.commands import rewind as rewind_cmd  # noqa: E402
+from souplite.commands import spectrum as spectrum_cmd  # noqa: E402
+from souplite.commands import (  # noqa: E402
+    tui as tui_cmd,
+)
+from souplite.commands import (  # noqa: E402
+    why as why_cmd,
+)
+from souplite.utils.constants import GITHUB_URL  # noqa: E402
+from souplite.utils.exit_codes import GateCommand  # noqa: E402
+
+console = Console()
+
+# Global verbose flag — set via callback, read by error handler
+_verbose = False
+# Global log level (resolved string), set by main() callback
+_log_level = "normal"
+# v0.71.3 #183 — audit-log opt-out, set by the --no-audit-log callback flag.
+_audit_disabled = False
+# v0.71.41 #318 — telemetry opt-out.
+_telemetry_disabled = False
+
+# Global options that consume a following value (so the audit command-splitter
+# does not mistake the value for the subcommand name).
+_GLOBAL_VALUE_OPTS = frozenset({"--log-level"})
+
+app = typer.Typer(
+    name="soup",
+    help=(
+        "Fine-tune and post-train LLMs in one command. No SSH, no config hell.\n\n"
+        f"[dim]GitHub: {GITHUB_URL}[/]"
+    ),
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+# Register sub-commands
+app.command()(init.init)
+app.command()(train.train)
+app.command()(chat.chat)
+app.command()(cost.cost)
+app.command()(push.push)
+app.command(name="export")(export.export)
+app.command()(merge.merge)
+app.command(name="card")(card.card)
+app.add_typer(ci.app, name="ci", help="Fine-tuning CI: init a PR gate workflow.")
+app.add_typer(
+    data.app, name="data",
+    help="Dataset tools: inspect, convert, merge, dedup, validate, stats.",
+)
+app.add_typer(
+    deploy.app, name="deploy",
+    help="Deploy models: Ollama integration (deploy, list, remove).",
+)
+app.add_typer(runs.app, name="runs", help="Experiment tracking: list, show, compare runs.")
+app.add_typer(
+    eval.app, name="eval",
+    help="Evaluate models: benchmarks, custom evals, LLM judge, leaderboard.",
+)
+app.command()(migrate.migrate)
+app.add_typer(
+    adapters.app, name="adapters",
+    help="Adapter management: list, info, compare LoRA adapters.",
+)
+app.add_typer(
+    recipes.app, name="recipes",
+    help="Ready-made configs: list, show, use, search recipes for popular models.",
+)
+app.command()(serve.serve)
+app.command()(sweep.sweep)
+app.command(name="diff")(diff.diff)
+app.command()(infer.infer)
+app.command()(profile.profile)
+app.add_typer(bench.app, name="bench")
+app.command()(doctor_cmd.doctor)
+app.command()(quickstart_cmd.quickstart)
+app.command()(ui.ui)
+app.command(name="autopilot")(autopilot.autopilot_cmd)
+app.add_typer(
+    registry.app, name="registry",
+    help="Model Registry: push, list, show, diff, search, promote, delete.",
+)
+app.command(name="history")(history.history)
+app.command(name="why")(why_cmd.why)
+app.command(name="rewind")(rewind_cmd.rewind)
+app.command(name="tui")(tui_cmd.tui)
+app.add_typer(
+    spectrum_cmd.app, name="spectrum",
+    help="Spectrum SNR scan for targeted training (v0.71.23).",
+)
+app.add_typer(
+    can.app, name="can",
+    help="Soup Cans: pack/inspect/verify/fork shareable .can artifacts.",
+)
+
+# v0.44.0 — register Live Dashboard & UX commands.
+app.command(name="monitor")(monitor_cmd.monitor)
+app.command(name="fetch")(fetch_cmd.fetch)
+app.command(name="quantize")(quantize_cmd.quantize)
+app.command(name="merge-sharded-fsdp-weights")(
+    merge_sharded_fsdp_weights_cmd.merge_sharded_fsdp_weights
+)
+app.command(name="delinearize-llama4")(delinearize_llama4_cmd.delinearize_llama4)
+app.add_typer(
+    llama_cmd.app,
+    name="llama",
+    help="Proxy to llama.cpp binaries (cli / mtmd-cli / gguf-split / server).",
+)
+
+# v0.45.0 Part A — Plugin system CLI.
+from souplite.commands import plugins as plugins_cmd  # noqa: E402
+
+app.add_typer(
+    plugins_cmd.app,
+    name="plugins",
+    help="Discover, list, enable, and disable Soup plugins.",
+)
+
+# v0.46.0 Part B — Agent Forge.
+from souplite.commands import agent as agent_cmd  # noqa: E402
+
+app.add_typer(
+    agent_cmd.app,
+    name="agent",
+    help="Agent Forge: spec -> tool-calling dataset / train / eval (v0.46.0).",
+)
+
+# Register data generate as a subcommand of data
+data.app.command(name="generate")(generate.generate)
+
+# v0.47.0 Part A — Synthetic Data Forge.
+from souplite.commands import data_forge as _data_forge_cmd  # noqa: E402
+
+data.app.command(name="forge")(_data_forge_cmd.forge)
+
+# v0.47.0 Part B — Data Quality Moat.
+from souplite.commands import data_score as _data_score_cmd  # noqa: E402
+
+data.app.command(name="score")(_data_score_cmd.score)
+data.app.command(name="decontaminate")(_data_score_cmd.decontaminate)
+data.app.command(name="toxicity")(_data_score_cmd.toxicity)
+data.app.command(name="langdetect")(_data_score_cmd.langdetect)
+data.app.command(name="pii")(_data_score_cmd.pii)
+data.app.command(name="educational")(_data_score_cmd.educational)
+
+# v0.48.0 Part B — Data Mixing Optimizer (BETA).
+from souplite.commands import data_mix as _data_mix_cmd  # noqa: E402
+
+data.app.command(name="mix")(_data_mix_cmd.mix)
+
+# v0.53.9 #15 — BPE tokenizer training.
+from souplite.commands import tokenizer as _tokenizer_cmd  # noqa: E402
+
+app.add_typer(
+    _tokenizer_cmd.app,
+    name="tokenizer",
+    help="Tokenizer tools: train a BPE tokenizer from JSONL (v0.53.9).",
+)
+
+# v0.54.0 — `soup advise` pre-flight decision engine.
+from souplite.commands import advise as _advise_cmd  # noqa: E402
+
+app.add_typer(
+    _advise_cmd.app,
+    name="advise",
+    help=(
+        "Pre-flight decision: PROMPT_ENG / RAG / SFT / DPO / GRPO. Run "
+        "BEFORE you spend 8 hours on a GPU (v0.54.0)."
+    ),
+)
+
+# v0.56.0 — `soup diagnose` post-training failure-mode report card.
+from souplite.commands import diagnose as _diagnose_cmd  # noqa: E402
+
+app.command(
+    name="diagnose",
+    help=(
+        "Post-training report card: forgetting / refusal / format / "
+        "mode_collapse / memorization / contamination (v0.56.0)."
+    ),
+)(_diagnose_cmd.diagnose)
+
+# v0.71.25 — `soup ship` SHIP / DON'T-SHIP verdict engine.
+from souplite.commands import ship as _ship_cmd  # noqa: E402
+
+app.add_typer(
+    _ship_cmd.app,
+    name="ship",
+    help=(
+        "SHIP / DON'T SHIP verdict after fine-tuning: task win AND no "
+        "catastrophic forgetting, fused into one decision (v0.71.25)."
+    ),
+)
+
+# v0.58.0 — `soup loop` CLI-first data flywheel capstone.
+from souplite.commands import loop as _loop_cmd  # noqa: E402
+
+app.add_typer(
+    _loop_cmd.app,
+    name="loop",
+    help=(
+        "Data flywheel: traces -> preference pairs -> DPO -> gate -> "
+        "canary deploy -> rollback, all from the CLI (v0.58.0)."
+    ),
+)
+
+# v0.59.0 — Governance & Provenance: BOM emit + attestation + audit log.
+from souplite.commands import attest as _attest_cmd  # noqa: E402
+from souplite.commands import audit_log as _audit_log_cmd  # noqa: E402
+from souplite.commands import bom as _bom_cmd  # noqa: E402
+
+app.add_typer(
+    _bom_cmd.app,
+    name="bom",
+    help=(
+        "CycloneDX ML-BOM + SPDX AI bill-of-materials emitter (v0.59.0)."
+    ),
+)
+app.add_typer(
+    _attest_cmd.app,
+    name="attest",
+    help=(
+        "In-toto + SLSA-3 attestations per Soup Can stage (v0.59.0)."
+    ),
+)
+app.add_typer(
+    _audit_log_cmd.app,
+    name="audit-log",
+    help=(
+        "HIPAA/SOC2-shaped JSONL audit log: tail + rotate (v0.59.0)."
+    ),
+)
+
+# v0.60.0 — Supply Chain Security: airgap bundle assembler.
+from souplite.commands import airgap as _airgap_cmd  # noqa: E402
+
+app.command(name="airgap-bundle")(_airgap_cmd.airgap_bundle)
+
+# v0.61.0 — Unlearning & Knowledge Edit: `soup edit set / diff`.
+from souplite.commands import edit as _edit_cmd  # noqa: E402
+
+app.add_typer(
+    _edit_cmd.app,
+    name="edit",
+    help=(
+        "Knowledge editing (ROME / MEMIT / AlphaEdit) - patch facts "
+        "without re-training (v0.61.0)."
+    ),
+)
+
+# v0.62.0 Part C — Activation steering: `soup steer train / apply / list`.
+from souplite.commands import steer as _steer_cmd  # noqa: E402
+
+app.add_typer(
+    _steer_cmd.app,
+    name="steer",
+    help=(
+        "Activation steering (CAA / ITI / RepE) - inference-time "
+        "intervention without retraining (v0.62.0)."
+    ),
+)
+
+# v0.63.0 Part A — Universal trace importer.
+from souplite.commands import ingest as _ingest_cmd  # noqa: E402
+
+app.command(
+    name="ingest",
+    help=(
+        "Universal trace importer: Langfuse / LangSmith / Helicone / "
+        "OpenPipe / OTel / OpenAI Stored Completions (v0.63.0)."
+    ),
+)(_ingest_cmd.ingest)
+
+# v0.63.0 Part B — Strip shared system-prompt prefix.
+from souplite.commands import prune_prompt as _prune_prompt_cmd  # noqa: E402
+
+app.command(
+    name="prune-prompt",
+    help=(
+        "Detect + strip a shared system-prompt prefix across training "
+        "data so the FT model internalises it (v0.63.0)."
+    ),
+)(_prune_prompt_cmd.prune_prompt_cmd)
+
+# v0.63.0 Part C — Active-learning sampler from prod traces.
+from souplite.commands import active_sample as _active_sample_cmd  # noqa: E402
+
+data.app.command(name="active-sample")(_active_sample_cmd.active_sample)
+
+# v0.63.0 Part D — mSPRT A/B harness.
+from souplite.commands import ab as _ab_cmd  # noqa: E402
+
+app.command(
+    name="ab",
+    help=(
+        "mSPRT sequential A/B harness on latency / judge_score / retry_rate "
+        "with early-stop guarantees (v0.63.0)."
+    ),
+)(_ab_cmd.ab)
+
+# v0.63.0 Part E — Online-eval drift alarm.
+from souplite.commands import drift_alarm as _drift_alarm_cmd  # noqa: E402
+
+app.command(
+    name="drift-alarm",
+    help=(
+        "Rolling-KL drift alarm on output-token distribution with "
+        "optional Slack/Discord webhook (v0.63.0)."
+    ),
+)(_drift_alarm_cmd.drift_alarm)
+
+# v0.64.0 Part A — Tunability probe across candidate bases.
+from souplite.commands import tunability as _tunability_cmd  # noqa: E402
+
+app.command(
+    name="tunability",
+    help=(
+        "Probe-train 6-10 small bases on a held-out slice + report "
+        "Pareto frontier of (eval delta, train cost, license) (v0.64.0)."
+    ),
+)(_tunability_cmd.tunability_cmd)
+
+# v0.64.0 Part B — Terraform-shape plan / apply.
+from souplite.commands import plan as _plan_cmd  # noqa: E402
+
+app.command(
+    name="plan",
+    help=(
+        "Render a pre-flight training plan (cost / ETA / SHA / VRAM) "
+        "and write soup.tfstate for `soup apply` to consult (v0.64.0)."
+    ),
+)(_plan_cmd.plan_cmd)
+
+app.command(
+    name="apply",
+    help=(
+        "Execute the planned training run, refusing on drift between "
+        "soup.yaml and soup.tfstate (v0.64.0)."
+    ),
+)(_plan_cmd.apply_cmd)
+
+# v0.64.0 Part C — Hermetic env lockfile.
+from souplite.commands.env import env_app as _env_app  # noqa: E402
+
+app.add_typer(_env_app, name="env")
+
+# v0.64.0 Part E — Shell completions.
+from souplite.commands import completions as _completions_cmd  # noqa: E402
+
+app.command(
+    name="completions",
+    help=(
+        "Emit a bash / zsh / fish completion script. Use with "
+        "`eval \"$(soup completions bash)\"` (v0.64.0)."
+    ),
+)(_completions_cmd.completions_cmd)
+
+# v0.64.0 Part F — License advisor.
+from souplite.commands import license_advisor as _license_advisor_cmd  # noqa: E402
+
+app.command(
+    name="license-advisor",
+    help=(
+        "Recommend a license-clean base for a deploy target "
+        "(b2c / defense / embedded) + flag downstream risk (v0.64.0)."
+    ),
+)(_license_advisor_cmd.license_advisor_cmd)
+
+# v0.66.0 Part C/D/E — Post-train X-rays: sleeper / interference / sae-diff
+# / probe pack.
+from souplite.commands import probe as _probe_cmd  # noqa: E402
+
+app.add_typer(
+    _probe_cmd.app,
+    name="probe",
+    help=(
+        "Activation probes: sleeper-agent defection / honesty / misuse / "
+        "pairwise interference / SAE feature diff / probe pack (v0.66.0, "
+        "truth+harm v0.71.8)."
+    ),
+)
+
+# v0.67.0 Part E — soup.lock shared run lockfile.
+from souplite.commands import lock as _lock_cmd  # noqa: E402
+
+app.add_typer(
+    _lock_cmd.app,
+    name="lock",
+    help="Shared run lockfile (write / show / check).",
+)
+
+# v0.68.0 — Anti-trend insurance (compile / distill-prompt / compile-tools /
+# apple-adapter / local-rl).
+from souplite.commands import apple_adapter as _apple_cmd  # noqa: E402
+from souplite.commands import compile_cmd as _compile_cmd  # noqa: E402
+from souplite.commands import compile_tools as _compile_tools_cmd  # noqa: E402
+from souplite.commands import distill_prompt as _distill_prompt_cmd  # noqa: E402
+from souplite.commands import local_rl as _local_rl_cmd  # noqa: E402
+
+app.command(
+    name="compile",
+    help="Compile a DSPy / GEPA prompt program against an eval suite (v0.68.0).",
+)(_compile_cmd.compile_cmd)
+
+app.command(
+    name="distill-prompt",
+    help="Distill prompt-heavy traces into a small FT plan (v0.68.0).",
+)(_distill_prompt_cmd.distill_prompt_cmd)
+
+app.command(
+    name="compile-tools",
+    help="Compile / optimize tool schemas + descriptions (v0.68.0).",
+)(_compile_tools_cmd.compile_tools_cmd)
+
+app.command(
+    name="apple-adapter",
+    help="Convert / sign HF / MLX / Apple FoundationModels adapters (v0.68.0).",
+)(_apple_cmd.apple_adapter_cmd)
+
+app.add_typer(
+    _local_rl_cmd.app,
+    name="local-rl",
+    help="Personal-LLM flywheel daemon (init / status / record / harvest / train) (v0.68.0).",
+)
+
+# v0.69.0 Part A — `soup build` (dbt-for-SFT DAG).
+from souplite.commands import build as _build_cmd  # noqa: E402
+
+app.command(
+    name="build",
+    help="dbt-for-SFT DAG: validate, plan, and materialise dataset transforms.",
+)(_build_cmd.build_cmd)
+
+# v0.69.0 Part B — `soup expect` (expectations suite).
+from souplite.commands import expect as _expect_cmd  # noqa: E402
+
+app.command(
+    name="expect",
+    cls=GateCommand,
+    help="Run an expectations suite against a JSONL dataset.",
+)(_expect_cmd.expect_cmd)
+
+# v0.70.0 Part E — `soup iterative-dpo` (iterative DPO loop driver).
+from souplite.commands import iterative_dpo as _iterative_dpo_cmd  # noqa: E402
+
+app.add_typer(
+    _iterative_dpo_cmd.app,
+    name="iterative-dpo",
+    help="Iterative DPO sample, score, pair, and train loop.",
+)
+
+# v0.71.10 #200 — `soup ra-dit` (two-stage RA-DIT orchestrator).
+from souplite.commands import ra_dit as _ra_dit_cmd  # noqa: E402
+
+app.add_typer(
+    _ra_dit_cmd.app,
+    name="ra-dit",
+    help="RA-DIT two-stage orchestrator: retriever -> generator (v0.71.10).",
+)
+
+# v0.71.27 — Fine-tune Doctor: chat-template doctor + loss-mask X-ray +
+# preference linter.
+from souplite.commands import data_doctor as _data_doctor_cmd  # noqa: E402
+
+data.app.command(name="doctor")(_data_doctor_cmd.doctor)
+data.app.command(name="lint", cls=GateCommand)(_data_doctor_cmd.lint)
+
+# v0.71.36 — Data Moat II: topic map + Secret-Sharer canaries.
+from souplite.commands import data_topics as _data_topics_cmd  # noqa: E402
+
+data.app.command(name="topics")(_data_topics_cmd.topics)
+
+from souplite.commands import data_canary as _data_canary_cmd  # noqa: E402
+
+data.app.add_typer(_data_canary_cmd.app, name="canary")
+
+# Automated Dataset Cleaning & Sanity Repair Pipeline.
+from souplite.commands import data_clean as _data_clean_cmd  # noqa: E402
+
+data.app.command(name="clean")(_data_clean_cmd.clean)
+
+# v0.71.28 — MCP server: drive Soup from any MCP client (Claude Code / Cursor /
+# Cline / Continue) over stdio.
+from souplite.commands import mcp as _mcp_cmd  # noqa: E402
+
+app.add_typer(
+    _mcp_cmd.app,
+    name="mcp",
+    help="Model Context Protocol server - drive Soup from any MCP client (v0.71.28).",
+)
+
+# v0.71.29 — `soup shrink` depth-prune + distill-heal.
+from souplite.commands import shrink as _shrink_cmd  # noqa: E402
+
+app.command(
+    name="shrink",
+    help=(
+        "Depth-prune a model (drop the least-important contiguous layer block "
+        "by residual angular distance) + optional distill-heal (v0.71.29)."
+    ),
+)(_shrink_cmd.shrink)
+
+# v0.71.33 — `soup draft` train-your-own speculative-decoding draft.
+from souplite.commands import draft as _draft_cmd  # noqa: E402
+
+app.add_typer(
+    _draft_cmd.app,
+    name="draft",
+    help=(
+        "Train + measure a speculative-decoding draft model: distil your tuned "
+        "model into a tiny draft, then serve it with --auto-spec (v0.71.33)."
+    ),
+)
+
+# v0.71.40 — `soup reward synth` auto-generate a deterministic verifier.
+from souplite.commands import reward as _reward_cmd  # noqa: E402
+
+app.add_typer(
+    _reward_cmd.app,
+    name="reward",
+    help=(
+        "Synthesize a deterministic reward verifier from reference outputs, with "
+        "a calibration report that refuses degenerate verifiers (v0.71.40)."
+    ),
+)
+
+
+def _rewrite_advise_argv(argv: list) -> list:
+    """Inject `run` between `advise` and a non-subcommand first argument.
+
+    Lets users type ``soup advise data.jsonl`` instead of the explicit
+    ``soup advise run data.jsonl``. Click's group/positional collision
+    makes the bare-positional design impossible at the parser level, so
+    we rewrite argv before Typer ever sees it.
+
+    Scope: ONLY fires when ``advise`` is the first non-script argument
+    (``argv[1]``). Any other position is treated as unrelated data — a
+    dataset path or option value that happens to contain the literal
+    string ``"advise"`` MUST NOT trigger rewriting (code-review HIGH).
+    """
+    if len(argv) < 2 or argv[1] != "advise":
+        return argv
+    known_subs = {"run", "explain", "compare", "--help", "-h"}
+    tail = argv[2:]
+    if not tail:
+        return argv
+    first = tail[0]
+    if first in known_subs or first.startswith("-"):
+        return argv
+    return argv[:2] + ["run"] + tail
+
+
+@app.command()
+def version(
+    full: bool = typer.Option(False, "--full", "-f", help="Show system info and extras"),
+    json_output: bool = typer.Option(False, "--json", help="Output in JSON format"),
+):
+    """Show SoupLite version."""
+    import json
+    import platform
+
+    if json_output:
+        info = {
+            "version": __version__,
+            "python": platform.python_version(),
+            "platform": platform.system().lower(),
+        }
+
+        if full:
+            for lib in ["torch", "transformers", "peft", "trl", "datasets", "accelerate"]:
+                try:
+                    mod = __import__(lib)
+                    if hasattr(mod, "__version__"):
+                        info[lib] = mod.__version__
+                except ImportError:
+                    pass
+            for name in ["fastapi", "vllm", "datasketch", "lm_eval", "deepspeed", "wandb"]:
+                try:
+                    mod = __import__(name)
+                    if hasattr(mod, "__version__"):
+                        info[name] = mod.__version__
+                    elif hasattr(mod, "version"):
+                        info[name] = mod.version
+                    else:
+                        info[name] = "installed"
+                except ImportError:
+                    pass
+
+        console.print(json.dumps(info), highlight=False)
+        return
+
+    if not full:
+        console.print(f"[bold green]souplite[/] v{__version__} [dim](by Muhtar Jaksilikov, <= 2GB RAM mode)[/]")
+        console.print(f"[dim]Inspired by Soup: {GITHUB_URL}[/]")
+        return
+
+    parts = [f"[bold green]soup[/] v{__version__}"]
+    parts.append(f"Python {platform.python_version()}")
+
+    # GPU info
+    try:
+        import torch
+        if torch.cuda.is_available():
+            parts.append(f"CUDA {torch.version.cuda}")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            parts.append("MPS")
+        else:
+            parts.append("CPU only")
+    except ImportError:
+        parts.append("no torch")
+
+    # Installed extras
+    extras = _installed_extras()
+
+    if extras:
+        parts.append(f"extras: {', '.join(extras)}")
+
+    console.print(" | ".join(parts))
+    console.print(f"[dim]GitHub: [link={GITHUB_URL}]{GITHUB_URL}[/link][/]")
+
+
+def _installed_extras() -> list[str]:
+    """Extras whose requirements are all importable, derived from dist metadata."""
+    import importlib.metadata
+
+    try:
+        from importlib.metadata import PackageNotFoundError
+        from importlib.metadata import metadata as _metadata
+        from importlib.metadata import requires as _requires
+    except ImportError:
+        return []
+    try:
+        dist_meta = _metadata("souplite")
+        reqs = _requires("souplite") or []
+    except PackageNotFoundError:
+        return []
+    provided = dist_meta.get_all("Provides-Extra") or []
+    try:
+        from packaging.requirements import Requirement
+    except ImportError:
+        return []
+    installed: list[str] = []
+    for extra in provided:
+        names: list[str] = []
+        try:
+            for raw in reqs:
+                req = Requirement(raw)
+                if req.marker is None:
+                    # A bare requirement with no marker applies to every
+                    # install, not to this extra in particular.
+                    continue
+                if not req.marker.evaluate({"extra": extra}):
+                    continue
+                if req.name.lower().replace("_", "-") == "souplite":
+                    # Self-reference (e.g. all = ["souplite[train,...]"]):
+                    # it names our own extras, not a third-party package.
+                    continue
+                names.append(req.name)
+        except Exception:  # noqa: BLE001 — unreadable metadata is not installed
+            continue
+        if not names:
+            continue
+        try:
+            for name in names:
+                # Distribution metadata, not the import name: ``scikit-learn``
+                # / ``sklearn`` and ``pillow`` / ``PIL`` never match find_spec,
+                # which dropped data/vision/dev from ``version --full`` (#828).
+                importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        except Exception:  # noqa: BLE001 — unreadable metadata, skip extra
+            continue
+        installed.append(extra)
+    return sorted(installed)
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-V",
+        help="Show full traceback on errors",
+    ),
+    log_level: str = typer.Option(
+        "normal",
+        "--log-level",
+        help="Logging tier: quiet | normal | verbose | debug",
+    ),
+    no_audit_log: bool = typer.Option(
+        False,
+        "--no-audit-log",
+        help=(
+            "Disable the local HIPAA/SOC2 audit log for this invocation "
+            "(also via SOUP_NO_AUDIT_LOG=1). Default: a one-line record per "
+            "command under ~/.soup/audit.jsonl. v0.71.3."
+        ),
+    ),
+    no_telemetry: bool = typer.Option(
+        False,
+        "--no-telemetry",
+        help="Opt-out of anonymous hardware-only telemetry for this run.",
+    ),
+):
+    """Soup — fine-tune and post-train LLMs in one command."""
+    global _verbose, _log_level, _audit_disabled, _telemetry_disabled
+    _verbose = verbose
+    _audit_disabled = no_audit_log
+    _telemetry_disabled = no_telemetry
+    from souplite.utils.log_level import (
+        apply_logging_level,
+        parse_log_level,
+        setup_logging,
+    )
+
+    try:
+        tier = parse_log_level(log_level)
+    except ValueError as exc:
+        console.print(f"[red]error:[/] {exc}")
+        raise typer.Exit(code=2) from exc
+    _log_level = tier.value
+    setup_logging(tier)
+    # v0.40.2 N1/G2: also push the tier into the root logger so third-party
+    # libraries (transformers / peft / trl) respect QUIET / DEBUG. Without
+    # this, all four levels were producing nearly-identical output.
+    apply_logging_level(tier)
+
+
+def _split_command_args(argv: list[str]) -> tuple[str, list[str]]:
+    """Split ``argv`` into (command, remaining_args) for the audit record.
+
+    Skips the program name (argv[0]) and global options. Global options that
+    take a value (``--log-level``) consume their following token so the value
+    is not mistaken for the subcommand. Returns ``("(root)", [...])`` when no
+    subcommand is present.
+    """
+    tokens = list(argv[1:])
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _GLOBAL_VALUE_OPTS:
+            i += 2  # skip the option AND its value (even if the value is "-"-like)
+            continue
+        if isinstance(tok, str) and tok.startswith("-"):
+            i += 1
+            continue
+        return tok, tokens[i + 1:]
+    return "(root)", tokens
+
+
+def _audit_env_opt_out() -> bool:
+    val = (os.environ.get("SOUP_NO_AUDIT_LOG") or "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+_ALL_SECRET_OPTION_STRINGS: frozenset[str] | None = None
+
+
+def _mask_audit_args(command: str, args: list[str]) -> tuple[str, ...]:
+    """Mask credential option values in ``args`` by option name.
+
+    Long credential option names are masked app-wide; short aliases (``-t``)
+    only for the command they belong to, since the same letter means
+    something else elsewhere. If the command does not resolve to a leaf,
+    every credential option string of the app is masked. A resolution
+    failure falls back to that widest set, never to the unmasked args.
+    """
+    global _ALL_SECRET_OPTION_STRINGS
+    import click
+
+    from souplite.utils.argv_redaction import (
+        all_secret_option_strings,
+        mask_secret_args,
+        resolve_command,
+        secret_option_strings,
+    )
+
+    root = typer.main.get_command(app)
+    if _ALL_SECRET_OPTION_STRINGS is None:
+        _ALL_SECRET_OPTION_STRINGS = all_secret_option_strings(root)
+    everything = _ALL_SECRET_OPTION_STRINGS
+    try:
+        resolved = resolve_command(root, [command, *args])
+        if isinstance(resolved, click.Group):
+            secret_opts = everything
+        else:
+            app_wide_longs = frozenset(o for o in everything if o.startswith("--"))
+            secret_opts = secret_option_strings(resolved) | app_wide_longs
+    except Exception:  # noqa: BLE001 — fall back to the widest mask
+        secret_opts = everything
+    return mask_secret_args(args, secret_opts)
+
+
+def _emit_audit_event(argv: list[str], exit_code: int) -> None:
+    """Append one HIPAA/SOC2 audit record for this command. Best-effort.
+
+    v0.71.3 #183 — auto-instrumentation. Disabled by ``--no-audit-log`` /
+    ``SOUP_NO_AUDIT_LOG``. Never raises: a broken audit log must never crash
+    the CLI (mirrors v0.59.0 audit-log fail-soft policy).
+    """
+    if _audit_disabled or _audit_env_opt_out():
+        return
+    try:
+        import getpass
+        import platform
+        from datetime import datetime, timezone
+
+        from souplite.utils.audit_log import AuditEvent, append_audit_event
+
+        command, raw_args = _split_command_args(argv)
+        # Credential option values are masked by option name here; the
+        # value-pattern layer in utils/audit_log.py still applies afterwards.
+        args = _mask_audit_args(command, raw_args)
+        command = (command or "(root)")[:64] or "(root)"
+        try:
+            operator = getpass.getuser() or "unknown"
+        except (OSError, KeyError, ImportError):
+            # getpass.getuser() can raise when no pwd / env user is resolvable.
+            operator = "unknown"
+        host = (platform.node() or "unknown")[:128] or "unknown"
+        operator = (operator or "unknown")[:128] or "unknown"
+        # Defensive re-cap, mirroring audit_log._MAX_ARGS (256) /
+        # _MAX_ARG_LEN (1024) so AuditEvent.__post_init__ never rejects.
+        capped_args = tuple(str(a)[:1024] for a in args[:256])
+        code = exit_code if isinstance(exit_code, int) and not isinstance(
+            exit_code, bool
+        ) else 1
+        ev = AuditEvent(
+            timestamp=datetime.now(tz=timezone.utc).isoformat(),
+            command=command,
+            args=capped_args,
+            exit_code=code,
+            host_id=host,
+            operator_id=operator,
+        )
+        append_audit_event(ev)
+    except Exception:  # noqa: BLE001 — audit must never crash the CLI
+        pass
+
+
+_REGISTERED_COMMANDS: frozenset[str] | None = None
+
+
+def _get_registered_commands() -> frozenset[str]:
+    """Return the set of known registered top-level CLI command names.
+
+    Used by telemetry to sanitize argv so private arguments (e.g. local paths
+    passed by mistake as subcommands) can NEVER leak into telemetry event names.
+    """
+    global _REGISTERED_COMMANDS
+    if _REGISTERED_COMMANDS is None:
+        cmds: set[str] = set()
+        for cmd in app.registered_commands:
+            name = cmd.name or getattr(cmd.callback, "__name__", None)
+            if name:
+                cmds.add(name)
+        for grp in app.registered_groups:
+            name = grp.name
+            if not name and getattr(grp, "typer_instance", None):
+                name = getattr(grp.typer_instance.info, "name", None)
+            if name:
+                cmds.add(name)
+        _REGISTERED_COMMANDS = frozenset(cmds)
+    return _REGISTERED_COMMANDS
+
+
+def _emit_telemetry(argv: list[str], duration_seconds: float) -> None:
+    """Send an opt-in, hardware-only telemetry ping at command exit. Best-effort.
+
+    Telemetry is strictly opt-IN via ``SOUP_TELEMETRY=1``; it is disabled by default,
+    by ``--no-telemetry``, or when ``SOUP_TELEMETRY`` is unset or falsy.
+    Never raises — telemetry must NEVER crash the CLI.
+    """
+    try:
+        if _telemetry_disabled or "--no-telemetry" in argv:
+            return
+
+        from souplite.utils.trackers import is_telemetry_enabled
+
+        if not is_telemetry_enabled():
+            return
+
+        from souplite import __version__
+        from souplite.utils.trackers import (
+            build_telemetry_payload,
+            get_or_create_distinct_id,
+            send_telemetry_payload,
+        )
+
+        raw_command, _ = _split_command_args(argv)
+        reg = _get_registered_commands()
+        if raw_command in reg or raw_command == "(root)":
+            command = raw_command[:64]
+        else:
+            command = "(unknown)"
+
+        payload = build_telemetry_payload(
+            soup_version=__version__,
+            command=command,
+            duration_seconds=duration_seconds,
+            distinct_id=get_or_create_distinct_id(),
+        )
+        send_telemetry_payload(payload)
+    except Exception:  # noqa: BLE001 — telemetry must never crash the CLI
+        pass
+
+
+def run():
+    """Entry point with friendly error handling."""
+    import time  # noqa: PLC0415
+
+    start_time = time.monotonic()
+
+    # v0.54.0 — rewrite `soup advise <data>` → `soup advise run <data>`.
+    sys.argv = _rewrite_advise_argv(sys.argv)
+    argv_snapshot = list(sys.argv)
+    try:
+        app()
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            resolved = 0
+        elif isinstance(code, int) and not isinstance(code, bool):
+            resolved = code
+        else:
+            resolved = 1
+        _emit_audit_event(argv_snapshot, resolved)
+        raise
+    except typer.Exit as exc:
+        # Defensive/unreachable under click standalone mode (typer.Exit is
+        # converted to SystemExit inside app()); kept so a future click
+        # behaviour change still audits exactly once.
+        _emit_audit_event(argv_snapshot, getattr(exc, "exit_code", 1) or 0)
+        raise
+    except KeyboardInterrupt:
+        _emit_audit_event(argv_snapshot, 130)
+        console.print("\n[yellow]Interrupted.[/]")
+        sys.exit(130)
+    except Exception as exc:
+        _emit_audit_event(argv_snapshot, 1)
+        from souplite.utils.errors import format_friendly_error
+
+        format_friendly_error(exc, verbose=_verbose)
+        sys.exit(1)
+    else:
+        # Defensive/unreachable: app() raises SystemExit(0) on success under
+        # click standalone mode, so this normal-return path rarely fires.
+        _emit_audit_event(argv_snapshot, 0)
+    finally:
+        try:
+            _emit_telemetry(argv_snapshot, time.monotonic() - start_time)
+        except Exception:
+            pass
+
+
+# When invoked via `soup` entry point, use run() for error handling.
+# When invoked via `python -m souplite`, __main__.py calls run() directly.
+if __name__ == "__main__":
+    run()

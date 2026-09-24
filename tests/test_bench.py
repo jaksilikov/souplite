@@ -1,0 +1,197 @@
+"""Tests for soup bench CLI command."""
+
+from typer.testing import CliRunner
+
+from souplite.cli import app
+from tests.conftest import strip_ansi
+
+runner = CliRunner()
+
+
+def test_bench_model_not_found():
+    """soup bench with nonexistent model should fail gracefully."""
+    result = runner.invoke(app, ["bench", "nonexistent_model_path"])
+    assert result.exit_code == 1
+    assert "not found" in result.output.lower()
+
+
+def test_bench_custom_prompts(tmp_path, monkeypatch):
+    """Test using custom prompts from a text file and JSONL."""
+    monkeypatch.chdir(tmp_path)
+
+    dummy_model = tmp_path / "dummy_model"
+    dummy_model.mkdir()
+
+    # Text file
+    prompts_txt = tmp_path / "prompts.txt"
+    prompts_txt.write_text("Custom prompt 1\nCustom prompt 2\n")
+
+    # JSONL file
+    prompts_jsonl = tmp_path / "prompts.jsonl"
+    prompts_jsonl.write_text('{"prompt": "JSON prompt 1"}\n{"prompt": "JSON prompt 2"}\n')
+
+    # Path traversal
+    outside_file = tmp_path.parent / "outside.txt"
+    outside_file.write_text("Outside\n")
+
+    from unittest.mock import patch
+
+    with patch("souplite.commands.infer._load_model") as mock_load, \
+         patch("souplite.commands.infer._generate") as mock_generate:
+
+        mock_load.return_value = ("mock_model", "mock_tokenizer")
+        mock_generate.return_value = (None, 10)
+
+        # Test 1: TXT -- verify exit, output, and that actual prompts were passed to _generate
+        result = runner.invoke(app, ["bench", str(dummy_model), "--prompts-file", "prompts.txt"])
+        assert result.exit_code == 0, (result.output, repr(result.exception))
+        assert "Running 2 test inferences" in strip_ansi(result.output)
+
+        used_contents = [
+            call.args[2][0]["content"]
+            for call in mock_generate.call_args_list
+        ]
+        assert "Custom prompt 1" in used_contents
+        assert "Custom prompt 2" in used_contents
+
+        mock_generate.reset_mock()
+
+        # Test 2: JSONL -- verify JSON prompt field was extracted and used
+        result = runner.invoke(app, ["bench", str(dummy_model), "--prompts-file", "prompts.jsonl"])
+        assert result.exit_code == 0, (result.output, repr(result.exception))
+        assert "Running 2 test inferences" in strip_ansi(result.output)
+
+        used_contents = [
+            call.args[2][0]["content"]
+            for call in mock_generate.call_args_list
+        ]
+        assert "JSON prompt 1" in used_contents
+        assert "JSON prompt 2" in used_contents
+
+        # Test 3: Path outside CWD -- security check
+        result = runner.invoke(
+            app, ["bench", str(dummy_model), "--prompts-file", str(outside_file)]
+        )
+        assert result.exit_code == 1
+        assert "Security Error" in result.output
+
+
+def test_bench_happy_path(tmp_path, monkeypatch):
+    """Happy path on CUDA: verify panel, table, TPS, and VRAM rendering end-to-end."""
+    monkeypatch.chdir(tmp_path)
+
+    dummy_model = tmp_path / "dummy_model"
+    dummy_model.mkdir()
+
+    from unittest.mock import patch
+
+    with patch("souplite.commands.infer._load_model") as mock_load, \
+         patch("souplite.commands.infer._generate") as mock_generate, \
+         patch("torch.cuda.is_available") as mock_is_available, \
+         patch("torch.cuda.reset_peak_memory_stats"), \
+         patch("torch.cuda.max_memory_allocated") as mock_max_memory, \
+         patch("souplite.utils.gpu.detect_device") as mock_detect_device:
+
+        mock_load.return_value = ("mock_model", "mock_tokenizer")
+        mock_generate.return_value = ("mock response", 128)
+        mock_is_available.return_value = True
+        mock_max_memory.return_value = 4 * 1024**3  # 4 GB
+        mock_detect_device.return_value = ("cuda", 0)
+
+        result = runner.invoke(app, ["bench", str(dummy_model)])
+
+        assert result.exit_code == 0, (result.output, repr(result.exception))
+        # Panel rendered
+        assert "Benchmarking Configuration" in result.output
+        # Results table rendered with expected columns
+        assert "Inference Benchmark Results" in result.output
+        assert "TPS (Avg)" in result.output
+        # Token count propagated from mocked _generate
+        plain = strip_ansi(result.output)
+        assert "128 tokens" in plain
+        # VRAM value derived from mocked max_memory_allocated (4 GB)
+        assert "4.00 GB" in plain
+        # Warmup + main loop: mock_generate called (warmup + num_prompts=3)
+        assert mock_generate.call_count == 1 + 3
+
+
+def test_bench_cpu_warning(tmp_path, monkeypatch):
+    """CPU path: warning shown and VRAM column falls back to N/A."""
+    monkeypatch.chdir(tmp_path)
+
+    dummy_model = tmp_path / "dummy_model"
+    dummy_model.mkdir()
+
+    from unittest.mock import patch
+
+    with patch("souplite.commands.infer._load_model") as mock_load, \
+         patch("souplite.commands.infer._generate") as mock_generate, \
+         patch("torch.cuda.is_available") as mock_is_available, \
+         patch("souplite.utils.gpu.detect_device") as mock_detect_device:
+
+        mock_load.return_value = ("mock_model", "mock_tokenizer")
+        mock_generate.return_value = ("mock response", 10)
+        mock_is_available.return_value = False
+        mock_detect_device.return_value = ("cpu", None)
+
+        result = runner.invoke(app, ["bench", str(dummy_model)])
+
+        assert result.exit_code == 0, (result.output, repr(result.exception))
+        assert "Running on CPU" in result.output
+        assert "Inference Benchmark Results" in result.output
+        # Without CUDA, VRAM column shows N/A
+        assert "N/A" in result.output
+
+
+def test_bench_passes_hf_repo_id_byte_identical_with_slashes(tmp_path, monkeypatch):
+    """soup bench with HF repo ID preserves slashes and passes is_local=False (#1097 / #1118)."""
+    monkeypatch.chdir(tmp_path)
+    from unittest.mock import patch
+
+    with patch("souplite.commands.infer._load_model") as mock_load, \
+         patch("souplite.commands.infer._generate") as mock_generate, \
+         patch("torch.cuda.is_available", return_value=False), \
+         patch("souplite.utils.gpu.detect_device", return_value=("cpu", None)):
+
+        mock_load.return_value = ("mock_model", "mock_tokenizer")
+        mock_generate.return_value = ("mock response", 10)
+
+        result = runner.invoke(app, [
+            "bench", "HuggingFaceTB/SmolLM2-135M-Instruct",
+            "--num-prompts", "1",
+            "--max-tokens", "2",
+        ])
+
+        assert result.exit_code == 0, (result.output, repr(result.exception))
+        mock_load.assert_called_once()
+        passed_model = mock_load.call_args[0][0]
+        assert passed_model == "HuggingFaceTB/SmolLM2-135M-Instruct"
+        assert "\\" not in passed_model
+        assert "/" in passed_model
+        assert mock_load.call_args.kwargs.get("is_local") is False
+
+
+def test_bench_passes_is_local_true_for_local_dir(tmp_path, monkeypatch):
+    """soup bench with local dir passes is_local=True (#1097 / #1118)."""
+    monkeypatch.chdir(tmp_path)
+    dummy_model = tmp_path / "dummy_model"
+    dummy_model.mkdir()
+    from unittest.mock import patch
+
+    with patch("souplite.commands.infer._load_model") as mock_load, \
+         patch("souplite.commands.infer._generate") as mock_generate, \
+         patch("torch.cuda.is_available", return_value=False), \
+         patch("souplite.utils.gpu.detect_device", return_value=("cpu", None)):
+
+        mock_load.return_value = ("mock_model", "mock_tokenizer")
+        mock_generate.return_value = ("mock response", 10)
+
+        result = runner.invoke(app, [
+            "bench", str(dummy_model),
+            "--num-prompts", "1",
+            "--max-tokens", "2",
+        ])
+
+        assert result.exit_code == 0, (result.output, repr(result.exception))
+        mock_load.assert_called_once()
+        assert mock_load.call_args.kwargs.get("is_local") is True

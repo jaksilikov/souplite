@@ -1,0 +1,1059 @@
+"""soup draft — train-your-own speculative-decoding draft (v0.71.33).
+
+Three subcommands::
+
+    soup draft distill --target <tuned> --draft-base <tiny> --data d.jsonl -o draft/
+    soup draft measure --target <tuned> --draft draft/ --prompts p.jsonl
+    soup draft list
+
+``distill`` is thin orchestration over the existing ``task='distill'`` trainer:
+it renders a validated distill config (student = the tiny draft base, teacher =
+your tuned target), runs ``soup train`` as a subprocess, then merges the LoRA
+adapter back into a DENSE checkpoint — a draft has to be loadable standalone as
+``assistant_model=``. The draft is recorded in the local registry so
+``soup serve --auto-spec`` picks it up.
+
+``measure`` reports the teacher-forced acceptance rate (see ``utils/draft.py``)
+plus plain-vs-assisted throughput. Exit codes mirror ``soup ship`` / ``soup
+shrink``: 0 = ok, 2 = below ``--min-acceptance``, 1 = runtime error.
+
+Draft and target MUST share a tokenizer (v1). Heavy imports are lazy.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+from dataclasses import replace
+from pathlib import Path
+from typing import TYPE_CHECKING, NoReturn, Optional
+
+import typer
+from rich.console import Console
+from rich.markup import escape
+from rich.table import Table
+
+from souplite import __version__
+from souplite.utils.adapter_fuse import merge_adapter_to_dense
+from souplite.utils.draft import (
+    DRAFT_K_MAX,
+    DRAFT_K_MIN,
+    AcceptanceReport,
+    acceptance_rate,
+    breakeven_acceptance,
+    classify_acceptance,
+    draft_report_to_dict,
+    latency_ratio,
+    list_drafts,
+    measure_acceptance,
+    measure_throughput,
+    modelled_best_k,
+    register_draft,
+    render_draft_panel,
+    same_tokenizer,
+)
+from souplite.utils.paths import atomic_write_text, enforce_under_cwd_and_no_symlink
+from souplite.utils.terminal import for_terminal, strip_control
+
+if TYPE_CHECKING:  # pragma: no cover — typing only, keeps the CLI import light
+    from transformers import PreTrainedModel, PreTrainedTokenizerBase
+
+app = typer.Typer(help="Train + measure a speculative-decoding draft model.")
+console = Console()
+
+_MAX_SWEEP_K = 8  # each k is a full assisted-generation pass over every prompt
+_MAX_INPUT_BYTES = 64 * 1024 * 1024
+_MAX_PROMPT_ROWS = 10_000
+_MAX_DATA_ROWS = 1_000_000
+_DISTILL_TIMEOUT_SECONDS = 24 * 60 * 60
+# batch 1 + grad checkpointing + a bounded max_length: teacher AND student are
+# both resident during distillation, so keep the footprint consumer-GPU sized.
+_DISTILL_BATCH_SIZE = 1
+_DISTILL_MAX_LENGTH = 1024
+_MAX_DISTILL_EPOCHS = 100
+# #364 — the epoch count that realises ``--steps N`` is derived from the
+# EFFECTIVE optimiser-step budget, which depends on the run shape: ``val_split``
+# removes rows from training and ``gradient_accumulation_steps`` micro-batches
+# make one optimiser step, so both divide the naive ``rows // batch``. Pin that
+# shape here (equal to the schema defaults) AND emit it into the config, so the
+# builder's arithmetic and the trainer's behaviour cannot drift apart.
+_DISTILL_VAL_SPLIT = 0.1   # DataConfig.val_split default
+_DISTILL_GRAD_ACCUM = 4    # TrainingConfig.gradient_accumulation_steps default
+# How much of a failed subprocess's output to surface (mirrors shrink.py).
+_SUBPROCESS_ERROR_TAIL_CHARS = 800
+# The distill trainer writes a LoRA adapter (never dense base weights), so it
+# trains into this subdirectory of -o; the merge then replaces -o with the
+# dense model.
+_ADAPTER_SUBDIR = "_adapter"
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+def _fail(message: str, code: int = 1) -> NoReturn:
+    """Print a red error and exit. Raises internally so a forgotten ``raise``
+    at a call site can never silently turn a failure into a no-op (mirrors
+    ``commands/ship.py::_fail``)."""
+    console.print(f"[red]{escape(message)}[/]")
+    raise typer.Exit(code)
+
+
+def _read_jsonl(path: str, label: str, max_rows: int) -> list[dict]:
+    """Read a JSONL file: cwd-contained, O_NOFOLLOW, size- and row-capped."""
+    enforce_under_cwd_and_no_symlink(path, label)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"{label} unreadable: {exc}") from exc
+    rows: list[dict] = []
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        if os.fstat(handle.fileno()).st_size > _MAX_INPUT_BYTES:
+            raise ValueError(f"{label} exceeds {_MAX_INPUT_BYTES} bytes")
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+            if len(rows) >= max_rows:
+                break
+    return rows
+
+
+def _vocab_size_of(model_id: str, trc: bool = False) -> int:
+    """Vocab size from the model's config — no weight download."""
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=trc)
+    vocab = getattr(config, "vocab_size", None)
+    if vocab is None and hasattr(config, "get_text_config"):
+        # Composite / multimodal configs (e.g. LlavaConfig) keep vocab_size on
+        # the text sub-config, not the top level; get_text_config() returns it
+        # (#344 review). Shared by measure and distill, so this fixes both.
+        vocab = getattr(config.get_text_config(), "vocab_size", None)
+    if vocab is None:
+        raise ValueError(f"{model_id} config has no vocab_size")
+    return int(vocab)
+
+
+def _pair_vocab_sizes_or_fail(
+    target: str, draft_id: str, target_trc: bool, draft_trc: bool
+) -> "tuple[int, int]":
+    """(target, draft) ``config.vocab_size`` — the signal transformers' assisted
+    generation actually gates on, read from config only (no weight download).
+
+    Shared by ``distill`` and ``measure`` so the two never disagree on the
+    same-tokenizer precondition and both refuse a mismatched pair before any
+    model loads (issue #344).
+    """
+    try:
+        return (
+            _vocab_size_of(target, target_trc),
+            _vocab_size_of(draft_id, draft_trc),
+        )
+    except Exception as exc:  # noqa: BLE001 — surface as a friendly CLI error
+        _fail(f"could not read model config: {exc}")
+
+
+def _write_draft_report(report: AcceptanceReport, output: str) -> None:
+    """Serialise a ``measure`` report to ``output`` (shared by the incremental
+    writes so a later failure cannot discard an earlier result — issue #344)."""
+    atomic_write_text(
+        json.dumps(draft_report_to_dict(report), indent=2),
+        output,
+        field="report path",
+    )
+
+
+def _write_draft_report_best_effort(
+    report: AcceptanceReport, output: Optional[str], what: str
+) -> None:
+    """Persist an intermediate result (#843's draft arm and each ``--sweep-k`` step).
+
+    Best-effort, like :func:`_record_assisted_status`: these writes sit between the
+    pre-arm write that already holds the acceptance rate and the arms still to run,
+    so a failed write here is a warning -- it must not abort the run, and it must
+    not replace an exception being handled.
+    """
+    if output is None:
+        return
+    try:
+        _write_draft_report(report, output)
+    except OSError as exc:
+        console.print(
+            f"[yellow]Warning:[/] could not record the {what} in {escape(output)} "
+            f"({escape(str(exc))}); results written earlier are still on disk."
+        )
+
+
+def _parse_sweep_k(value: str) -> list[int]:
+    """``--sweep-k 1,2,3,5,8`` -> ``[1, 2, 3, 5, 8]``, or ``ValueError`` naming the flag.
+
+    Bounded: every k is one assisted pass over every prompt, so an unbounded list
+    is an unbounded run.
+    """
+    parts = [part.strip() for part in value.split(",")]
+    if not value.strip() or any(not part for part in parts):
+        raise ValueError(f"--sweep-k needs comma-separated integers, got {value!r}")
+    ks: list[int] = []
+    for part in parts:
+        # isascii: str.isdigit() also accepts '²' (int() then raises without naming
+        # the flag) and '٣' (silently read as 3).
+        if not (part.isascii() and part.isdigit()):
+            raise ValueError(f"--sweep-k values must be integers, got {part!r}")
+        k = int(part)
+        if not DRAFT_K_MIN <= k <= DRAFT_K_MAX:
+            raise ValueError(
+                f"--sweep-k values must be in {DRAFT_K_MIN}..{DRAFT_K_MAX}, got {k}"
+            )
+        if k in ks:
+            raise ValueError(f"--sweep-k lists k={k} twice")
+        ks.append(k)
+    if len(ks) > _MAX_SWEEP_K:
+        raise ValueError(
+            f"--sweep-k takes at most {_MAX_SWEEP_K} values (got {len(ks)}); each is a "
+            "full assisted pass over every prompt"
+        )
+    return ks
+
+
+def _modelled_fields(
+    rate: float, plain: Optional[float], draft_tok_s: Optional[float], k: int
+) -> dict:
+    """The #843 break-even model for this measurement, or all-``None`` if unmeasured."""
+    c = latency_ratio(plain, draft_tok_s)
+    if c is None:
+        return {
+            "latency_ratio": None,
+            "breakeven_acceptance": None,
+            "modelled_best_k": None,
+            "modelled_speedup_best_k": None,
+        }
+    best_k, best_speedup = modelled_best_k(rate, c)
+    return {
+        "latency_ratio": c,
+        "breakeven_acceptance": breakeven_acceptance(k, c),
+        "modelled_best_k": best_k,
+        "modelled_speedup_best_k": best_speedup,
+    }
+
+
+def _record_assisted_status(
+    report: AcceptanceReport, output: Optional[str], status: str
+) -> AcceptanceReport:
+    """Stamp ``status`` on ``report`` and persist it best-effort.
+
+    Only for the assisted-arm handlers: a write that raises there would replace
+    the exception being handled — swapping the "assisted arm crashed" warning,
+    or Ctrl-C's exit code, for an unrelated ``OSError`` — and so lose exactly the
+    outcome the handler exists to record (#344 review). The pre-arm write has
+    already put acceptance + plain throughput on disk, so a failed status update
+    is a warning, not a failure. The success path deliberately does NOT use this:
+    there is no exception to mask, and failing to write the completed report is a
+    real error.
+    """
+    report = replace(report, assisted_status=status)
+    if output is None:
+        return report
+    try:
+        _write_draft_report(report, output)
+    except OSError as exc:
+        console.print(
+            f"[yellow]Warning:[/] could not record the assisted-arm outcome in "
+            f"{escape(output)} ({escape(str(exc))}); the acceptance rate and "
+            f"plain throughput written before the arm are still on disk."
+        )
+    return report
+
+
+def _resolve_trust(model_id: str, requested: bool = False) -> bool:
+    from souplite.utils.trust_remote import (
+        model_requires_trust_remote_code,
+        resolve_trust_remote_code,
+    )
+
+    requires = model_requires_trust_remote_code(model_id) or False
+    return resolve_trust_remote_code(
+        model_id, requested=requested, console=console, requires_remote_code=requires
+    )
+
+
+def _guard_output_target(output: str, *, force: bool) -> None:
+    """Refuse a destructive ``-o`` that would delete cwd or unrelated content.
+
+    ``merge_adapter_to_dense`` does ``rmtree(out_dir)`` then ``os.replace``, so
+    ``-o`` must not be cwd itself and must not be a pre-existing directory that
+    isn't already a Soup draft (contains ``config.json``) unless ``--force``.
+    """
+    resolved = os.path.realpath(output)
+    if resolved == os.path.realpath(os.getcwd()):
+        _fail(
+            "-o must not be the current directory: the finished draft REPLACES "
+            "this path, which would delete everything under it."
+        )
+    if os.path.isdir(output) and not force:
+        looks_like_draft = os.path.isfile(os.path.join(output, "config.json"))
+        if os.listdir(output) and not looks_like_draft:
+            _fail(
+                f"-o {output!r} already exists and is not a Soup draft — the "
+                "distilled model would REPLACE it. Choose an empty/new directory "
+                "or pass --force to overwrite."
+            )
+
+
+def _load_pair_member(
+    model_id: str, *, device: Optional[str] = None, trc: bool = False
+) -> tuple["PreTrainedModel", "PreTrainedTokenizerBase", str]:
+    """Load one half of the (target, draft) pair. Returns (model, tokenizer, device)."""
+    from souplite.utils.live_eval import load_model_and_tokenizer
+
+    return load_model_and_tokenizer(
+        model_id, device=device, trust_remote_code=trc, dtype="auto"
+    )
+
+
+# ---------------------------------------------------------------------------
+# distill
+# ---------------------------------------------------------------------------
+def _distill_steps_per_epoch(
+    data_rows: int, *, val_split: float, batch_size: int, grad_accum: int
+) -> int:
+    """Optimiser steps one epoch actually delivers for the distill run shape.
+
+    ``val_split`` removes rows from training and ``grad_accum`` micro-batches
+    make one optimiser step, so both divide the naive ``rows // batch_size``
+    the epoch count used to assume (#364).
+    """
+    train_rows = math.floor(data_rows * (1.0 - val_split))
+    return max(1, train_rows // (batch_size * grad_accum))
+
+
+def _distill_epochs_for_steps(
+    steps: int,
+    data_rows: int,
+    *,
+    val_split: float,
+    batch_size: int,
+    grad_accum: int,
+) -> int:
+    """Epochs whose delivered optimiser steps land nearest to ``steps``.
+
+    There is no ``max_steps`` knob in the trainer (see
+    ``commands/shrink.py::_build_heal_config_yaml``), so ``--steps`` is realised
+    through the epoch count. Rounding up means the request is met or overshot by
+    less than one epoch, never the ~1/4.44 undershoot of the old arithmetic.
+    """
+    per_epoch = _distill_steps_per_epoch(
+        data_rows,
+        val_split=val_split,
+        batch_size=batch_size,
+        grad_accum=grad_accum,
+    )
+    return max(1, math.ceil(steps / per_epoch))
+
+
+def _build_distill_config_yaml(
+    *,
+    draft_base: str,
+    target: str,
+    data: str,
+    out_dir: str,
+    steps: int,
+    data_rows: int,
+    uld_strategy: Optional[str] = None,
+) -> str:
+    """Render the ``task: distill`` config: student = draft base, teacher = target.
+
+    Every user-supplied string is embedded via ``json.dumps`` — a JSON string
+    literal is always a valid YAML scalar, so a model id or path containing a
+    newline cannot inject sibling YAML keys into the ``training:`` block.
+    Mirrors ``commands/shrink.py::_build_heal_config_yaml``.
+    """
+    epochs = _distill_epochs_for_steps(
+        steps,
+        data_rows,
+        val_split=_DISTILL_VAL_SPLIT,
+        batch_size=_DISTILL_BATCH_SIZE,
+        grad_accum=_DISTILL_GRAD_ACCUM,
+    )
+    if epochs > _MAX_DISTILL_EPOCHS:
+        raise ValueError(
+            f"--steps {steps} over {data_rows} rows expands to {epochs} "
+            f"epochs (> {_MAX_DISTILL_EPOCHS}); reduce --steps or grow --data."
+        )
+    uld_line = f"  uld_strategy: {uld_strategy}\n" if uld_strategy else ""
+    return (
+        "base: {draft_base}\n"
+        "task: distill\n"
+        "output: {out}\n"
+        "data:\n"
+        "  train: {data}\n"
+        "  format: auto\n"
+        "  max_length: {max_length}\n"
+        "  val_split: {val_split}\n"
+        "training:\n"
+        "  teacher_model: {target}\n"
+        "  distill_divergence: forward_kl\n"
+        "  distill_temperature: 2.0\n"
+        "{uld_line}"
+        "  epochs: {epochs}\n"
+        "  batch_size: {batch}\n"
+        "  gradient_accumulation_steps: {grad_accum}\n"
+        "  gradient_checkpointing: true\n"
+        "  quantization: none\n"
+        "  lora:\n"
+        "    r: 16\n"
+        "    alpha: 32\n"
+    ).format(
+        draft_base=json.dumps(draft_base),
+        out=json.dumps(out_dir),
+        data=json.dumps(data),
+        target=json.dumps(target),
+        uld_line=uld_line,
+        max_length=_DISTILL_MAX_LENGTH,
+        val_split=_DISTILL_VAL_SPLIT,
+        epochs=epochs,
+        batch=_DISTILL_BATCH_SIZE,
+        grad_accum=_DISTILL_GRAD_ACCUM,
+    )
+
+
+def _run_distill(
+    *,
+    draft_base: str,
+    target: str,
+    data: str,
+    out_dir: str,
+    steps: int,
+    data_rows: int,
+    device: Optional[str] = None,
+    trc: bool = False,
+    uld_strategy: Optional[str] = None,
+) -> None:
+    """Distil the target into the draft base, then merge the adapter to dense.
+
+    Writes a validated distill config, runs ``soup train`` as a subprocess
+    (argv list, no shell — mirrors ``commands/shrink.py::_run_heal``), then
+    merges the trained LoRA into the draft base so the shipped artifact is a
+    single DENSE model loadable as ``assistant_model=``.
+
+    ``DistillTrainerWrapper`` always LoRA-wraps the student and its
+    ``save_model`` therefore writes ONLY ``adapter_config.json`` +
+    ``adapter_model.safetensors`` — never full base weights. So the trainer's
+    output goes to a nested ``_adapter`` directory and the base weights are
+    re-loaded from ``draft_base`` for the merge; the merge then atomically
+    replaces ``out_dir`` (adapter subdir and all) with the dense result.
+    """
+    import subprocess
+    import sys
+
+    from souplite.config.loader import load_config_from_string
+
+    adapter_dir = os.path.join(out_dir, _ADAPTER_SUBDIR)
+
+    yaml_text = _build_distill_config_yaml(
+        draft_base=draft_base,
+        target=target,
+        data=data,
+        out_dir=adapter_dir,
+        steps=steps,
+        data_rows=data_rows,
+        uld_strategy=uld_strategy,
+    )
+    try:
+        load_config_from_string(yaml_text)  # validate before spending a subprocess
+    except ValueError as exc:
+        console.print(f"[red]Invalid rendered distill config:[/] {for_terminal(exc)}")
+        raise typer.Exit(code=1) from exc
+
+    # #364 — surface the resolved optimiser-step budget before the run. Epoch
+    # granularity can only land NEAR ``--steps``; printing it makes any mismatch
+    # visible up front rather than after a full training run.
+    per_epoch = _distill_steps_per_epoch(
+        data_rows,
+        val_split=_DISTILL_VAL_SPLIT,
+        batch_size=_DISTILL_BATCH_SIZE,
+        grad_accum=_DISTILL_GRAD_ACCUM,
+    )
+    epochs = _distill_epochs_for_steps(
+        steps,
+        data_rows,
+        val_split=_DISTILL_VAL_SPLIT,
+        batch_size=_DISTILL_BATCH_SIZE,
+        grad_accum=_DISTILL_GRAD_ACCUM,
+    )
+    console.print(
+        f"[dim]--steps {steps} -> {epochs} epoch(s) ~= {epochs * per_epoch} "
+        f"optimiser steps ({data_rows} rows, val_split {_DISTILL_VAL_SPLIT}, "
+        f"accum {_DISTILL_GRAD_ACCUM}, batch {_DISTILL_BATCH_SIZE})[/]"
+    )
+
+    # The config lives BESIDE out_dir, not inside it: the merge below replaces
+    # out_dir wholesale, which would otherwise delete the config we just wrote.
+    config_path = Path(out_dir).parent / f"{Path(out_dir).name}_distill_config.yaml"
+    atomic_write_text(yaml_text, str(config_path), field="draft distill config")
+
+    env = dict(os.environ)
+    if device is not None and device.lower() == "cpu":
+        # -1 is the canonical "hide every GPU"; "" trips an "Invalid device id"
+        # assertion in some torch/accelerate paths.
+        env["CUDA_VISIBLE_DEVICES"] = "-1"
+
+    argv = [
+        sys.executable,
+        "-m",
+        "souplite.cli",
+        "train",
+        "--config",
+        str(config_path),
+        "--yes",
+    ]
+    try:
+        result = subprocess.run(  # noqa: S603 — argv list, no shell.
+            argv,
+            capture_output=True,
+            check=False,
+            timeout=_DISTILL_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"draft distill exceeded {_DISTILL_TIMEOUT_SECONDS}s timeout"
+        ) from exc
+    if result.returncode != 0:
+        combined = (result.stderr or b"").decode("utf-8", "replace") + (
+            result.stdout or b""
+        ).decode("utf-8", "replace")
+        tail = strip_control(combined[-_SUBPROCESS_ERROR_TAIL_CHARS:])
+        raise RuntimeError(f"draft distill failed (rc={result.returncode}): {tail}")
+
+    if not os.path.isdir(adapter_dir):
+        raise RuntimeError(
+            f"distill finished but wrote no adapter to {adapter_dir} — "
+            "cannot build a dense draft"
+        )
+
+    # transformers cannot use a PEFT adapter dir as an assistant_model, so merge
+    # the LoRA into the base weights and write a dense model to out_dir.
+    merge_adapter_to_dense(
+        base_model=draft_base, adapter_dir=adapter_dir, out_dir=out_dir, trc=trc
+    )
+
+
+@app.command()
+def distill(
+    target: str = typer.Option(
+        ..., "--target", help="The tuned model to speed up (the teacher)."
+    ),
+    draft_base: str = typer.Option(
+        ...,
+        "--draft-base",
+        help="Tiny model to distil into (the student). Must share the target's "
+        "tokenizer. A `soup shrink` output qualifies by construction.",
+    ),
+    data: str = typer.Option(
+        ..., "--data", help="JSONL distillation set (chat / instruction rows)."
+    ),
+    output: str = typer.Option(
+        "draft", "-o", "--output", help="Directory for the dense draft model."
+    ),
+    steps: int = typer.Option(
+        500, "--steps", min=1, max=1_000_000, help="Approximate training steps."
+    ),
+    device: Optional[str] = typer.Option(
+        None, "--device", help="cpu | cuda (default: auto-detect)."
+    ),
+    no_register: bool = typer.Option(
+        False,
+        "--no-register",
+        help="Do not record the draft in ~/.soup/drafts.json "
+        "(it then won't be picked up by `soup serve --auto-spec`).",
+    ),
+    trust_remote_code: bool = typer.Option(
+        False,
+        "--trust-remote-code",
+        help="Allow custom modelling code from the target / draft-base "
+        "(required for architectures that ship an auto_map).",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite -o even if it already contains a non-draft directory.",
+    ),
+    plan_only: bool = typer.Option(
+        False, "--plan-only", help="Print the distill config and exit; write nothing."
+    ),
+) -> None:
+    """Distil a target model into a tiny dense speculative-decoding draft."""
+    try:
+        enforce_under_cwd_and_no_symlink(output, "output dir")
+        rows = _read_jsonl(data, "data path", _MAX_DATA_ROWS)
+    except ValueError as exc:
+        _fail(str(exc))
+    if not rows:
+        _fail(f"data file has no usable rows: {data}")
+
+    # The merge REPLACES -o wholesale (rmtree + os.replace). Guard against
+    # nuking the working directory or an unrelated pre-existing directory: the
+    # subprocess can run for hours, and a distracted `-o .` would otherwise
+    # delete everything under cwd on success.
+    _guard_output_target(output, force=force)
+
+    target_trc = _resolve_trust(target, trust_remote_code)
+    draft_trc = _resolve_trust(draft_base, trust_remote_code)
+
+    # Tokenizer compatibility check. When draft and target share a tokenizer,
+    # standard distillation is used. When vocab sizes or tokenizers differ,
+    # route through cross-tokenizer ULD (wasserstein_aligned).
+    try:
+        target_vocab = _vocab_size_of(target, target_trc)
+        draft_vocab = _vocab_size_of(draft_base, draft_trc)
+    except Exception as exc:  # noqa: BLE001 — surface as a friendly CLI error
+        _fail(f"could not read model config: {exc}")
+
+    cross_tokenizer = target_vocab != draft_vocab
+    if not cross_tokenizer:
+        try:
+            from transformers import AutoTokenizer
+
+            t_tok = AutoTokenizer.from_pretrained(target, trust_remote_code=target_trc)
+            d_tok = AutoTokenizer.from_pretrained(draft_base, trust_remote_code=draft_trc)
+            if not same_tokenizer(t_tok, d_tok):
+                cross_tokenizer = True
+        except Exception as exc:  # noqa: BLE001 — surface as a friendly CLI error
+            _fail(f"could not verify tokenizer compatibility: {exc}")
+
+    uld_strategy = "wasserstein_aligned" if cross_tokenizer else None
+
+    try:
+        yaml_text = _build_distill_config_yaml(
+            draft_base=draft_base,
+            target=target,
+            data=data,
+            out_dir=output,
+            steps=steps,
+            data_rows=len(rows),
+            uld_strategy=uld_strategy,
+        )
+    except ValueError as exc:
+        _fail(str(exc))
+
+    if plan_only:
+        vocab_desc = (
+            f"shared vocab {target_vocab}"
+            if not cross_tokenizer
+            else f"cross-tokenizer: target={target_vocab}, draft={draft_vocab} "
+            f"-> uld_strategy=wasserstein_aligned"
+        )
+        console.print(
+            f"[bold]Plan[/] — distil [cyan]{escape(target)}[/] into "
+            f"[cyan]{escape(draft_base)}[/] over {len(rows)} rows "
+            f"({vocab_desc})\n"
+        )
+        console.print(escape(yaml_text))
+        console.print("[dim]--plan-only: nothing written.[/]")
+        return
+
+    mode_note = (
+        " [cyan](cross-tokenizer ULD: wasserstein_aligned)[/]"
+        if cross_tokenizer
+        else ""
+    )
+    console.print(
+        f"[bold]Distilling[/] {escape(target)} -> {escape(draft_base)}{mode_note} "
+        f"({len(rows)} rows, ~{steps} steps)"
+    )
+    try:
+        _run_distill(
+            draft_base=draft_base,
+            target=target,
+            data=data,
+            out_dir=output,
+            steps=steps,
+            data_rows=len(rows),
+            device=device,
+            trc=draft_trc,
+            uld_strategy=uld_strategy,
+        )
+    except (RuntimeError, ValueError, OSError) as exc:
+        _fail(f"distill failed: {exc}")
+
+    if not no_register:
+        register_draft(target, output)
+        console.print(
+            f"[green]Registered[/] as the local draft for {escape(target)} — "
+            "`soup serve --auto-spec` will now pick it up."
+        )
+
+    console.print(
+        f"[green]Draft written to[/] {escape(output)}\n"
+        f"[dim]Next: soup draft measure --target {escape(target)} "
+        f"--draft {escape(output)} --prompts <p.jsonl>[/]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# measure
+# ---------------------------------------------------------------------------
+def _prompt_texts(rows: list[dict]) -> list[str]:
+    """Best-effort prompt text (prompt / text / instruction / messages)."""
+    prompts: list[str] = []
+    for row in rows:
+        for key in ("prompt", "text", "instruction", "content"):
+            value = row.get(key)
+            if isinstance(value, str) and value.strip():
+                prompts.append(value)
+                break
+        else:
+            messages = row.get("messages")
+            if isinstance(messages, list):
+                user = [
+                    msg.get("content", "")
+                    for msg in messages
+                    if isinstance(msg, dict) and msg.get("role") == "user"
+                ]
+                if user and isinstance(user[0], str) and user[0].strip():
+                    prompts.append(user[0])
+    return prompts
+
+
+@app.command()
+def measure(
+    target: str = typer.Option(..., "--target", help="The model being served."),
+    draft: str = typer.Option(
+        ..., "--draft", help="The draft model (a `soup draft distill` output)."
+    ),
+    prompts: str = typer.Option(
+        ..., "--prompts", help="JSONL prompts representative of production traffic."
+    ),
+    max_new_tokens: int = typer.Option(
+        64, "--max-new-tokens", min=1, max=4096, help="Tokens to generate per prompt."
+    ),
+    num_assistant_tokens: int = typer.Option(
+        5,
+        "--num-assistant-tokens",
+        min=1,
+        max=64,
+        help="Tokens the draft proposes per step (the assisted-generation knob).",
+    ),
+    device: Optional[str] = typer.Option(None, "--device", help="cpu | cuda."),
+    min_acceptance: Optional[float] = typer.Option(
+        None,
+        "--min-acceptance",
+        min=0.0,
+        max=1.0,
+        help="Exit 2 if the acceptance rate falls below this (for CI gating).",
+    ),
+    trust_remote_code: bool = typer.Option(
+        False,
+        "--trust-remote-code",
+        help="Allow custom modelling code from the target / draft "
+        "(required for architectures that ship an auto_map).",
+    ),
+    output: Optional[str] = typer.Option(
+        None, "-o", "--output", help="Write the report as JSON."
+    ),
+    sweep_k: Optional[str] = typer.Option(
+        None,
+        "--sweep-k",
+        help="Also time assisted generation at each of these draft lengths, e.g. "
+        f"1,2,3,5,8 (at most {_MAX_SWEEP_K}, each in {DRAFT_K_MIN}..{DRAFT_K_MAX}).",
+    ),
+) -> None:
+    """Report a draft's acceptance rate + throughput against its target."""
+    sweep_values: Optional[list[int]] = None
+    if sweep_k is not None:
+        try:
+            sweep_values = _parse_sweep_k(sweep_k)
+        except ValueError as exc:
+            _fail(str(exc))
+    try:
+        rows = _read_jsonl(prompts, "prompts path", _MAX_PROMPT_ROWS)
+    except ValueError as exc:
+        _fail(str(exc))
+    prompt_texts = _prompt_texts(rows)
+    if not prompt_texts:
+        _fail(f"prompts file yielded no usable prompt text: {prompts}")
+    if output is not None:
+        try:
+            enforce_under_cwd_and_no_symlink(output, "output path")
+        except ValueError as exc:
+            _fail(str(exc))
+
+    target_trc = _resolve_trust(target, trust_remote_code)
+    draft_trc = _resolve_trust(draft, trust_remote_code)
+
+    # Refuse a pair transformers cannot run BEFORE loading either model. Assisted
+    # generation gates on config.vocab_size (not the tokenizer's vocab) and raises
+    # "different tokenizers" deep inside generate() — after the expensive load —
+    # for a pair whose tokenizers ARE identical but whose padded embedding rows
+    # differ (e.g. Qwen2.5 large<-small). `soup draft distill` already refuses
+    # such a pair up front; measure uses the SAME definition here so the two agree
+    # (issue #344). same_tokenizer() below stays as an additional check.
+    target_vocab, draft_vocab = _pair_vocab_sizes_or_fail(
+        target, draft, target_trc, draft_trc
+    )
+    if target_vocab != draft_vocab:
+        _fail(
+            f"Draft and target must share a tokenizer, but their vocab sizes "
+            f"differ (target={target_vocab}, draft={draft_vocab}). Speculative "
+            f"decoding proposes draft token ids into the target's vocabulary, so "
+            f"transformers refuses a mismatched pair. Distil a draft from this "
+            f"target with `soup draft distill`."
+        )
+
+    console.print(f"[dim]Loading target: {escape(target)}[/]")
+    try:
+        target_model, target_tok, resolved_device = _load_pair_member(
+            target, device=device, trc=target_trc
+        )
+        console.print(f"[dim]Loading draft: {escape(draft)}[/]")
+        draft_model, draft_tok, _ = _load_pair_member(
+            draft, device=resolved_device, trc=draft_trc
+        )
+    except Exception as exc:  # noqa: BLE001 — friendly CLI error
+        _fail(f"could not load the model pair: {exc}")
+
+    is_cross_tok = not same_tokenizer(target_tok, draft_tok)
+    if is_cross_tok:
+        console.print(
+            "[cyan]Cross-tokenizer draft detected — using decoded-span alignment "
+            "& Universal Assisted Decoding.[/]"
+        )
+
+    try:
+        accepted, total = measure_acceptance(
+            target_model,
+            draft_model,
+            target_tok,
+            prompt_texts,
+            max_new_tokens=max_new_tokens,
+            draft_tokenizer=draft_tok,
+        )
+    except Exception as exc:  # noqa: BLE001 — friendly error
+        _fail(f"acceptance measurement failed: {exc}")
+
+    if total == 0:
+        _fail(
+            "the target generated no tokens for any prompt — nothing to measure "
+            "(check the prompts file and --max-new-tokens)"
+        )
+
+    rate = acceptance_rate(accepted, total)
+    verdict = classify_acceptance(rate)
+
+
+    tok_s_plain = measure_throughput(
+        target_model, target_tok, prompt_texts, max_new_tokens=max_new_tokens
+    )
+    # A measured 0.0 tok/s means "we could not time it", not "zero throughput";
+    # normalise explicitly rather than leaning on 0.0 being falsy.
+    plain = None if tok_s_plain <= 0 else tok_s_plain
+
+    # Persist acceptance + plain throughput BEFORE the assisted arm. That arm runs
+    # after the two expensive measurements and can still fail inside transformers
+    # (issue #344); the report used to be written only after it, so a failure
+    # there discarded results that had already succeeded. Write incrementally,
+    # then upgrade the report in place if the assisted arm returns a number.
+    report = AcceptanceReport(
+        target=target,
+        draft=draft,
+        n_prompts=len(prompt_texts),
+        n_generated_tokens=total,
+        acceptance_rate=rate,
+        verdict=verdict,
+        tok_s_plain=plain,
+        tok_s_assisted=None,
+        speedup=None,
+        num_assistant_tokens=num_assistant_tokens,
+        soup_version=__version__,
+    )
+    if output is not None:
+        _write_draft_report(report, output)
+
+    # #843: the draft decoding alone, so the report can say at what acceptance this
+    # pair pays and which k is best. Best-effort like the assisted arm: a failure
+    # here never costs the acceptance rate or plain throughput already on disk.
+    try:
+        tok_s_draft = measure_throughput(
+            draft_model, draft_tok, prompt_texts, max_new_tokens=max_new_tokens
+        )
+    except KeyboardInterrupt:
+        report = replace(report, draft_status="interrupted")
+        _write_draft_report_best_effort(report, output, "draft-arm outcome")
+        raise
+    except Exception as exc:  # noqa: BLE001 — draft arm is best-effort
+        report = replace(report, draft_status="crash")
+        console.print(
+            f"[yellow]Warning:[/] draft-alone throughput could not be measured "
+            f"({escape(str(exc))}); no break-even is reported."
+        )
+    else:
+        draft_tok_s = None if tok_s_draft <= 0 else tok_s_draft
+        report = replace(
+            report,
+            tok_s_draft=draft_tok_s,
+            draft_status="complete" if draft_tok_s is not None else "untimed",
+            **_modelled_fields(rate, plain, draft_tok_s, num_assistant_tokens),
+        )
+    _write_draft_report_best_effort(report, output, "draft-arm outcome")
+
+    try:
+        tok_s_assisted = measure_throughput(
+            target_model,
+            target_tok,
+            prompt_texts,
+            assistant_model=draft_model,
+            assistant_tokenizer=draft_tok,
+            num_assistant_tokens=num_assistant_tokens,
+            max_new_tokens=max_new_tokens,
+        )
+    except KeyboardInterrupt:
+        # A Ctrl-C during the arm must be distinguishable on disk from a crash or
+        # an untimed run — otherwise all three write byte-identical reports
+        # (#344 review). Record the outcome, then re-raise so the exit code and
+        # the "arm is best-effort" contract are unchanged.
+        _record_assisted_status(report, output, "interrupted")
+        raise
+    except Exception as exc:  # noqa: BLE001 — assisted arm is best-effort
+        report = _record_assisted_status(report, output, "crash")
+        console.print(
+            f"[yellow]Warning:[/] assisted-generation throughput could not be "
+            f"measured ({escape(str(exc))}); the acceptance rate and plain "
+            f"throughput are still valid"
+            + (" and are on disk." if output is not None else ".")
+        )
+    else:
+        assisted = None if tok_s_assisted <= 0 else tok_s_assisted
+        if assisted is not None:
+            report = replace(
+                report,
+                tok_s_assisted=assisted,
+                speedup=assisted / plain if plain else None,
+                assisted_status="complete",
+            )
+        else:
+            report = replace(report, assisted_status="untimed")
+        if output is not None:
+            _write_draft_report(report, output)
+
+    if sweep_values is not None:
+        report = _run_k_sweep(
+            report, output, sweep_values, plain,
+            target_model, target_tok, draft_model, draft_tok, prompt_texts, max_new_tokens,
+        )
+
+    console.print(render_draft_panel(report))
+    if output is not None:
+        console.print(f"[dim]Report written to {escape(output)}[/]")
+
+    if min_acceptance is not None and rate < min_acceptance:
+        _fail(
+            f"Acceptance {rate:.1%} is below the required {min_acceptance:.1%}.",
+            code=2,
+        )
+
+
+def _run_k_sweep(
+    report: AcceptanceReport,
+    output: Optional[str],
+    ks: list[int],
+    plain: Optional[float],
+    target_model,
+    target_tok,
+    draft_model,
+    draft_tok,
+    prompt_texts: list[str],
+    max_new_tokens: int,
+) -> AcceptanceReport:
+    """``--sweep-k``: time assisted generation at each k (#843).
+
+    Each k is best-effort and written as it completes, so one crash or a Ctrl-C
+    keeps every k measured before it. The measured best k sits beside the modelled
+    one; when they disagree, that disagreement is the point of measuring.
+    """
+    rows: list[dict] = []
+
+    def _commit(best: Optional[int]) -> AcceptanceReport:
+        updated = replace(report, k_sweep=tuple(rows), measured_best_k=best)
+        _write_draft_report_best_effort(updated, output, "--sweep-k result")
+        return updated
+
+    def _best() -> Optional[int]:
+        done = [row for row in rows if row["status"] == "complete"]
+        # A tie goes to the smaller k, as the modelled best k does, whatever order
+        # --sweep-k was typed in.
+        return (
+            max(done, key=lambda row: (row["tok_s_assisted"], -row["k"]))["k"] if done else None
+        )
+
+    for k in ks:
+        row: dict = {"k": k, "tok_s_assisted": None, "speedup": None, "status": "pending"}
+        rows.append(row)
+        try:
+            tok_s = measure_throughput(
+                target_model,
+                target_tok,
+                prompt_texts,
+                assistant_model=draft_model,
+                assistant_tokenizer=draft_tok,
+                num_assistant_tokens=k,
+                max_new_tokens=max_new_tokens,
+            )
+        except KeyboardInterrupt:
+            row["status"] = "interrupted"
+            _commit(_best())
+            raise
+        except Exception as exc:  # noqa: BLE001 — each k is best-effort
+            row["status"] = "crash"
+            console.print(
+                f"[yellow]Warning:[/] --sweep-k k={k} could not be measured "
+                f"({escape(str(exc))})."
+            )
+        else:
+            if tok_s > 0:
+                row.update(
+                    tok_s_assisted=tok_s,
+                    speedup=tok_s / plain if plain else None,
+                    status="complete",
+                )
+            else:
+                row["status"] = "untimed"
+        report = _commit(_best())
+    return report
+
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+@app.command("list")
+def list_registered() -> None:
+    """List locally-trained drafts that `soup serve --auto-spec` can use."""
+    entries = list_drafts()
+    if not entries:
+        console.print(
+            "[yellow]No drafts registered.[/] Train one with "
+            "`soup draft distill --target <model> --draft-base <tiny> "
+            "--data <d.jsonl>`."
+        )
+        return
+
+    table = Table(title="Local speculative-decoding drafts")
+    table.add_column("Target", style="cyan")
+    table.add_column("Draft")
+    table.add_column("Acceptance", justify="right")
+    table.add_column("Created", style="dim")
+    for entry in entries:
+        rate = entry.get("acceptance_rate")
+        table.add_row(
+            for_terminal(str(entry.get("target", "?"))),
+            for_terminal(str(entry.get("draft", "?"))),
+            "-" if rate is None else f"{float(rate) * 100:.1f}%",
+            for_terminal(str(entry.get("created", "?"))),
+        )
+    console.print(table)

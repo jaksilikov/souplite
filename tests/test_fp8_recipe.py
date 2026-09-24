@@ -1,0 +1,479 @@
+"""Tests for FP8 recipe support (v0.28.1).
+
+Covers:
+- Schema: fp8_recipe field accepts valid literals, rejects invalid strings
+- Schema: fp8_recipe requires quantization_aware='fp8' when non-default
+- Schema: default recipe is 'tensorwise' (backward compat with v0.28.0)
+- Dispatch: apply_fp8_training passes correct recipe to Float8LinearConfig
+- Integration: fp8_recipe with non-SFT tasks rejected (via quantization_aware gate)
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pydantic import ValidationError
+
+from souplite.config.schema import SoupConfig, TrainingConfig
+
+# ─── Schema: fp8_recipe field ──────────────────────────────────────────────
+
+
+class TestFP8RecipeSchema:
+    """fp8_recipe accepts 'tensorwise', 'rowwise', 'rowwise_with_gw_hp'."""
+
+    def test_fp8_recipe_default_tensorwise(self):
+        cfg = SoupConfig(base="test/model", data={"train": "./data.jsonl"})
+        assert cfg.training.fp8_recipe == "tensorwise"
+
+    def test_fp8_recipe_tensorwise_explicit(self):
+        cfg = SoupConfig(
+            base="test/model",
+            data={"train": "./data.jsonl"},
+            training={"quantization_aware": "fp8", "fp8_recipe": "tensorwise"},
+        )
+        assert cfg.training.fp8_recipe == "tensorwise"
+
+    def test_fp8_recipe_rowwise(self):
+        cfg = SoupConfig(
+            base="test/model",
+            data={"train": "./data.jsonl"},
+            training={"quantization_aware": "fp8", "fp8_recipe": "rowwise"},
+        )
+        assert cfg.training.fp8_recipe == "rowwise"
+
+    def test_fp8_recipe_rowwise_with_gw_hp(self):
+        cfg = SoupConfig(
+            base="test/model",
+            data={"train": "./data.jsonl"},
+            training={
+                "quantization_aware": "fp8",
+                "fp8_recipe": "rowwise_with_gw_hp",
+            },
+        )
+        assert cfg.training.fp8_recipe == "rowwise_with_gw_hp"
+
+    def test_fp8_recipe_invalid_string_rejected(self):
+        """Only the three literal values are accepted."""
+        with pytest.raises(ValidationError) as exc:
+            SoupConfig(
+                base="test/model",
+                data={"train": "./data.jsonl"},
+                training={
+                    "quantization_aware": "fp8",
+                    "fp8_recipe": "delayed",
+                },
+            )
+        assert "fp8_recipe" in str(exc.value)
+
+    def test_fp8_recipe_invalid_empty_string_rejected(self):
+        with pytest.raises(ValidationError):
+            SoupConfig(
+                base="test/model",
+                data={"train": "./data.jsonl"},
+                training={"quantization_aware": "fp8", "fp8_recipe": ""},
+            )
+
+    def test_fp8_recipe_invalid_int_rejected(self):
+        with pytest.raises(ValidationError):
+            SoupConfig(
+                base="test/model",
+                data={"train": "./data.jsonl"},
+                training={"quantization_aware": "fp8", "fp8_recipe": 42},
+            )
+
+
+# ─── Schema: fp8_recipe requires quantization_aware='fp8' ─────────────────
+
+
+class TestFP8RecipeRequiresFP8:
+    """Non-default fp8_recipe without quantization_aware='fp8' is rejected."""
+
+    def test_default_recipe_allowed_without_fp8(self):
+        """tensorwise (default) is fine even without fp8 — it's the default."""
+        cfg = SoupConfig(
+            base="test/model",
+            data={"train": "./data.jsonl"},
+            training={"fp8_recipe": "tensorwise"},
+        )
+        assert cfg.training.fp8_recipe == "tensorwise"
+        assert cfg.training.quantization_aware is False
+
+    def test_rowwise_without_fp8_rejected(self):
+        with pytest.raises(ValidationError) as exc:
+            SoupConfig(
+                base="test/model",
+                data={"train": "./data.jsonl"},
+                training={"fp8_recipe": "rowwise"},
+            )
+        assert "quantization_aware" in str(exc.value)
+
+    def test_rowwise_with_gw_hp_without_fp8_rejected(self):
+        with pytest.raises(ValidationError) as exc:
+            SoupConfig(
+                base="test/model",
+                data={"train": "./data.jsonl"},
+                training={"fp8_recipe": "rowwise_with_gw_hp"},
+            )
+        assert "quantization_aware" in str(exc.value)
+
+    def test_rowwise_with_bool_true_qat_rejected(self):
+        """Bool True = int8 QAT, not FP8 — recipe should be rejected."""
+        with pytest.raises(ValidationError) as exc:
+            SoupConfig(
+                base="test/model",
+                data={"train": "./data.jsonl"},
+                training={
+                    "quantization_aware": True,
+                    "fp8_recipe": "rowwise",
+                },
+            )
+        assert "quantization_aware" in str(exc.value)
+
+
+# ─── Dispatch: apply_fp8_training recipe parameter ────────────────────────
+
+
+class TestFP8RecipeDispatch:
+    """apply_fp8_training passes recipe to Float8LinearConfig.from_recipe_name."""
+
+    @pytest.fixture(autouse=True)
+    def _hopper_card(self, monkeypatch):
+        """#835: apply_fp8_training now asks the hardware gate before converting.
+
+        These tests are about recipe dispatch, so they run on a Hopper card
+        (SM 9.0, every recipe admitted); ``tests/test_issue835_fp8_gate.py``
+        covers the gate. torch is patched, not the gate, because each test
+        reloads ``souplite.utils.fp8``.
+
+        The OS and torch's CUDA build are pinned with it: the rowwise recipes
+        need a build that has the kernel, and torch never builds it on Windows,
+        so the three Windows CI cells would otherwise fail these dispatch tests
+        (#1044 review).
+        """
+        import sys
+
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_a, **_k: (9, 0))
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(torch.version, "cuda", "12.4")
+
+    def test_apply_fp8_dispatches_tensorwise(self):
+        """Default recipe passes 'tensorwise' to from_recipe_name."""
+        mock_config = MagicMock()
+        mock_from_recipe = MagicMock(return_value=mock_config)
+        mock_convert = MagicMock()
+
+        fake_float8 = MagicMock()
+        fake_float8.convert_to_float8_training = mock_convert
+        fake_config_mod = MagicMock()
+        fake_config_mod.Float8LinearConfig.from_recipe_name = mock_from_recipe
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "torchao": MagicMock(),
+                "torchao.float8": fake_float8,
+                "torchao.float8.config": fake_config_mod,
+            },
+        ):
+            # Need to reimport to pick up the mocked modules
+            import importlib
+
+            import souplite.utils.fp8 as fp8_mod
+
+            importlib.reload(fp8_mod)
+
+            # Mock is_fp8_available to return True
+            with patch.object(fp8_mod, "is_fp8_available", return_value=True):
+                model = MagicMock()
+                result = fp8_mod.apply_fp8_training(model, recipe="tensorwise")
+
+        mock_from_recipe.assert_called_once_with("tensorwise")
+        mock_convert.assert_called_once_with(model, config=mock_config)
+        assert result is True
+
+    def test_apply_fp8_dispatches_rowwise(self):
+        """Rowwise recipe passes 'rowwise' to from_recipe_name."""
+        mock_config = MagicMock()
+        mock_from_recipe = MagicMock(return_value=mock_config)
+        mock_convert = MagicMock()
+
+        fake_float8 = MagicMock()
+        fake_float8.convert_to_float8_training = mock_convert
+        fake_config_mod = MagicMock()
+        fake_config_mod.Float8LinearConfig.from_recipe_name = mock_from_recipe
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "torchao": MagicMock(),
+                "torchao.float8": fake_float8,
+                "torchao.float8.config": fake_config_mod,
+            },
+        ):
+            import importlib
+
+            import souplite.utils.fp8 as fp8_mod
+
+            importlib.reload(fp8_mod)
+
+            with patch.object(fp8_mod, "is_fp8_available", return_value=True):
+                model = MagicMock()
+                result = fp8_mod.apply_fp8_training(model, recipe="rowwise")
+
+        mock_from_recipe.assert_called_once_with("rowwise")
+        assert result is True
+
+    def test_apply_fp8_dispatches_rowwise_with_gw_hp(self):
+        """rowwise_with_gw_hp recipe passes through correctly."""
+        mock_config = MagicMock()
+        mock_from_recipe = MagicMock(return_value=mock_config)
+        mock_convert = MagicMock()
+
+        fake_float8 = MagicMock()
+        fake_float8.convert_to_float8_training = mock_convert
+        fake_config_mod = MagicMock()
+        fake_config_mod.Float8LinearConfig.from_recipe_name = mock_from_recipe
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "torchao": MagicMock(),
+                "torchao.float8": fake_float8,
+                "torchao.float8.config": fake_config_mod,
+            },
+        ):
+            import importlib
+
+            import souplite.utils.fp8 as fp8_mod
+
+            importlib.reload(fp8_mod)
+
+            with patch.object(fp8_mod, "is_fp8_available", return_value=True):
+                model = MagicMock()
+                result = fp8_mod.apply_fp8_training(
+                    model, recipe="rowwise_with_gw_hp"
+                )
+
+        mock_from_recipe.assert_called_once_with("rowwise_with_gw_hp")
+        assert result is True
+
+    def test_apply_fp8_returns_false_when_unavailable(self):
+        """When FP8 deps are missing, apply_fp8_training returns False."""
+        from souplite.utils.fp8 import apply_fp8_training
+
+        with patch("souplite.utils.fp8.is_fp8_available", return_value=False):
+            model = MagicMock()
+            assert apply_fp8_training(model, recipe="rowwise") is False
+
+    def test_apply_fp8_default_recipe_is_tensorwise(self):
+        """Calling without recipe= uses 'tensorwise' (v0.28.0 compat)."""
+        mock_config = MagicMock()
+        mock_from_recipe = MagicMock(return_value=mock_config)
+        mock_convert = MagicMock()
+
+        fake_float8 = MagicMock()
+        fake_float8.convert_to_float8_training = mock_convert
+        fake_config_mod = MagicMock()
+        fake_config_mod.Float8LinearConfig.from_recipe_name = mock_from_recipe
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "torchao": MagicMock(),
+                "torchao.float8": fake_float8,
+                "torchao.float8.config": fake_config_mod,
+            },
+        ):
+            import importlib
+
+            import souplite.utils.fp8 as fp8_mod
+
+            importlib.reload(fp8_mod)
+
+            with patch.object(fp8_mod, "is_fp8_available", return_value=True):
+                model = MagicMock()
+                fp8_mod.apply_fp8_training(model)
+
+        # Default should be tensorwise
+        mock_from_recipe.assert_called_once_with("tensorwise")
+
+
+# ─── Integration: fp8_recipe + non-SFT tasks ──────────────────────────────
+
+
+class TestFP8RecipeNonSFT:
+    """FP8 recipe on non-SFT tasks: accepted on transformer backends (v0.35.0)."""
+
+    def test_fp8_recipe_on_dpo_accepted(self):
+        """DPO + fp8 + recipe is valid (all transformer trainers wired in v0.35.0)."""
+        cfg = SoupConfig(
+            base="m",
+            task="dpo",
+            data={"train": "./d.jsonl", "format": "dpo"},
+            training={
+                "quantization_aware": "fp8",
+                "fp8_recipe": "rowwise",
+            },
+        )
+        assert cfg.training.fp8_recipe == "rowwise"
+
+    def test_fp8_recipe_on_grpo_accepted(self):
+        cfg = SoupConfig(
+            base="m",
+            task="grpo",
+            data={"train": "./d.jsonl"},
+            training={
+                "quantization_aware": "fp8",
+                "fp8_recipe": "rowwise_with_gw_hp",
+            },
+        )
+        assert cfg.training.fp8_recipe == "rowwise_with_gw_hp"
+
+    def test_fp8_recipe_on_mlx_rejected(self):
+        """MLX backend does not support FP8 — rejected at config level."""
+        with pytest.raises(ValidationError):
+            SoupConfig(
+                base="m",
+                task="sft",
+                backend="mlx",
+                data={"train": "./d.jsonl"},
+                training={
+                    "quantization_aware": "fp8",
+                    "fp8_recipe": "rowwise",
+                },
+            )
+
+    def test_fp8_recipe_on_sft_accepted(self):
+        """SFT + fp8 + recipe is valid."""
+        cfg = SoupConfig(
+            base="m",
+            task="sft",
+            data={"train": "./d.jsonl"},
+            training={
+                "quantization_aware": "fp8",
+                "fp8_recipe": "rowwise",
+            },
+        )
+        assert cfg.training.fp8_recipe == "rowwise"
+        assert cfg.training.quantization_aware == "fp8"
+
+    def test_all_recipes_accepted_on_sft(self):
+        """All three recipes are valid on SFT with fp8."""
+        for recipe in ("tensorwise", "rowwise", "rowwise_with_gw_hp"):
+            cfg = SoupConfig(
+                base="m",
+                task="sft",
+                data={"train": "./d.jsonl"},
+                training={
+                    "quantization_aware": "fp8",
+                    "fp8_recipe": recipe,
+                },
+            )
+            assert cfg.training.fp8_recipe == recipe
+
+
+# ─── Backward compatibility ───────────────────────────────────────────────
+
+
+class TestFP8RecipeBackwardCompat:
+    """v0.28.0 configs without fp8_recipe still work (defaults to tensorwise)."""
+
+    def test_v028_config_no_recipe_field(self):
+        """Config with quantization_aware='fp8' but no fp8_recipe is valid."""
+        cfg = SoupConfig(
+            base="test/model",
+            data={"train": "./data.jsonl"},
+            training={"quantization_aware": "fp8"},
+        )
+        assert cfg.training.quantization_aware == "fp8"
+        assert cfg.training.fp8_recipe == "tensorwise"
+
+    def test_v028_bool_true_unaffected(self):
+        """Bool True (int8 QAT) is unaffected by fp8_recipe field."""
+        cfg = SoupConfig(
+            base="test/model",
+            data={"train": "./data.jsonl"},
+            training={"quantization_aware": True},
+        )
+        assert cfg.training.quantization_aware is True
+        assert cfg.training.fp8_recipe == "tensorwise"  # default, unused
+
+    def test_training_config_fp8_recipe_default(self):
+        """TrainingConfig alone defaults fp8_recipe to tensorwise."""
+        tcfg = TrainingConfig()
+        assert tcfg.fp8_recipe == "tensorwise"
+
+
+# ─── Dispatch through apply_v028_speed_memory (covers 10 non-SFT trainers) ──
+
+
+class TestFP8RecipeViaV028Features:
+    """All non-SFT trainers go through apply_v028_speed_memory; verify it
+    passes the user-configured recipe through to apply_fp8_training instead
+    of always defaulting to tensorwise (silent no-op bug fix)."""
+
+    def _run_dispatch(self, recipe: str) -> MagicMock:
+        """Invoke apply_v028_speed_memory with quantization_aware=fp8 and
+        the given recipe, returning the patched apply_fp8_training mock."""
+        tcfg = MagicMock()
+        tcfg.quantization_aware = "fp8"
+        tcfg.fp8_recipe = recipe
+        tcfg.use_cut_ce = False
+        tcfg.kernel_auto_compose = False
+        # A MagicMock attribute is truthy, so this test enabled fp8_attention by
+        # accident; harmless while that path degraded, but it now refuses on a
+        # card that cannot run the recipe (#1044 review).
+        tcfg.fp8_attention = False
+
+        with patch("souplite.utils.fp8.apply_fp8_training", return_value=True) as m:
+            from souplite.utils.v028_features import apply_v028_speed_memory
+
+            apply_v028_speed_memory(
+                model=MagicMock(),
+                tcfg=tcfg,
+                base_model="test/model",
+                console=None,
+                device="cuda",
+                backend="transformers",
+            )
+        return m
+
+    def test_v028_dispatch_tensorwise(self):
+        m = self._run_dispatch("tensorwise")
+        m.assert_called_once()
+        assert m.call_args.kwargs.get("recipe") == "tensorwise"
+
+    def test_v028_dispatch_rowwise(self):
+        m = self._run_dispatch("rowwise")
+        m.assert_called_once()
+        assert m.call_args.kwargs.get("recipe") == "rowwise"
+
+    def test_v028_dispatch_rowwise_with_gw_hp(self):
+        m = self._run_dispatch("rowwise_with_gw_hp")
+        m.assert_called_once()
+        assert m.call_args.kwargs.get("recipe") == "rowwise_with_gw_hp"
+
+    def test_v028_skips_apply_when_quant_not_fp8(self):
+        """If quantization_aware != 'fp8', apply_fp8_training is not called."""
+        tcfg = MagicMock()
+        tcfg.quantization_aware = True  # int8 QAT, not fp8
+        tcfg.fp8_recipe = "rowwise"
+        tcfg.use_cut_ce = False
+        tcfg.kernel_auto_compose = False
+        tcfg.fp8_attention = False  # a MagicMock attribute is truthy (#1044 review)
+
+        with patch("souplite.utils.fp8.apply_fp8_training") as m:
+            from souplite.utils.v028_features import apply_v028_speed_memory
+
+            apply_v028_speed_memory(
+                model=MagicMock(),
+                tcfg=tcfg,
+                base_model="test/model",
+                console=None,
+            )
+        m.assert_not_called()

@@ -1,0 +1,1235 @@
+"""Pure MCP tool registry for ``soup mcp serve`` (v0.71.28).
+
+This module has **no** dependency on the ``mcp`` SDK: it defines the tool
+table (:class:`ToolSpec`), the handler functions (each a pure
+``(dict) -> dict``), and the shared security guards. :mod:`souplite.mcp_server.server`
+is the only file that imports the SDK, and it consumes this registry.
+
+Every handler lazy-imports its light core inside the function body so that
+importing this module stays cheap and torch-free.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+import re
+import shlex
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
+
+from souplite.mcp_server.execution import (
+    ExecutionError,
+    ExecutionManager,
+    ProtectedFile,
+    absent_marker,
+    digest_file,
+)
+from souplite.utils.paths import enforce_under_cwd_and_no_symlink, is_under_cwd
+from souplite.utils.terminal import strip_control
+
+if TYPE_CHECKING:
+    from souplite.config.schema import SoupConfig
+
+# Default read cap for JSON tool arguments (mirrors ship/diagnose evidence).
+_MAX_JSON_BYTES = 16 * 1024 * 1024
+# Cap on `data` dataset loads — the server is long-lived, so a client must not
+# be able to point `data` at an arbitrarily large file and exhaust memory
+# (mirrors advise's own 1 GiB cap; security-review MEDIUM).
+_MAX_DATA_BYTES = 1024 * 1024 * 1024
+
+
+class McpToolError(Exception):
+    """A tool-level failure with a pre-sanitized, path-free message.
+
+    The MCP SDK stringifies a raised exception verbatim into an ``isError``
+    result, so handlers must raise THIS (never a bare ``OSError`` whose text
+    could leak a filesystem path).
+    """
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """One entry in the MCP tool table.
+
+    ``frozen=True`` blocks attribute rebinding; ``input_schema`` contents are
+    still technically mutable, but the table is built fresh per server and
+    never mutated in place.
+    """
+
+    name: str
+    title: str
+    description: str
+    input_schema: dict
+    handler: Callable[[dict], dict]
+    mutating: bool = False
+    annotations: dict | None = None
+
+
+def _sanitize(obj: Any) -> Any:
+    """Recursively strip C0/ESC/DEL bytes from every string in ``obj``.
+
+    Leaves non-string scalars (int/float/bool/None) untouched; recurses into
+    dicts and lists. Applied to every handler result as defence-in-depth.
+    """
+    if isinstance(obj, str):
+        return strip_control(obj)
+    if isinstance(obj, Mapping):
+        return {_sanitize(k): _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
+def _read_text_under_cwd(path: str, field: str, *, max_bytes: int = _MAX_JSON_BYTES) -> str:
+    """Read a text file argument (cwd-contained, symlink-rejected, size-capped).
+
+    Opens with ``O_NOFOLLOW`` (where available) and fstats the open fd so a
+    symlink swapped in after the containment check cannot redirect the read
+    (TOCTOU defence, mirrors ``commands/ship.py::_load_evidence``). Raises
+    :class:`McpToolError` with a path-free message on any failure.
+    """
+    try:
+        enforce_under_cwd_and_no_symlink(path, field)
+    except Exception as exc:  # ValueError / OSError from the guard
+        raise McpToolError(f"{field} must be a readable file under the working directory") from exc
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        handle_fd = os.open(path, flags)
+    except OSError as exc:
+        raise McpToolError(f"{field} is unreadable ({type(exc).__name__})") from exc
+    try:
+        with os.fdopen(handle_fd, "r", encoding="utf-8") as handle:
+            if os.fstat(handle.fileno()).st_size > max_bytes:
+                raise McpToolError(f"{field} exceeds {max_bytes} bytes")
+            return handle.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise McpToolError(f"{field} is unreadable ({type(exc).__name__})") from exc
+
+
+def _read_json_under_cwd(path: str, field: str, *, max_bytes: int = _MAX_JSON_BYTES) -> dict:
+    """Read a JSON *object* argument (delegates to :func:`_read_text_under_cwd`)."""
+    text = _read_text_under_cwd(path, field, max_bytes=max_bytes)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise McpToolError(f"{field} is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise McpToolError(f"{field} must contain a JSON object")
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Argument helpers — every handler validates its own args (the SDK also
+# jsonschema-validates inputSchema, but handlers must not trust that alone).
+# Error messages NEVER echo raw user input (avoids ANSI/path injection).
+# ---------------------------------------------------------------------------
+
+
+# Generous cap on free-text string args (paths, ids, goals, queries). Bounds a
+# pathological input without constraining any legitimate value (security-review).
+_MAX_STR_LEN = 4096
+
+
+def _unknown_choice(
+    field: str, value: str, choices: Iterable[str], *, preserve_order: bool = False
+) -> McpToolError:
+    """Describe a rejected choice using the live allowlist and an escaped value.
+
+    Callers apply the string length guard first. Only the choice is echoed,
+    never related model/config paths or an underlying exception's message.
+    """
+    accepted = choices if preserve_order else sorted(choices)
+    return McpToolError(f"unknown {field} {value!r}; accepted: " + ", ".join(accepted))
+
+
+def _require_str(args: dict, key: str) -> str:
+    val = args.get(key)
+    if not isinstance(val, str) or not val:
+        raise McpToolError(f"'{key}' must be a non-empty string")
+    if len(val) > _MAX_STR_LEN:
+        raise McpToolError(f"'{key}' must be at most {_MAX_STR_LEN} characters")
+    return val
+
+
+def _opt_str(args: dict, key: str) -> str | None:
+    val = args.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, str):
+        raise McpToolError(f"'{key}' must be a string")
+    if len(val) > _MAX_STR_LEN:
+        raise McpToolError(f"'{key}' must be at most {_MAX_STR_LEN} characters")
+    return val
+
+
+def _opt_int(args: dict, key: str, default: int, *, lo: int, hi: int) -> int:
+    val = args.get(key, default)
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise McpToolError(f"'{key}' must be an integer")
+    # Reject rather than silently clamp — clamping hides the user's error and
+    # bypasses the core's own bounds check (code-review MEDIUM).
+    if not lo <= val <= hi:
+        raise McpToolError(f"'{key}' must be between {lo} and {hi}")
+    return val
+
+
+def _enforce_data_path(path: str, field: str = "data") -> None:
+    try:
+        enforce_under_cwd_and_no_symlink(path, field)
+    except Exception as exc:  # ValueError / OSError from the guard
+        raise McpToolError(
+            f"'{field}' must be a readable file under the working directory"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Read-only tool handlers (each a pure ``(dict) -> dict``)
+# ---------------------------------------------------------------------------
+
+
+def tool_advise(args: dict) -> dict:
+    """`soup advise` — pre-flight PROMPT_ENG / RAG / SFT / DPO / GRPO verdict."""
+    from souplite.utils import advise as _advise
+
+    data = _require_str(args, "data")
+    goal = _opt_str(args, "goal")
+    _enforce_data_path(data)
+    try:
+        rows = _advise.load_advise_dataset(data)
+        task = _advise.classify_task(rows, goal)
+        profile = _advise.compute_dataset_profile(rows)
+        verdict = _advise.build_verdict(profile, task, goal=goal)
+    except (OSError, ValueError, TypeError) as exc:
+        raise McpToolError(f"advise failed ({type(exc).__name__})") from exc
+    return asdict(verdict)
+
+
+def _load_data_rows(path: str) -> list[dict]:
+    from souplite.data.loader import load_raw_data
+
+    _enforce_data_path(path)
+    # Best-effort size cap before load_raw_data reads the whole file into memory
+    # (the path is already confirmed non-symlink + under cwd).
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise McpToolError(f"data is unreadable ({type(exc).__name__})") from exc
+    if size > _MAX_DATA_BYTES:
+        raise McpToolError(f"data exceeds {_MAX_DATA_BYTES} bytes")
+    # load_raw_data dispatches by extension: parquet raises bare ImportError
+    # without pandas, CSV raises csv.Error (NOT a ValueError subclass) on
+    # malformed input. Translate every loader failure here (code-review MEDIUM).
+    try:
+        return load_raw_data(Path(path))
+    except (OSError, ValueError, ImportError, csv.Error) as exc:
+        raise McpToolError(f"cannot load data ({type(exc).__name__})") from exc
+
+
+def tool_data_inspect(args: dict) -> dict:
+    """`soup data inspect` — dataset stats."""
+    from souplite.data.validator import validate_and_stats
+
+    rows = _load_data_rows(_require_str(args, "data"))
+    return validate_and_stats(rows)
+
+
+def tool_data_validate(args: dict) -> dict:
+    """`soup data validate` — format-compliance report.
+
+    Resolves ``format`` exactly as ``tool_data_doctor`` below already does,
+    and for the same reason (#878). ``validator.validate_and_stats`` computes
+    ``check_format = bool(expected_format and expected_format in
+    VALID_FORMATS)``, so an unrecognised format silently turns the format
+    check *off* and a missing one never turns it on -- both answer "every row
+    valid" for a reason that has nothing to do with the data. #869 guarded the
+    CLI against that; this surface kept reporting the old verdict, so one file
+    got two answers depending on which surface asked.
+
+    The allowlist is ``VALID_FORMATS`` itself rather than a copy: a
+    hand-written second tuple is how the two surfaces drifted apart in the
+    first place.
+    """
+    from souplite.data import formats as _formats
+    from souplite.data.validator import validate_and_stats
+
+    rows = _load_data_rows(_require_str(args, "data"))
+    # Absent means auto; an empty or blank string is a value the caller
+    # supplied and it is not a format, so it is refused -- `soup data
+    # validate --format ""` exits 1 rather than auto-detecting, and this
+    # surface has to answer the same way.
+    fmt = _opt_str(args, "format")
+    fmt = "auto" if fmt is None else fmt
+    if fmt != "auto" and fmt not in _formats.VALID_FORMATS:
+        raise _unknown_choice(
+            "format", fmt, ("auto", *_formats.VALID_FORMATS), preserve_order=True
+        )
+    if fmt == "auto":
+        try:
+            fmt = _formats.detect_format(rows)
+        except ValueError as exc:
+            raise McpToolError(
+                "could not auto-detect data format; pass 'format'"
+            ) from exc
+    # The resolved format travels back with the report: without it a caller
+    # cannot tell which format was checked, which makes the schema's
+    # "omit to auto-detect" unobservable even once it is true.
+    return {**validate_and_stats(rows, expected_format=fmt), "format": fmt}
+
+
+def tool_data_score(args: dict) -> dict:
+    """`soup data score` — PII / keyword triage / language / educational scorecard."""
+    from souplite.utils.data_score import compute_scorecard
+
+    rows = _load_data_rows(_require_str(args, "data"))
+    rep = compute_scorecard(rows)
+    return {
+        "total": rep.total,
+        "pii_flagged": rep.pii_flagged,
+        "toxic_flagged": rep.toxic_flagged,
+        "abuse_keyword_flagged": rep.toxic_flagged,
+        "decontaminated_removed": rep.decontaminated_removed,
+        "languages": dict(rep.languages),
+        "educational_mean": rep.educational_mean,
+    }
+
+
+def tool_data_doctor(args: dict) -> dict:
+    """`soup data doctor` — chat-template compat report (needs the tokenizer stack)."""
+    from souplite.data import formats as _formats
+    from souplite.utils import data_doctor as _dd
+
+    rows = _load_data_rows(_require_str(args, "data"))
+    model = _require_str(args, "model")
+    fmt = _opt_str(args, "format")
+    fmt = "auto" if fmt is None else fmt
+    if fmt != "auto" and fmt not in _formats.VALID_FORMATS:
+        raise _unknown_choice(
+            "format", fmt, ("auto", *_formats.VALID_FORMATS), preserve_order=True
+        )
+    max_length = _opt_int(args, "max_length", 2048, lo=64, hi=1_048_576)
+    sample_size = _opt_int(args, "sample_size", 200, lo=1, hi=2000)
+    if fmt == "auto":
+        try:
+            fmt = _formats.detect_format(rows)
+        except ValueError as exc:
+            raise McpToolError("could not auto-detect data format; pass 'format'") from exc
+    # `resolve_tokenizer` catches the transformers-missing case internally and
+    # re-raises it as a ValueError, so probe the dependency directly to keep the
+    # actionable "install the extra" hint (python-review HIGH).
+    try:
+        import transformers  # noqa: F401
+    except ImportError as exc:
+        raise McpToolError(
+            "data_doctor needs the tokenizer stack: pip install \"souplite[train]\""
+        ) from exc
+    try:
+        tok = _dd.resolve_tokenizer(model, trust_remote_code=False)
+    except (ImportError, ValueError, TypeError, OSError) as exc:
+        raise McpToolError(f"could not load tokenizer ({type(exc).__name__})") from exc
+    try:
+        report = _dd.run_doctor(
+            rows, tok, fmt=fmt, max_length=max_length, sample_size=sample_size
+        )
+    except (ValueError, TypeError) as exc:
+        raise McpToolError(f"data doctor failed ({type(exc).__name__})") from exc
+    return report.to_dict()
+
+
+def tool_recipes_search(args: dict) -> dict:
+    """`soup recipes search` — compact recipe list (no yaml body)."""
+    from souplite.recipes.catalog import RECIPES, search_recipes
+
+    results = search_recipes(
+        _opt_str(args, "query"), _opt_str(args, "task"), _opt_str(args, "size")
+    )
+    name_by_id = {id(meta): name for name, meta in RECIPES.items()}
+    out = [
+        {
+            "name": name_by_id.get(id(meta), "?"),
+            "model": meta.model,
+            "task": meta.task,
+            "size": meta.size,
+            "tags": list(meta.tags),
+            "description": meta.description,
+        }
+        for meta in results
+    ]
+    return {"results": out, "count": len(out)}
+
+
+def tool_recipes_show(args: dict) -> dict:
+    """`soup recipes show` — full recipe incl. the YAML body."""
+    from souplite.recipes.catalog import get_recipe
+
+    name = _require_str(args, "name")
+    meta = get_recipe(name)
+    if meta is None:
+        raise McpToolError("unknown recipe (try recipes_search)")
+    return {
+        "name": name,
+        "model": meta.model,
+        "task": meta.task,
+        "size": meta.size,
+        "tags": list(meta.tags),
+        "description": meta.description,
+        "yaml_str": meta.yaml_str,
+    }
+
+
+def tool_runs_list(args: dict) -> dict:
+    """`soup runs` — recent experiment runs."""
+    from souplite.experiment.tracker import ExperimentTracker
+
+    limit = _opt_int(args, "limit", 50, lo=1, hi=500)
+    runs = ExperimentTracker().list_runs(limit=limit)
+    return {"runs": runs, "count": len(runs)}
+
+
+def tool_runs_show(args: dict) -> dict:
+    """`soup runs show` — one run's full record."""
+    from souplite.experiment.tracker import ExperimentTracker
+
+    run = ExperimentTracker().get_run(_require_str(args, "run_id"))
+    if run is None:
+        raise McpToolError("run not found")
+    return run
+
+
+def tool_registry_list(args: dict) -> dict:
+    """`soup registry list` — model registry entries."""
+    from souplite.registry.store import RegistryStore
+
+    limit = _opt_int(args, "limit", 100, lo=1, hi=500)
+    with RegistryStore() as store:
+        entries = store.list(
+            name=_opt_str(args, "name"),
+            tag=_opt_str(args, "tag"),
+            base=_opt_str(args, "base"),
+            task=_opt_str(args, "task"),
+            limit=limit,
+        )
+    return {"entries": entries, "count": len(entries)}
+
+
+def tool_registry_show(args: dict) -> dict:
+    """`soup registry show` — one registry entry (id / prefix / name:tag / registry://)."""
+    from souplite.registry.store import AmbiguousRefError, RegistryStore
+
+    ref = _require_str(args, "ref")
+    with RegistryStore() as store:
+        try:
+            entry_id = store.resolve(ref)
+        except AmbiguousRefError as exc:
+            raise McpToolError("ambiguous registry ref") from exc
+        if entry_id is None:
+            raise McpToolError("registry entry not found")
+        entry = store.get(entry_id)
+    if entry is None:
+        raise McpToolError("registry entry not found")
+    return entry
+
+
+def _resolve_gpu_memory_mcp(gpu: str | None) -> tuple[float, str]:
+    """GPU memory in GB and its source, from a flag or auto-detection (non-Typer
+    mirror of ``commands/profile.py::_resolve_gpu_memory``)."""
+    from souplite.utils.profiler import ASSUMED_GPU_MEMORY_GB, GPU_MEMORY, normalize_gpu_key
+
+    if gpu is not None:
+        gpu_key = normalize_gpu_key(gpu)
+        if gpu_key not in GPU_MEMORY:
+            raise _unknown_choice("gpu", gpu, GPU_MEMORY)
+        return float(GPU_MEMORY[gpu_key]), "flag"
+    try:
+        from souplite.utils.gpu import get_gpu_info
+
+        info = get_gpu_info()
+        mem_bytes = info.get("memory_total_bytes", 0)
+        if mem_bytes > 0:
+            return mem_bytes / (1024**3), "detected"
+    except (ImportError, RuntimeError, OSError):
+        pass
+    return ASSUMED_GPU_MEMORY_GB, "assumed"
+
+
+def _load_config_under_cwd(config: str) -> SoupConfig:
+    """Read + validate a soup.yaml via the API-safe loader.
+
+    Uses ``load_config_from_string`` (raises ``ValueError``) NOT ``load_config``
+    (which prints to stdout + ``sys.exit`` — both fatal to the MCP stdio stream).
+    """
+    from souplite.config.loader import load_config_from_string
+
+    text = _read_text_under_cwd(config, "config")
+    try:
+        return load_config_from_string(text)
+    except ValueError as exc:
+        raise McpToolError(f"invalid config ({type(exc).__name__})") from exc
+
+
+def tool_profile(args: dict) -> dict:
+    """`soup profile` — memory / speed / GPU estimate from a soup.yaml (no model load)."""
+    from souplite.utils.gpu import model_size_from_name
+    from souplite.utils.profiler import (
+        estimate_speed,
+        estimate_total,
+        recommend_batch_size,
+        recommend_gpu,
+    )
+
+    cfg = _load_config_under_cwd(_require_str(args, "config"))
+    gpu = _opt_str(args, "gpu")
+
+    model_params_b = model_size_from_name(cfg.base)
+    batch_size = cfg.training.batch_size
+    batch_size = 4 if batch_size == "auto" else int(batch_size)
+    gpu_memory_gb, gpu_memory_source = _resolve_gpu_memory_mcp(gpu)
+
+    result = estimate_total(
+        model_name=cfg.base,
+        model_params_b=model_params_b,
+        quantization=cfg.training.quantization,
+        lora_r=cfg.training.lora.r,
+        lora_alpha=cfg.training.lora.alpha,
+        batch_size=batch_size,
+        seq_len=cfg.data.max_length,
+        optimizer=cfg.training.optimizer,
+        gradient_checkpointing=cfg.training.gradient_checkpointing,
+    )
+    tokens_per_sec = estimate_speed(model_params_b, cfg.training.quantization, batch_size)
+    result["tokens_per_sec"] = round(tokens_per_sec, 1)
+    result["samples_per_sec"] = round(tokens_per_sec / max(cfg.data.max_length, 1), 2)
+    result["recommended_batch_size"] = recommend_batch_size(
+        result["total_memory_gb"], gpu_memory_gb
+    )
+    result["compatible_gpus"] = recommend_gpu(result["total_memory_gb"])
+    result["gpu_memory_gb"] = gpu_memory_gb
+    result["gpu_memory_source"] = gpu_memory_source
+    return result
+
+
+def tool_diagnose_evidence(args: dict) -> dict:
+    """`soup diagnose --evidence` — failure-mode report card from pre-computed scores."""
+    from souplite import __version__
+    from souplite.utils.diagnose.report import FAILURE_MODES, FailureScore, classify_score
+    from souplite.utils.diagnose.runner import build_report
+
+    run_id = _require_str(args, "run_id")
+    payload = _read_json_under_cwd(_require_str(args, "evidence"), "evidence")
+    base = _opt_str(args, "base") or ""
+    adapter = _opt_str(args, "adapter") or ""
+
+    raw_scores = payload.get("scores", {})
+    if not isinstance(raw_scores, dict):
+        raise McpToolError("evidence.scores must be an object")
+    scores = {}
+    for mode in FAILURE_MODES:  # closed set — safe to echo in errors
+        entry = raw_scores.get(mode)
+        if entry is None:
+            continue
+        if not isinstance(entry, dict):
+            raise McpToolError(f"evidence.scores.{mode} must be an object")
+        score = entry.get("score", 1.0)
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            raise McpToolError(f"evidence.scores.{mode}.score must be a number")
+        # classify_score rejects a score outside [0, 1] / non-finite, and
+        # FailureScore.__post_init__ rejects a mismatched/unknown verdict — both
+        # ValueError. Guard them into a specific McpToolError (code-review HIGH).
+        try:
+            verdict = entry.get("verdict") or classify_score(score)
+            scores[mode] = FailureScore(
+                mode=mode,
+                score=float(score),
+                verdict=verdict,
+                evidence=str(entry.get("evidence", "supplied via evidence")),
+            )
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise McpToolError(f"evidence.scores.{mode} is invalid ({type(exc).__name__})") from exc
+    try:
+        report = build_report(
+            run_id=run_id, base=base, adapter=adapter, scores=scores, soup_version=__version__
+        )
+    except (ValueError, TypeError) as exc:
+        raise McpToolError(f"diagnose failed ({type(exc).__name__})") from exc
+    return report.to_dict()
+
+
+# The shared evidence decoder (#758) quotes the offending value with ``!r``/
+# ``repr()`` every time it echoes evidence-file content, and never quotes the
+# structural part of its message. So redacting every quoted run drops exactly
+# the untrusted half and keeps the schema path that says what was refused.
+# Each alternative tracks DELIMITERS, not merely balance. When a value holds
+# both quote characters ``repr()`` delimits with single quotes and
+# backslash-escapes the internal ones; a naive ``'[^']*'`` then pairs an escaped
+# quote with a real delimiter, the pairing slips by one, and the evidence text
+# between them survives. Consuming ``\\.`` inside each run keeps an escaped quote
+# from ending it.
+# The trailing alternative redacts from an UNTERMINATED quote to end-of-string:
+# ``repr()`` always balances its quotes, so that cannot happen today, but a
+# boundary that fails open on one malformed message is the wrong default.
+_EVIDENCE_ERROR_QUOTED = re.compile(
+    r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|['\"].*\Z", re.DOTALL
+)
+_EVIDENCE_ERROR_REDACTION = "<redacted>"
+
+
+def _evidence_error_message(exc: Exception) -> str:
+    """Strip evidence-file content out of a shared-decoder error message.
+
+    ``McpToolError`` is documented above as a path-free/user-input-free message,
+    and every other handler raises a fixed string. The evidence decoder is
+    shared with the CLI (#758), where naming the offending value on stderr is
+    the point, so the sanitising happens HERE at the MCP boundary rather than by
+    degrading the CLI diagnostic. Schema field names outside quotes are kept:
+    they are constants from ``EVIDENCE_SCHEMA_FIELDS`` rather than user input,
+    and the v0.73.2 contract test asserts the refusal names the block it refused.
+    """
+    redacted = _EVIDENCE_ERROR_QUOTED.sub(_EVIDENCE_ERROR_REDACTION, str(exc)).strip()
+    if not redacted:
+        return f"invalid evidence ({type(exc).__name__})"
+    return f"{redacted} ({type(exc).__name__})"
+
+
+def tool_ship_evidence(args: dict) -> dict:
+    """`soup ship --evidence` — SHIP / DON'T-SHIP verdict from pre-computed scores."""
+    from souplite.utils.ship_verdict import (
+        DEFAULT_FORGETTING_THRESHOLD,
+        floor_exceeds_threshold,
+        verdict_from_evidence,
+        verdict_to_dict,
+    )
+
+    payload = _read_json_under_cwd(_require_str(args, "evidence"), "evidence")
+    threshold = args.get("forgetting_threshold", DEFAULT_FORGETTING_THRESHOLD)
+    try:
+        verdict = verdict_from_evidence(
+            payload, forgetting_threshold=threshold
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise McpToolError(_evidence_error_message(exc)) from exc
+    payload_out = verdict_to_dict(verdict)
+    # An evidence-supplied floor WIDENS the gate, and the CLI announces that on
+    # stderr. This transport cannot: stdout is the JSON-RPC channel and the
+    # server redirects prints away from it. So the warning rides in the RESULT,
+    # which is the MCP-native equivalent — the point is that neither reader is
+    # the quiet one an attacker would pick.
+    widened = floor_exceeds_threshold(
+        verdict.noise_floor, verdict.forgetting_threshold
+    )
+    payload_out["warnings"] = [
+        f"noise floor {value:.4f} on {name!r} exceeds forgetting_threshold "
+        f"{verdict.forgetting_threshold:.4f}; that axis is gated LOOSER than requested"
+        for name, value in widened
+    ]
+    return payload_out
+
+
+# ---------------------------------------------------------------------------
+# Mutating tool handlers — PLAN-ONLY in v1: they validate + render the exact
+# command that WOULD run, but never execute. Live execution is a follow-up.
+# ---------------------------------------------------------------------------
+
+_MUTATING_NOTE = (
+    "plan-only: 'soup mcp serve' does not execute this. Run the command "
+    "yourself to proceed."
+)
+
+
+# Every schema field whose value names a local file or directory that the
+# spawned ``soup train`` may read. A plan pins each of them: an existing path is
+# digested, a value that does not exist yet (a hub id, a built-in reward name, a
+# ``registry://`` reference) is recorded as absent and must still be absent at
+# execution. ``tests/test_mcp_plan_inputs.py`` walks the schema and fails when a
+# path-like string field is in neither this tuple nor NOT_PLAN_INPUT_FIELDS.
+PLAN_INPUT_FIELDS: tuple[str, ...] = (
+    "base",
+    "data.train",
+    "data.image_dir",
+    "data.audio_dir",
+    "data.video_dir",
+    "data.replay",
+    "data.tokenized_path",
+    "data.forget_set",
+    "data.retain_set",
+    "training.reward_fn",
+    "training.prm_reward",
+    "training.reward_model",
+    "training.teacher_model",
+    "training.minillm_pretrain_anchor_path",
+    "training.mole_task_adapters",
+    "training.ra_dit_retriever_model",
+    "training.checkpoint_eval_tasks",
+    "training.eval_gate.suite",
+    "training.eval_gate.baseline",
+    "eval.custom_tasks",
+)
+
+NOT_PLAN_INPUT_FIELDS: Mapping[str, str] = {
+    "output": "written by the run, not read",
+    "data.chat_template": (
+        "a registered template name or inline Jinja (data/chat_templates.py "
+        "resolve_chat_template); never opened as a file"
+    ),
+    "training.online_dpo_judge": "a judge URL, not a local path",
+    "training.preference_loss_weights": "a mapping of loss weights",
+    "training.reward_hack_signals": "signal names",
+    "eval.ship.general_suite": "read by soup ship, not soup train",
+    "eval.ship.judge_model": "a judge URL read by soup ship, not soup train",
+    "eval.ship.baseline": "read by soup ship, not soup train",
+}
+
+# ``training.reward_fn`` accepts a comma-separated ensemble (v0.71.40 #311); each
+# segment is a built-in name or a ``.py`` path loaded by trainer/rewards.py.
+_COMMA_SEPARATED_PLAN_INPUTS = frozenset({"training.reward_fn"})
+
+
+def _plan_input_value(cfg: SoupConfig, dotted: str) -> Any:
+    """Resolve a dotted schema path; a missing intermediate model yields None."""
+    value: Any = cfg
+    for part in dotted.split("."):
+        value = getattr(value, part, None)
+        if value is None:
+            return None
+    return value
+
+
+def _protect_plan_input(entry: str, field: str) -> ProtectedFile:
+    """Digest an existing input, or record that it is absent; refuse outside cwd."""
+    if not is_under_cwd(entry):
+        raise ExecutionError(
+            f"{field} points outside the working directory; move it under the "
+            "project to execute"
+        )
+    if os.path.lexists(entry):
+        return digest_file(entry, field)
+    return absent_marker(entry, field)
+
+
+def _collect_external_protected_inputs(cfg: SoupConfig) -> list[ProtectedFile]:
+    """Pin every local input named by PLAN_INPUT_FIELDS (digest or absent marker)."""
+    protected: list[ProtectedFile] = []
+    for field in PLAN_INPUT_FIELDS:
+        value = _plan_input_value(cfg, field)
+        if value is None:
+            continue
+        # #443 — data.train may be a list (interleave): one entry per element.
+        if isinstance(value, (list, tuple)):
+            named = [(f"{field}[{i}]", entry) for i, entry in enumerate(value)]
+        elif field in _COMMA_SEPARATED_PLAN_INPUTS and isinstance(value, str):
+            named = [(field, part.strip()) for part in value.split(",") if part.strip()]
+        else:
+            named = [(field, value)]
+        for entry_field, entry in named:
+            if isinstance(entry, str) and entry:
+                protected.append(_protect_plan_input(entry, entry_field))
+    return protected
+
+
+def tool_train_start(args: dict, execution: ExecutionManager | None = None) -> dict:
+    """`soup train` (plan-only) — validate a soup.yaml + render the command."""
+    config = _require_str(args, "config")
+    text = _read_text_under_cwd(config, "config")
+    try:
+        from souplite.config.loader import load_config_from_string
+
+        cfg = load_config_from_string(text)
+    except ValueError as exc:
+        raise McpToolError(f"invalid config ({type(exc).__name__})") from exc
+
+    if execution is not None:
+        try:
+            run_id = execution.allocate_run_id()
+            snapshot_path = execution.snapshot_config(run_id, text)
+            protected_list = [digest_file(snapshot_path, "config snapshot")]
+            protected_list.extend(_collect_external_protected_inputs(cfg))
+        except ExecutionError as exc:
+            raise McpToolError(str(exc)) from exc
+
+        argv = [
+            sys.executable,
+            "-m",
+            "souplite.cli",
+            "train",
+            "--config",
+            snapshot_path,
+            "--yes",
+        ]
+        display_cmd = f"soup train --config {shlex.quote(snapshot_path)} --yes"
+        token = execution.issue(
+            kind="train",
+            argv=argv,
+            display_command=display_cmd,
+            protected_files=tuple(protected_list),
+            run_id=run_id,
+        )
+        return {
+            "config_valid": True,
+            "task": cfg.task,
+            "base": cfg.base,
+            "would_run": display_cmd,
+            "note": _MUTATING_NOTE,
+            "confirmation_token": token,
+        }
+
+    config_real = os.path.realpath(config)
+    return {
+        "config_valid": True,
+        "task": cfg.task,
+        "base": cfg.base,
+        "would_run": f"soup train --config {shlex.quote(config_real)} --yes",
+        "note": _MUTATING_NOTE,
+    }
+
+
+def tool_export(args: dict, execution: ExecutionManager | None = None) -> dict:
+    """`soup export` (plan-only) — validate format + render the command."""
+    from souplite.commands.export import SUPPORTED_FORMATS
+
+    model = _require_str(args, "model")
+    fmt = _require_str(args, "format")
+    if fmt not in SUPPORTED_FORMATS:
+        raise _unknown_choice("export format", fmt, SUPPORTED_FORMATS)
+    output = _opt_str(args, "output")
+    try:
+        enforce_under_cwd_and_no_symlink(model, "model")
+        if output:
+            enforce_under_cwd_and_no_symlink(output, "output")
+    except (OSError, ValueError) as exc:
+        raise McpToolError("model/output must stay under the working directory") from exc
+    cmd = f"soup export --model {shlex.quote(model)} --format {fmt}"
+    if output:
+        cmd += f" --output {shlex.quote(output)}"
+    out = {"format": fmt, "would_run": cmd, "note": _MUTATING_NOTE}
+    if execution is not None:
+        model_real = os.path.realpath(model)
+        if not os.path.exists(model_real):
+            raise McpToolError(f"model path {model!r} does not exist for execution")
+        output_real = os.path.realpath(output) if output else None
+        argv = [
+            sys.executable,
+            "-m",
+            "souplite.cli",
+            "export",
+            "--model",
+            model_real,
+            "--format",
+            fmt,
+        ]
+        if output_real:
+            argv.extend(["--output", output_real])
+        try:
+            protected = (digest_file(model_real, "model"),)
+        except ExecutionError as exc:
+            raise McpToolError(str(exc)) from exc
+        run_id = execution.allocate_run_id()
+        out["confirmation_token"] = execution.issue(
+            kind="export",
+            argv=argv,
+            display_command=cmd,
+            protected_files=protected,
+            run_id=run_id,
+        )
+    return out
+
+
+def _execute_handler(execution: ExecutionManager, kind: str) -> Callable[[dict], dict]:
+    def _handler(args: dict) -> dict:
+        if set(args) != {"confirmation_token"}:
+            raise McpToolError("execution requires only 'confirmation_token'")
+        try:
+            return execution.execute(token=args.get("confirmation_token"), kind=kind)
+        except ExecutionError as exc:
+            raise McpToolError(str(exc)) from None
+    return _handler
+
+
+# ---------------------------------------------------------------------------
+# Tool table
+# ---------------------------------------------------------------------------
+
+_DATA_ARG = {
+    "type": "string",
+    "description": "Path to a JSONL/JSON dataset under the working directory.",
+}
+
+
+def _readonly_specs() -> list[ToolSpec]:
+    return [
+        ToolSpec(
+            name="advise",
+            title="Advise",
+            description=(
+                "Pre-flight recommendation (PROMPT_ENG / RAG / SFT / DPO / GRPO) "
+                "for a dataset + goal."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "data": _DATA_ARG,
+                    "goal": {
+                        "type": "string",
+                        "description": "Optional stated goal, e.g. 'improve summaries'.",
+                    },
+                },
+                "required": ["data"],
+                "additionalProperties": False,
+            },
+            handler=tool_advise,
+        ),
+        ToolSpec(
+            name="data_inspect",
+            title="Inspect dataset",
+            description="Dataset stats: row count, columns, length distribution, duplicates.",
+            input_schema={
+                "type": "object",
+                "properties": {"data": _DATA_ARG},
+                "required": ["data"],
+                "additionalProperties": False,
+            },
+            handler=tool_data_inspect,
+        ),
+        ToolSpec(
+            name="data_validate",
+            title="Validate dataset",
+            description=(
+                "Format-compliance report: issues + valid-row count "
+                "(alpaca/sharegpt/chatml/dpo/...)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "data": _DATA_ARG,
+                    "format": {
+                        "type": "string",
+                        "description": (
+                            "Expected format (alpaca/sharegpt/chatml/dpo/...); "
+                            "'auto' or omitted auto-detects. The resolved "
+                            "format is returned as 'format'."
+                        ),
+                    },
+                },
+                "required": ["data"],
+                "additionalProperties": False,
+            },
+            handler=tool_data_validate,
+        ),
+        ToolSpec(
+            name="data_score",
+            title="Score dataset",
+            description=(
+                "Data-quality scorecard: PII, abuse-keyword triage, "
+                "language mix, educational value."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"data": _DATA_ARG},
+                "required": ["data"],
+                "additionalProperties": False,
+            },
+            handler=tool_data_score,
+        ),
+        ToolSpec(
+            name="data_doctor",
+            title="Chat-template doctor",
+            description=(
+                "Chat-template compatibility report vs a tokenizer (EOS-in-labels, "
+                "BOS dup, truncation risk). Needs the souplite[train] tokenizer stack."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "data": _DATA_ARG,
+                    "model": {
+                        "type": "string",
+                        "description": "Tokenizer model id or local path.",
+                    },
+                    "format": {
+                        "type": "string",
+                        "description": "Data format; omit to auto-detect.",
+                    },
+                    "max_length": {"type": "integer", "minimum": 64, "maximum": 1048576},
+                    "sample_size": {"type": "integer", "minimum": 1, "maximum": 2000},
+                },
+                "required": ["data", "model"],
+                "additionalProperties": False,
+            },
+            handler=tool_data_doctor,
+        ),
+        ToolSpec(
+            name="recipes_search",
+            title="Search recipes",
+            description="Search the ready-made recipe catalog by keyword / task / model size.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "task": {"type": "string"},
+                    "size": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            handler=tool_recipes_search,
+        ),
+        ToolSpec(
+            name="recipes_show",
+            title="Show recipe",
+            description="Full recipe details incl. the ready-to-use soup.yaml body.",
+            input_schema={
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "Recipe name."}},
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+            handler=tool_recipes_show,
+        ),
+        ToolSpec(
+            name="runs_list",
+            title="List runs",
+            description="Recent experiment runs from the local tracker.",
+            input_schema={
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 500}},
+                "additionalProperties": False,
+            },
+            handler=tool_runs_list,
+        ),
+        ToolSpec(
+            name="runs_show",
+            title="Show run",
+            description="One run's full record (config, metrics summary). Accepts an id prefix.",
+            input_schema={
+                "type": "object",
+                "properties": {"run_id": {"type": "string"}},
+                "required": ["run_id"],
+                "additionalProperties": False,
+            },
+            handler=tool_runs_show,
+        ),
+        ToolSpec(
+            name="registry_list",
+            title="List registry",
+            description="Model-registry entries, filterable by name/tag/base/task.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "base": {"type": "string"},
+                    "task": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                },
+                "additionalProperties": False,
+            },
+            handler=tool_registry_list,
+        ),
+        ToolSpec(
+            name="registry_show",
+            title="Show registry entry",
+            description="One registry entry by id / prefix / name:tag / registry:// ref.",
+            input_schema={
+                "type": "object",
+                "properties": {"ref": {"type": "string"}},
+                "required": ["ref"],
+                "additionalProperties": False,
+            },
+            handler=tool_registry_show,
+        ),
+        ToolSpec(
+            name="profile",
+            title="Profile training",
+            description=(
+                "Estimate memory / speed / GPU fit from a soup.yaml before "
+                "training (no model load)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "string",
+                        "description": "Path to a soup.yaml under cwd.",
+                    },
+                    "gpu": {"type": "string", "description": "Target GPU, e.g. rtx4090 / a100."},
+                },
+                "required": ["config"],
+                "additionalProperties": False,
+            },
+            handler=tool_profile,
+        ),
+        ToolSpec(
+            name="diagnose_evidence",
+            title="Diagnose (evidence)",
+            description=(
+                "Post-training failure-mode report card from a pre-computed "
+                "evidence JSON (no model load)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "evidence": {
+                        "type": "string",
+                        "description": "Path to a diagnose evidence JSON under cwd.",
+                    },
+                    "base": {"type": "string"},
+                    "adapter": {"type": "string"},
+                },
+                "required": ["run_id", "evidence"],
+                "additionalProperties": False,
+            },
+            handler=tool_diagnose_evidence,
+        ),
+        ToolSpec(
+            name="ship_evidence",
+            title="Ship verdict (evidence)",
+            description=(
+                "SHIP / DON'T-SHIP verdict from a pre-computed evidence JSON "
+                "(task win AND no regression)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "evidence": {
+                        "type": "string",
+                        "description": "Path to a ship evidence JSON under cwd.",
+                    },
+                    "forgetting_threshold": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
+                },
+                "required": ["evidence"],
+                "additionalProperties": False,
+            },
+            handler=tool_ship_evidence,
+        ),
+    ]
+
+
+def _refuse_mutating(name: str) -> Callable[[dict], dict]:
+    """Handler used for a mutating tool when ``--allow-mutating`` is off."""
+
+    def _handler(args: dict) -> dict:
+        raise McpToolError(
+            f"'{name}' can change state and is disabled; restart with "
+            "'soup mcp serve --allow-mutating' to enable (still plan-only in v1)."
+        )
+
+    return _handler
+
+
+def _refuse_execute(name: str) -> Callable[[dict], dict]:
+    """Handler used for an execution tool when ``--allow-execute`` is off."""
+
+    def _handler(args: dict) -> dict:
+        raise McpToolError(
+            f"'{name}' can execute commands and is disabled; restart with "
+            "'soup mcp serve --allow-execute' to enable."
+        )
+
+    return _handler
+
+
+def _mutating_specs(
+    *, allow_mutating: bool, allow_execute: bool = False, execution: ExecutionManager | None
+) -> list[ToolSpec]:
+    """The plan-only mutating tools.
+
+    Always LISTED (so clients can discover them), but their handler refuses
+    unless ``allow_mutating`` is set. Even when enabled they only render the
+    command that would run — v1 never executes training or export.
+    """
+    entries = [
+        (
+            "train_start",
+            "Start training (plan-only)",
+            "Validate a soup.yaml and render the 'soup train' command (does not execute).",
+            {
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "string",
+                        "description": "Path to a soup.yaml under cwd.",
+                    }
+                },
+                "required": ["config"],
+                "additionalProperties": False,
+            },
+            lambda args: tool_train_start(args, execution if allow_execute else None),
+        ),
+        (
+            "export",
+            "Export model (plan-only)",
+            "Validate a format and render the 'soup export' command (does not execute).",
+            {
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string", "description": "Adapter/model path or id."},
+                    "format": {"type": "string", "description": "gguf / onnx / awq / gptq / ..."},
+                    "output": {"type": "string", "description": "Optional output path."},
+                },
+                "required": ["model", "format"],
+                "additionalProperties": False,
+            },
+            lambda args: tool_export(args, execution if allow_execute else None),
+        ),
+    ]
+    specs = [
+        ToolSpec(
+            name=name,
+            title=title,
+            description=description,
+            input_schema=schema,
+            handler=real if allow_mutating else _refuse_mutating(name),
+            mutating=True,
+        )
+        for name, title, description, schema, real in entries
+    ]
+    for name, title, description, kind in (
+        ("train_execute", "Execute training", "Execute a confirmed training plan.", "train"),
+        ("export_execute", "Execute export", "Execute a confirmed export plan.", "export"),
+    ):
+        specs.append(
+            ToolSpec(
+                name=name,
+                title=title,
+                description=description,
+                input_schema={
+                    "type": "object",
+                    "properties": {"confirmation_token": {"type": "string"}},
+                    "required": ["confirmation_token"],
+                    "additionalProperties": False,
+                },
+                handler=(
+                    _execute_handler(execution, kind)
+                    if allow_execute and execution is not None
+                    else _refuse_execute(name)
+                ),
+                mutating=True,
+                annotations={"readOnlyHint": False, "destructiveHint": True},
+            )
+        )
+    return specs
+
+
+def build_registry(
+    *, allow_mutating: bool, allow_execute: bool = False, execution: ExecutionManager | None = None
+) -> list[ToolSpec]:
+    """Assemble the MCP tool table.
+
+    The read-only tools are always present and executable. The mutating tools
+    are always listed but refuse unless ``allow_mutating`` is set (and are
+    plan-only even then). ``allow_execute`` gates the execution tools
+    (``train_execute`` / ``export_execute``) and implies ``allow_mutating``.
+    """
+    allow_mutating = allow_mutating or allow_execute
+    if allow_execute and execution is None:
+        execution = ExecutionManager()
+    return _readonly_specs() + _mutating_specs(
+        allow_mutating=allow_mutating,
+        allow_execute=allow_execute,
+        execution=execution,
+    )

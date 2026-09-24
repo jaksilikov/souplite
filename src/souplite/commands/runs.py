@@ -1,0 +1,678 @@
+"""soup runs — experiment tracking commands."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.markup import escape as markup_escape
+from rich.panel import Panel
+from rich.table import Table
+
+from souplite.utils.run_cost import format_cost_usd
+from souplite.utils.terminal import for_terminal
+
+console = Console()
+
+app = typer.Typer(no_args_is_help=False, invoke_without_command=True)
+
+
+def _filter_runs_by_cwd(runs: list[dict], cwd: str) -> list[dict]:
+    """Return only runs whose output_dir is under ``cwd``.
+
+    Runs with no ``output_dir`` are dropped. Comparisons use
+    ``os.path.realpath + commonpath`` for Windows 8.3 short-name safety
+    (project-wide path-containment convention).
+    """
+    cwd_real = os.path.realpath(cwd)
+    kept: list[dict] = []
+    for run in runs:
+        out = run.get("output_dir")
+        if not out:
+            continue
+        try:
+            cand = os.path.realpath(out)
+            if os.path.commonpath([cand, cwd_real]) == cwd_real:
+                kept.append(run)
+        except (ValueError, OSError):
+            # Different drives on Windows / unreadable path — skip.
+            continue
+    return kept
+
+
+@app.callback(invoke_without_command=True)
+def list_runs(
+    ctx: typer.Context,
+    limit: int = typer.Option(20, "--limit", "-l", help="Max runs to show"),
+    cwd_only: bool = typer.Option(
+        False,
+        "--cwd-only",
+        help=(
+            "Only show runs whose output_dir is under the current "
+            "working directory (default: show all in ~/.soup/experiments.db)."
+        ),
+    ),
+):
+    """List all training runs.
+
+    By default lists every run from the global ``~/.soup/experiments.db``.
+    Use ``--cwd-only`` to restrict to runs anchored under the current
+    directory.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+
+    from souplite.experiment.tracker import ExperimentTracker
+
+    tracker = ExperimentTracker()
+    runs = tracker.list_runs(limit=limit)
+    if cwd_only:
+        runs = _filter_runs_by_cwd(runs, os.getcwd())
+
+    if not runs:
+        console.print("[dim]No runs found. Train a model with:[/] [bold]soup train[/]")
+        raise typer.Exit()
+
+    table = Table(title="Training Runs")
+    table.add_column("Run ID", style="bold cyan", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("Model", max_width=30)
+    table.add_column("Task")
+    table.add_column("Status")
+    table.add_column("Loss", justify="right")
+    table.add_column("Steps", justify="right")
+    table.add_column("Duration", justify="right")
+    table.add_column("Date", no_wrap=True)
+
+    for run in runs:
+        # Format status with color
+        status = run["status"]
+        if status == "completed":
+            status_str = "[green]completed[/]"
+        elif status == "failed":
+            status_str = "[red]failed[/]"
+        else:
+            # Show the real status (e.g. 'terminated' reconciled from a dead
+            # watcher, issue #401) — never hardcode 'running' for a row that is
+            # no longer running.
+            status_str = f"[yellow]{status}[/]"
+
+        # Format loss
+        loss_str = ""
+        if run.get("initial_loss") and run.get("final_loss"):
+            loss_str = f"{run['initial_loss']:.3f} -> {run['final_loss']:.3f}"
+
+        # Format duration
+        duration_str = ""
+        if run.get("duration_secs"):
+            secs = run["duration_secs"]
+            if secs >= 3600:
+                duration_str = f"{secs / 3600:.1f}h"
+            elif secs >= 60:
+                duration_str = f"{secs / 60:.0f}m"
+            else:
+                duration_str = f"{secs:.0f}s"
+
+        # Format date (just date + time, no seconds)
+        date_str = run["created_at"][:16].replace("T", " ")
+
+        # Shorten run_id for display
+        short_id = run["run_id"]
+
+        # experiment_name / base_model / task are config-derived — escape so a
+        # crafted value can't inject Rich markup (registry.py escapes the same
+        # fields).
+        table.add_row(
+            markup_escape(str(short_id)),
+            markup_escape(str(run.get("experiment_name") or "")),
+            markup_escape(str(run.get("base_model") or "")),
+            markup_escape(str(run.get("task") or "")),
+            status_str,
+            loss_str,
+            str(run.get("total_steps") or ""),
+            duration_str,
+            date_str,
+        )
+
+    console.print(table)
+
+
+@app.command()
+def show(
+    run_id: str = typer.Argument(..., help="Run ID (or prefix) to show"),
+    plot: bool = typer.Option(True, "--plot/--no-plot", help="Show loss curve"),
+):
+    """Show detailed info about a specific run, including loss curve."""
+    from souplite.experiment.tracker import ExperimentTracker
+
+    tracker = ExperimentTracker()
+    run = tracker.get_run(run_id)
+
+    if not run:
+        console.print(f"[red]Run not found:[/] {markup_escape(run_id)}")
+        console.print("[dim]Use [bold]soup runs[/] to see all runs.[/]")
+        raise typer.Exit(1)
+
+    # Format status. Enumerated rather than a catch-all "else: running" —
+    # that fallback used to print "running" for a "terminated" row too,
+    # since _reconcile_orphaned_run (#401) and a "launching" MCP row both
+    # fell through it silently (#764/#767 review).
+    status = run["status"]
+    if status == "completed":
+        status_str = "[green]completed[/]"
+    elif status == "failed":
+        status_str = "[red]failed[/]"
+    elif status == "terminated":
+        status_str = "[red]terminated[/]"
+    elif status == "launching":
+        status_str = "[dim]launching[/]"
+    else:
+        status_str = "[yellow]running[/]"
+
+    # Format duration
+    duration_str = "-"
+    if run.get("duration_secs"):
+        secs = run["duration_secs"]
+        hours = int(secs // 3600)
+        minutes = int((secs % 3600) // 60)
+        duration_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+
+    # Build info panel — config-derived fields escaped (mirrors registry.py).
+    _esc = markup_escape
+    info_lines = [
+        f"Run ID:     [bold]{_esc(str(run['run_id']))}[/]",
+        f"Name:       {_esc(str(run.get('experiment_name') or '-'))}",
+        f"Status:     {status_str}",
+        f"Date:       {run['created_at'][:19].replace('T', ' ')}",
+    ]
+    # error_message (#764/#767): written by fail_run since #764, but read by
+    # nothing until now — a failed run's "why" was sitting in the database
+    # with no surface to show it.
+    if run.get("error_message"):
+        # error_message is exception text, not a config-derived string --
+        # it can carry a remote error body verbatim, so it gets control-byte
+        # stripping (for_terminal) rather than markup escaping alone (#767).
+        info_lines.append(f"Error:      {for_terminal(run['error_message'])}")
+    info_lines.extend([
+        "",
+        f"Model:      [bold]{_esc(str(run.get('base_model') or '-'))}[/]",
+        f"Task:       {_esc(str(run.get('task') or '-'))}",
+        f"Device:     {_esc(str(run.get('device_name') or '-'))} "
+        f"({_esc(str(run.get('device') or '-'))})",
+        f"GPU Memory: {_esc(str(run.get('gpu_memory') or '-'))}",
+        "",
+        f"Loss:       {_fmt_loss(run)}",
+        f"Steps:      {run.get('total_steps') or '-'}",
+        f"Duration:   {duration_str}",
+        f"Cost:       {_fmt_cost(run)}",
+        f"Output:     {_esc(str(run.get('output_dir') or '-'))}",
+    ])
+    console.print(Panel("\n".join(info_lines), title="Run Details"))
+
+    # Config section
+    if run.get("config_json"):
+        try:
+            config = json.loads(run["config_json"])
+            config_str = json.dumps(config, indent=2, default=str)
+            # Truncate long configs
+            if len(config_str) > 1500:
+                config_str = config_str[:1500] + "\n..."
+            console.print(Panel(config_str, title="Config"))
+        except json.JSONDecodeError:
+            pass
+
+    # Eval results
+    eval_results = tracker.get_eval_results(run_id=run["run_id"])
+    if eval_results:
+        eval_table = Table(title="Evaluation Results")
+        eval_table.add_column("Benchmark", style="bold")
+        eval_table.add_column("Score", justify="right")
+        for result in eval_results:
+            eval_table.add_row(result["benchmark"], f"{result['score']:.4f}")
+        console.print(eval_table)
+
+    # Loss curve
+    if plot:
+        metrics = tracker.get_metrics(run["run_id"])
+        if metrics:
+            _plot_loss_curve(metrics)
+
+
+@app.command()
+def compare(
+    run_1: str = typer.Argument(..., help="First run ID (or prefix)"),
+    run_2: str = typer.Argument(..., help="Second run ID (or prefix)"),
+):
+    """Compare two training runs side by side."""
+    from souplite.experiment.tracker import ExperimentTracker
+
+    tracker = ExperimentTracker()
+    r1 = tracker.get_run(run_1)
+    r2 = tracker.get_run(run_2)
+
+    if not r1:
+        console.print(f"[red]Run not found: {run_1}[/]")
+        raise typer.Exit(1)
+    if not r2:
+        console.print(f"[red]Run not found: {run_2}[/]")
+        raise typer.Exit(1)
+
+    table = Table(title="Run Comparison")
+    table.add_column("Metric", style="bold")
+    table.add_column(r1["run_id"][:20], justify="right")
+    table.add_column(r2["run_id"][:20], justify="right")
+
+    rows = [
+        ("Name", r1.get("experiment_name") or "-", r2.get("experiment_name") or "-"),
+        ("Model", r1.get("base_model") or "-", r2.get("base_model") or "-"),
+        ("Task", r1.get("task") or "-", r2.get("task") or "-"),
+        ("Device", r1.get("device_name") or "-", r2.get("device_name") or "-"),
+        ("Status", r1.get("status") or "-", r2.get("status") or "-"),
+        ("Initial Loss", _fmt_float(r1.get("initial_loss")), _fmt_float(r2.get("initial_loss"))),
+        ("Final Loss", _fmt_float(r1.get("final_loss")), _fmt_float(r2.get("final_loss"))),
+        ("Steps", str(r1.get("total_steps") or "-"), str(r2.get("total_steps") or "-")),
+        ("Duration", _fmt_duration(r1.get("duration_secs")),
+         _fmt_duration(r2.get("duration_secs"))),
+    ]
+
+    # Add config comparison for key fields
+    for run_data in [r1, r2]:
+        if run_data.get("config_json"):
+            try:
+                run_data["_config"] = json.loads(run_data["config_json"])
+            except json.JSONDecodeError:
+                run_data["_config"] = {}
+
+    c1 = r1.get("_config", {})
+    c2 = r2.get("_config", {})
+
+    training1 = c1.get("training", {})
+    training2 = c2.get("training", {})
+    rows.extend([
+        ("Epochs", str(training1.get("epochs", "-")), str(training2.get("epochs", "-"))),
+        ("Learning Rate", str(training1.get("lr", "-")), str(training2.get("lr", "-"))),
+        ("Batch Size", str(training1.get("batch_size", "-")),
+         str(training2.get("batch_size", "-"))),
+        ("Quantization", str(training1.get("quantization", "-")),
+         str(training2.get("quantization", "-"))),
+    ])
+
+    lora1 = training1.get("lora", {})
+    lora2 = training2.get("lora", {})
+    rows.extend([
+        ("LoRA r", str(lora1.get("r", "-")), str(lora2.get("r", "-"))),
+        ("LoRA alpha", str(lora1.get("alpha", "-")), str(lora2.get("alpha", "-"))),
+    ])
+
+    for label, val1, val2 in rows:
+        # Highlight differences
+        if val1 != val2:
+            table.add_row(label, f"[yellow]{val1}[/]", f"[yellow]{val2}[/]")
+        else:
+            table.add_row(label, val1, val2)
+
+    console.print(table)
+
+
+@app.command()
+def delete(
+    run_id: str = typer.Argument(..., help="Run ID (or prefix) to delete"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+):
+    """Delete a training run and its metrics."""
+    from souplite.experiment.tracker import ExperimentTracker
+
+    tracker = ExperimentTracker()
+    run = tracker.get_run(run_id)
+
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/]")
+        raise typer.Exit(1)
+
+    if not force:
+        if not typer.confirm(f"Delete run {run['run_id']}?"):
+            raise typer.Exit()
+
+    tracker.delete_run(run["run_id"])
+    console.print(f"[green]Deleted run: {run['run_id']}[/]")
+
+
+@app.command()
+def clean(
+    run_id: Optional[str] = typer.Argument(
+        None, help="Run ID (or prefix) to clean. Omit if --all is used."
+    ),
+    all_runs: bool = typer.Option(False, "--all", help="Cleanup all historical runs."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Estimate space savings without deleting."
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+    keep_weights: bool = typer.Option(
+        True, "--keep-weights/--no-keep-weights",
+        help=(
+            "Keep intermediate model weights and delete only optimizer and scheduler "
+            "states (default). --no-keep-weights deletes whole non-best checkpoints."
+        ),
+    ),
+):
+    """Intelligently clean up redundant checkpoint files to reclaim disk space."""
+    import shutil
+
+    from souplite.experiment.tracker import ExperimentTracker
+
+    tracker = ExperimentTracker()
+
+    if all_runs and run_id:
+        raise typer.BadParameter("Cannot use --all and RUN_ID together.")
+
+    if all_runs:
+        runs_to_clean = tracker.list_runs(limit=100000)
+    elif run_id:
+        run = tracker.get_run(run_id)
+        if not run:
+            console.print(f"[red]Run not found: {run_id}[/]")
+            raise typer.Exit(1)
+        runs_to_clean = [run]
+    else:
+        console.print("[red]Must specify RUN_ID or use --all[/]")
+        console.print("[dim]Example: soup runs clean run_2026...[/]")
+        raise typer.Exit(1)
+
+    if not runs_to_clean:
+        console.print("[yellow]No runs to clean.[/]")
+        raise typer.Exit()
+
+    total_bytes_to_reclaim = 0
+    files_to_delete = []
+    dirs_to_delete = []
+
+    for run in runs_to_clean:
+        out_dir_str = run.get("output_dir")
+        if not out_dir_str:
+            continue
+        # Cross-platform containment: project convention requires
+        # os.path.realpath + commonpath because Path.resolve() + relative_to()
+        # silently mismatches on Windows 8.3 short names.
+        from souplite.utils.paths import is_under_cwd
+
+        try:
+            output_dir = Path(os.path.realpath(out_dir_str))
+        except (OSError, ValueError):
+            continue
+        if not is_under_cwd(output_dir):
+            continue
+        if not output_dir.exists():
+            continue
+
+        metrics = tracker.get_metrics(run["run_id"])
+
+        best_step = -1
+        valid_metrics = [m for m in metrics if m.get("loss") is not None]
+        if valid_metrics:
+            best_metric = min(valid_metrics, key=lambda x: x["loss"])
+            best_step = best_metric["step"]
+
+        checkpoints = [d for d in output_dir.glob("checkpoint-*") if d.is_dir()]
+        for ckpt in checkpoints:
+            is_best = False
+            try:
+                step = int(ckpt.name.split("-")[-1])
+                if step == best_step:
+                    is_best = True
+            except ValueError:
+                pass
+
+            if is_best:
+                continue
+
+            if keep_weights:
+                for opt_file in ckpt.glob("optimizer*.pt"):
+                    total_bytes_to_reclaim += opt_file.stat().st_size
+                    files_to_delete.append(opt_file)
+                for opt_file in ckpt.glob("optimizer*.safetensors"):
+                    total_bytes_to_reclaim += opt_file.stat().st_size
+                    files_to_delete.append(opt_file)
+                for sch_file in ckpt.glob("scheduler.pt"):
+                    total_bytes_to_reclaim += sch_file.stat().st_size
+                    files_to_delete.append(sch_file)
+            else:
+                size = sum(f.stat().st_size for f in ckpt.rglob('*') if f.is_file())
+                total_bytes_to_reclaim += size
+                dirs_to_delete.append(ckpt)
+
+    if total_bytes_to_reclaim == 0:
+        console.print(
+            "[green]No disposable checkpoint files found. "
+            "Storage is already optimized.[/]"
+        )
+        raise typer.Exit()
+
+    gb_to_reclaim = total_bytes_to_reclaim / (1024 ** 3)
+
+    if dry_run:
+        console.print(f"[bold]Dry Run:[/] Would reclaim [green]{gb_to_reclaim:.2f} GB[/] "
+                      f"from {len(files_to_delete)} files "
+                      f"and {len(dirs_to_delete)} directories.")
+        for d in dirs_to_delete:
+            console.print(f"  [red]Delete dir:[/]\t{d}")
+        for f in files_to_delete:
+            console.print(f"  [red]Delete file:[/]\t{f}")
+        raise typer.Exit()
+
+    if not force:
+        console.print(f"Ready to reclaim [green]{gb_to_reclaim:.2f} GB[/] by pruning checkpoints.")
+        if not typer.confirm("Do you want to proceed?"):
+            raise typer.Exit()
+
+    for f in files_to_delete:
+        try:
+            f.unlink()
+        except OSError as e:
+            console.print(f"[yellow]Warning:[/] Failed to delete file {f}: {e}")
+    for d in dirs_to_delete:
+        try:
+            shutil.rmtree(d)
+        except OSError as e:
+            console.print(f"[yellow]Warning:[/] Failed to delete directory {d}: {e}")
+
+    console.print(f"[green]Successfully reclaimed {gb_to_reclaim:.2f} GB.[/]")
+
+
+def _fmt_loss(run: dict) -> str:
+    """Format loss as 'initial -> final'."""
+    init = run.get("initial_loss")
+    final = run.get("final_loss")
+    if init is not None and final is not None:
+        return f"{init:.4f} -> {final:.4f}"
+    return "-"
+
+
+def _fmt_float(val: Optional[float]) -> str:
+    """Format a float or return '-'."""
+    if val is not None:
+        return f"{val:.4f}"
+    return "-"
+
+
+@app.command()
+def replay(
+    run_id: str = typer.Argument(..., help="Run ID (or prefix) to replay."),
+    plot: bool = typer.Option(True, "--plot/--no-plot", help="Render loss curve"),
+):
+    """Replay a completed run's metrics — re-renders summary + loss curve."""
+    from souplite.experiment.tracker import ExperimentTracker
+    from souplite.utils.replay import downsample, summarise
+
+    tracker = ExperimentTracker()
+    run = tracker.get_run(run_id)
+    if run is None:
+        console.print(f"[red]Run not found:[/] {markup_escape(run_id)}")
+        raise typer.Exit(1)
+
+    metrics = tracker.get_metrics(run["run_id"])
+    summary = summarise(metrics)
+
+    rendered = [
+        f"Run ID:     [bold]{run['run_id']}[/]",
+        f"Status:     {run.get('status') or '-'}",
+        f"Steps:      {summary.first_step or '-'} → {summary.last_step or '-'}"
+        f" ({summary.total_rows} rows)",
+    ]
+    if summary.initial_loss is not None and summary.final_loss is not None:
+        rendered.append(f"Loss:       {summary.initial_loss:.4f} → {summary.final_loss:.4f}")
+    if summary.min_loss is not None and summary.min_loss_step is not None:
+        rendered.append(
+            f"Best:       {summary.min_loss:.4f} @ step {summary.min_loss_step}"
+        )
+    rendered.append(f"Cost:       {_fmt_cost(run)}")
+    console.print(Panel("\n".join(rendered), title="Replay"))
+
+    if plot and metrics:
+        sampled = downsample(metrics)
+        _plot_loss_curve(sampled)
+
+
+def _fmt_cost(run: dict) -> str:
+    """Render the per-run cost estimate. Falls back to a dash + label hint."""
+    cost = run.get("cost_usd")
+    label = run.get("cost_gpu_label")
+    rendered = format_cost_usd(cost)
+    if cost is not None and label:
+        return f"{rendered} ({label})"
+    return rendered
+
+
+def _fmt_duration(secs: Optional[float]) -> str:
+    """Format duration in seconds to human-readable string."""
+    if secs is None:
+        return "-"
+    if secs >= 3600:
+        return f"{secs / 3600:.1f}h"
+    if secs >= 60:
+        return f"{secs / 60:.0f}m"
+    return f"{secs:.0f}s"
+
+
+def _plot_loss_curve(metrics: list[dict]) -> None:
+    """Render a loss-over-steps chart in the terminal using plotext."""
+    try:
+        import plotext as plt
+    except ImportError:
+        console.print(
+            "[yellow]Install plotext for terminal charts:[/] "
+            "[bold]pip install plotext[/]"
+        )
+        return
+
+    valid = [m for m in metrics if m.get("loss") is not None]
+    steps = [m["step"] for m in valid]
+    losses = [m["loss"] for m in valid]
+
+    if not steps:
+        console.print("[dim]No loss data to plot.[/]")
+        return
+
+    from souplite.utils.plotext_compat import render_line
+
+    render_line(
+        plt,
+        steps,
+        losses,
+        console=console,
+        label="loss",
+        title="Training Loss",
+        xlabel="Step",
+        ylabel="Loss",
+    )
+
+
+@app.command(name="curriculum-curve")
+def curriculum_curve(
+    run_id: str = typer.Argument(..., help="Run ID (or prefix)."),
+    history_path: str = typer.Option(
+        None, "--history",
+        help="Override path to curriculum_history.jsonl (default: under run output_dir).",
+    ),
+    width: int = typer.Option(10, "--width", min=4, max=200, help="Per-bucket column width."),
+) -> None:
+    """v0.48.0 (BETA) — visualise dynamic curriculum bucket weights."""
+    import json
+    import os
+    import stat as _stat
+
+    from souplite.experiment.tracker import ExperimentTracker
+    from souplite.utils.curriculum_dynamic import parse_history_jsonl, render_curve
+    from souplite.utils.paths import is_under_cwd
+
+    tracker = ExperimentTracker()
+    run = tracker.get_run(run_id)
+    if run is None:
+        console.print(f"[red]Run not found:[/] {markup_escape(run_id)}")
+        raise typer.Exit(1)
+
+    if history_path is None:
+        out_dir = str(run.get("output_dir") or ".")
+        if "\x00" in out_dir:
+            console.print("[red]run output_dir contains null bytes[/]")
+            raise typer.Exit(2)
+        candidate = os.path.join(out_dir, "curriculum_history.jsonl")
+    else:
+        candidate = history_path
+    # Symlink check on the ORIGINAL path BEFORE realpath (matches v0.46.0
+    # `_reject_symlink_target` pattern — realpath follows the symlink).
+    try:
+        _st = os.lstat(candidate)
+    except FileNotFoundError:
+        _st = None
+    except OSError as exc:
+        console.print(
+            f"[red]history path is not stat-able:[/] "
+            f"{markup_escape(os.path.basename(candidate))}"
+        )
+        raise typer.Exit(2) from exc
+    if _st is not None and _stat.S_ISLNK(_st.st_mode):
+        console.print(
+            f"[red]history path is a symlink (rejected for safety):[/] "
+            f"{markup_escape(os.path.basename(candidate))}"
+        )
+        raise typer.Exit(2)
+    real = os.path.realpath(candidate)
+    if not is_under_cwd(real):
+        console.print("[red]history path is outside cwd[/]")
+        raise typer.Exit(2)
+    if not os.path.isfile(real):
+        console.print(
+            f"[yellow]curriculum_history.jsonl not found:[/] "
+            f"{markup_escape(os.path.basename(real))}"
+        )
+        raise typer.Exit(1)
+    max_history_bytes = 50 * 1024 * 1024  # 50 MB
+    if os.path.getsize(real) > max_history_bytes:
+        console.print("[red]history file exceeds 50 MB cap[/]")
+        raise typer.Exit(2)
+
+    rows = []
+    max_lines = 100_000
+    with open(real, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+            if len(rows) > max_lines:
+                console.print("[red]history exceeds 100k-row cap[/]")
+                raise typer.Exit(2)
+    if not rows:
+        console.print("[yellow](no curriculum history rows)[/]")
+        return
+    nb = len(rows[0].get("weights", []))
+    try:
+        normalised = parse_history_jsonl(rows)
+    except (ValueError, TypeError) as exc:
+        console.print(f"[red]history malformed: {markup_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+    console.print(render_curve(normalised, num_buckets=nb, width=width))
