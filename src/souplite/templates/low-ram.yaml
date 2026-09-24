@@ -1,0 +1,24 @@
+# SoupLite template: Low-RAM Assistant (<= 2 GB RAM)
+# Optimized for machines and cheap VMs with 2GB RAM limits
+
+base: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+task: sft
+
+data:
+  train: ./data/train.jsonl
+  format: alpaca
+  val_split: 0.1
+  max_length: 512
+
+training:
+  epochs: 3
+  lr: 2e-4
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  lora:
+    r: 8
+    alpha: 16
+    target_modules: ["q_proj", "v_proj"]
+  quantization: 4bit
+
+output: ./output

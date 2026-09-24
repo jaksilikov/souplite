@@ -1,5 +1,6 @@
 {
   "templates": {
+    "low-ram": "low-ram.yaml",
     "audio": "audio.yaml",
     "bco": "bco.yaml",
     "chat": "chat.yaml",
