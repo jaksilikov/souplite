@@ -7,8 +7,10 @@ Specially re-engineered to run LLM fine-tuning and post-training on machines wit
 """
 
 from souplite.utils.low_ram import setup_low_ram_environment
+from souplite.utils.memory_opt import LowRAMContext, purge_memory
 
 setup_low_ram_environment()
 
 __version__ = "0.75.0"
 __author__ = "Muhtar Jaksilikov"
+__all__ = ["setup_low_ram_environment", "LowRAMContext", "purge_memory", "__version__", "__author__"]
