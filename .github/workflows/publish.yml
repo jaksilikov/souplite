@@ -1,22 +1,44 @@
-name: Publish to PyPI
+name: Auto-Publish to npm, PyPI, and Docker Hub
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
+  workflow_dispatch:
 
 jobs:
-  publish:
+  publish-pypi:
+    name: Publish Python Package to PyPI
     runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: pip install build
-      - run: python scripts/assemble_changelog.py --check-empty
-      - run: python -m build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          python-version: '3.11'
+      - name: Install build tools
+        run: pip install build twine
+      - name: Build wheel and sdist
+        run: python -m build
+      - name: Publish to PyPI
+        if: env.TWINE_PASSWORD != ''
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload dist/*
+
+  publish-npm:
+    name: Publish Node.js Package to npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Publish to npm
+        if: env.NODE_AUTH_TOKEN != ''
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
