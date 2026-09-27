@@ -1,0 +1,35 @@
+{
+  "name": "souplite",
+  "version": "0.75.0",
+  "description": "Ultra-lightweight LLM Fine-Tuning & Inference engine optimized for sub-2GB RAM budget. Created by Muhtar Jaksilikov.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "souplite": "./cli.js",
+    "soup": "./cli.js"
+  },
+  "scripts": {
+    "test": "node index.js --test"
+  },
+  "keywords": [
+    "souplite",
+    "llm",
+    "ai",
+    "fine-tuning",
+    "low-ram",
+    "sub-2gb-ram",
+    "machine-learning",
+    "transformers",
+    "gpt-4o"
+  ],
+  "author": "Muhtar Jaksilikov",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaksilikov/souplite.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jaksilikov/souplite/issues"
+  },
+  "homepage": "https://github.com/jaksilikov/souplite#readme"
+}
